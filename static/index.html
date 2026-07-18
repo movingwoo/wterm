@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>W-Term</title>
+  <link rel="stylesheet" href="/static/vendor/xterm.css">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <aside id="sidebar">
+    <h1>W-Term</h1>
+    <div id="project-list"></div>
+    <div id="conn-status" class="disconnected">연결 안 됨</div>
+  </aside>
+  <main id="terminal-pane">
+    <div id="terminal"></div>
+    <div id="placeholder">좌측에서 프로젝트를 선택하세요.</div>
+  </main>
+  <div id="login-overlay">
+    <form id="login-form">
+      <h2>W-Term</h2>
+      <input type="password" id="login-password" placeholder="패스워드"
+             autocomplete="current-password" required>
+      <div id="login-error"></div>
+      <button type="submit">로그인</button>
+    </form>
+  </div>
+  <script src="/static/vendor/xterm.js"></script>
+  <script src="/static/vendor/addon-fit.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

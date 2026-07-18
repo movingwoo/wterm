@@ -1,0 +1,17 @@
+{
+  "host": "127.0.0.1",
+  "port": 8877,
+  "grace_seconds": 60,
+  "projects": [
+    {
+      "name": "example-project",
+      "path": "/home/user/example-project"
+    },
+    {
+      "name": "remote-project",
+      "path": "/home/user/remote-project",
+      "ssh": "user@remote-host"
+    }
+  ],
+  "password_sha256": "패스워드 hash"
+}

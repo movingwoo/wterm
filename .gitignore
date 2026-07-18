@@ -1,0 +1,11 @@
+.claude/
+.venv/
+__pycache__/
+*.pyc
+logs/
+run/
+*.sock
+*.pid
+projects.json
+projects.*.json
+!projects.example.json
