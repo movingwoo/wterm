@@ -24,6 +24,7 @@ from fastapi import WebSocket
 
 BUFFER_LIMIT = 256 * 1024  # 재연결 replay 버퍼 상한
 READ_CHUNK = 65536
+CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 SIGTERM_WAIT = 10  # SIGTERM 후 SIGKILL까지 대기 초
 
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -45,15 +46,41 @@ def latest_session_id(cwd: str) -> str | None:
     return jsonls[0].stem if jsonls else None
 
 
-async def remote_has_history(ssh: str, cwd: str) -> bool:
-    """원격 호스트의 ~/.claude/projects/에 해당 cwd의 세션 기록이 있는지 확인한다.
+def has_codex_history(cwd: str) -> bool:
+    """Codex 세션 메타데이터에서 해당 cwd의 대화 기록 존재 여부를 확인한다."""
+    if not CODEX_SESSIONS_DIR.is_dir():
+        return False
+    for path in CODEX_SESSIONS_DIR.rglob("*.jsonl"):
+        try:
+            with path.open(encoding="utf-8") as f:
+                meta = json.loads(f.readline())
+            if (
+                meta.get("type") == "session_meta"
+                and meta.get("payload", {}).get("cwd") == cwd
+            ):
+                return True
+        except (OSError, json.JSONDecodeError):
+            continue
+    return False
+
+
+async def remote_has_history(ssh: str, cwd: str, agent: str = "claude") -> bool:
+    """원격 호스트에 해당 cwd의 Claude/Codex 세션 기록이 있는지 확인한다.
 
     비대화식 확인이므로 BatchMode를 쓴다 — 키 인증이 안 돼 있으면 False가 되어
     새 세션으로 폴백한다 (스폰 자체는 대화식이라 터미널에서 패스워드 입력 가능).
     """
+    if agent == "codex":
+        needle = json.dumps({"cwd": cwd}, ensure_ascii=False, separators=(",", ":"))[1:-1]
+        check_cmd = (
+            f"grep -rlF -m1 -- {shlex.quote(needle)} ~/.codex/sessions "
+            ">/dev/null 2>&1"
+        )
+    else:
+        check_cmd = f"ls ~/.claude/projects/{munge_cwd(cwd)}/*.jsonl"
     proc = await asyncio.create_subprocess_exec(
         "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", ssh,
-        f"ls ~/.claude/projects/{munge_cwd(cwd)}/*.jsonl",
+        check_cmd,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
@@ -69,13 +96,13 @@ class Session:
         cwd: str,
         grace_seconds: int,
         ssh: str | None = None,
-        shell: bool = False,
+        agent: str = "claude",
     ):
         self.project_name = project_name
         self.cwd = cwd
         self.grace_seconds = grace_seconds
         self.ssh = ssh
-        self.shell = shell  # True면 claude 대신 로그인 셸(bash -l)을 띄운다
+        self.agent = agent  # "claude" | "codex" | "shell"
         self.pid: int = -1
         self.master_fd: int = -1
         self.alive = False
@@ -89,13 +116,17 @@ class Session:
     # ── 프로세스 수명 주기 ────────────────────────────────────────────
 
     def spawn(self, extra_args: list[str] | None = None) -> None:
-        base_cmd = ["bash", "-l"] if self.shell else ["claude", *(extra_args or [])]
+        base_cmd = (
+            ["bash", "-l"]
+            if self.agent == "shell"
+            else [self.agent, *(extra_args or [])]
+        )
         if self.ssh is not None:
             # -t: 원격에 TTY 강제 할당. resize(SIGWINCH)·시그널은 ssh가 중계하고,
             # ssh가 끊기면(grace 만료 포함) 원격 프로세스는 SIGHUP으로 정리된다.
             # BatchMode는 쓰지 않는다 — 패스워드/호스트키 프롬프트를 터미널에서 처리 가능.
             remote_cmd = f"cd {shlex.quote(self.cwd)} && exec {shlex.join(base_cmd)}"
-            if not self.shell:
+            if self.agent != "shell":
                 # bash -lc: 비대화식 ssh는 ~/.profile을 안 읽어 ~/.local/bin 등이
                 # PATH에 없으므로 로그인 셸로 감싸 claude를 찾게 한다.
                 # (셸 모드는 bash -l 자체가 로그인 셸이라 불필요)
@@ -312,7 +343,7 @@ class SessionManager:
         cwd: str,
         extra_args: list[str] | None = None,
         ssh: str | None = None,
-        shell: bool = False,
+        agent: str = "claude",
     ) -> Session:
         """새 claude/셸 프로세스를 기동한다. 같은 키의 라이브 세션이 있으면 먼저 종료한다."""
         existing = self.get_live(project_name)
@@ -320,7 +351,7 @@ class SessionManager:
             await existing.terminate()
             del self.sessions[project_name]
 
-        session = Session(project_name, cwd, self.grace_seconds, ssh=ssh, shell=shell)
+        session = Session(project_name, cwd, self.grace_seconds, ssh=ssh, agent=agent)
         session.spawn(extra_args)
         self.sessions[project_name] = session
         return session

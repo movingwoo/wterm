@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import load_config
-from .session import SessionManager, latest_session_id, remote_has_history
+from .session import SessionManager, has_codex_history, latest_session_id, remote_has_history
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
@@ -90,11 +90,13 @@ async def list_projects(request: Request):
                 "name": p.name,
                 "path": p.path,
                 "ssh": p.ssh,
-                "live": manager.get_live(p.name) is not None,
+                "live": manager.get_live(f"{p.name}#claude") is not None,
+                "codex_live": manager.get_live(f"{p.name}#codex") is not None,
                 "shell_live": manager.get_live(f"{p.name}#shell") is not None,
                 # 원격은 목록 조회 때마다 ssh를 돌리기엔 느려서 낙관적으로 true
                 # (실제 판단은 WS 접속 시 remote_has_history로 수행)
                 "has_history": True if p.ssh else latest_session_id(p.path) is not None,
+                "codex_has_history": True if p.ssh else has_codex_history(p.path),
             }
         )
     return result
@@ -102,7 +104,8 @@ async def list_projects(request: Request):
 
 @app.websocket("/ws/{project_name}")
 async def terminal_ws(
-    ws: WebSocket, project_name: str, mode: str = "attach", shell: bool = False
+    ws: WebSocket, project_name: str, mode: str = "attach",
+    agent: str = "claude", shell: bool = False
 ):
     """터미널 WebSocket.
 
@@ -127,6 +130,12 @@ async def terminal_ws(
         await ws.close(code=4404, reason="화이트리스트에 없는 프로젝트")
         return
 
+    if shell:
+        agent = "shell"
+    if agent not in ("claude", "codex", "shell"):
+        await ws.close(code=4400, reason="지원하지 않는 에이전트")
+        return
+
     await ws.accept()
 
     # accept 후에 닫아야 close code(4401)가 클라이언트까지 전달된다
@@ -134,16 +143,16 @@ async def terminal_ws(
         await ws.close(code=4401, reason="인증 필요")
         return
 
-    session_key = f"{project_name}#shell" if shell else project_name
+    session_key = f"{project_name}#{agent}"
     session = manager.get_live(session_key)
     if session is not None and mode != "new":
         await session.attach(ws)
         await ws.send_text(
             json.dumps({"type": "status", "message": "실행 중인 세션에 재접속했습니다."})
         )
-    elif shell:
+    elif agent == "shell":
         session = await manager.start(
-            session_key, project.path, ssh=project.ssh, shell=True
+            session_key, project.path, ssh=project.ssh, agent="shell"
         )
         await session.attach(ws)
         await ws.send_text(
@@ -151,19 +160,25 @@ async def terminal_ws(
         )
     else:
         if project.ssh is not None:
-            has_history = await remote_has_history(project.ssh, project.path)
+            has_history = await remote_has_history(project.ssh, project.path, agent)
         else:
-            has_history = latest_session_id(project.path) is not None
+            has_history = (
+                has_codex_history(project.path)
+                if agent == "codex"
+                else latest_session_id(project.path) is not None
+            )
         if mode == "resume" and has_history:
-            extra_args, msg = ["--resume"], "이어할 세션을 목록에서 선택하세요."
+            extra_args = ["resume"] if agent == "codex" else ["--resume"]
+            msg = "이어할 세션을 목록에서 선택하세요."
         elif mode == "continue" and has_history:
-            extra_args, msg = ["--continue"], "가장 최근 세션을 이어합니다."
+            extra_args = ["resume", "--last"] if agent == "codex" else ["--continue"]
+            msg = "가장 최근 세션을 이어합니다."
         elif mode in ("resume", "continue"):
             extra_args, msg = None, "이어할 세션 기록이 없어 새 세션을 시작합니다."
         else:
             extra_args, msg = None, "새 세션을 시작합니다."
         session = await manager.start(
-            session_key, project.path, extra_args, ssh=project.ssh
+            session_key, project.path, extra_args, ssh=project.ssh, agent=agent
         )
         await session.attach(ws)
         await ws.send_text(json.dumps({"type": "status", "message": msg}))

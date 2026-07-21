@@ -25,7 +25,7 @@
   term.open(document.getElementById("terminal"));
 
   let ws = null;
-  let current = null; // { name, mode }
+  let current = null; // { name, mode, agent }
   let reconnectTimer = null;
   let reconnectAttempts = 0;
   let intentionalClose = false;
@@ -78,12 +78,12 @@
   }
   window.addEventListener("resize", fitAndReport);
 
-  function connect(name, mode, shell = false) {
+  function connect(name, mode, agent = "claude") {
     intentionalClose = true;
     if (ws) ws.close();
     clearTimeout(reconnectTimer);
 
-    current = { name, mode, shell };
+    current = { name, mode, agent };
     document.body.classList.add("session-open");
     term.reset();
     term.focus();
@@ -91,8 +91,8 @@
 
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const url =
-      `${proto}://${location.host}/ws/${encodeURIComponent(name)}?mode=${mode}` +
-      (shell ? "&shell=1" : "");
+      `${proto}://${location.host}/ws/${encodeURIComponent(name)}` +
+      `?mode=${mode}&agent=${encodeURIComponent(agent)}`;
     const sock = new WebSocket(url);
     sock.binaryType = "arraybuffer";
     ws = sock;
@@ -100,7 +100,8 @@
 
     sock.onopen = () => {
       reconnectAttempts = 0;
-      setStatus("connected", `연결됨: ${name}${shell ? " (셸)" : ""}`);
+      const label = agent === "shell" ? "셸" : agent === "codex" ? "Codex" : "Claude";
+      setStatus("connected", `연결됨: ${name} (${label})`);
       fitAndReport();
       loadProjects();
     };
@@ -138,7 +139,7 @@
         const delay = Math.min(1000 * reconnectAttempts, 5000);
         setStatus("connecting", `재연결 시도 중… (${reconnectAttempts})`);
         reconnectTimer = setTimeout(
-          () => connect(current.name, "continue", current.shell),
+          () => connect(current.name, "continue", current.agent),
           delay
         );
       } else {
@@ -171,7 +172,13 @@
       if (p.live) {
         const badge = document.createElement("span");
         badge.className = "badge";
-        badge.textContent = "LIVE";
+        badge.textContent = "CLAUDE";
+        nameEl.appendChild(badge);
+      }
+      if (p.codex_live) {
+        const badge = document.createElement("span");
+        badge.className = "badge codex";
+        badge.textContent = "CODEX";
         nameEl.appendChild(badge);
       }
       if (p.shell_live) {
@@ -188,30 +195,51 @@
       const actions = document.createElement("div");
       actions.className = "actions";
 
-      const resumeBtn = document.createElement("button");
-      resumeBtn.className = "primary";
-      resumeBtn.textContent = p.live ? "재접속" : "이어하기";
-      resumeBtn.title = p.live
-        ? "실행 중인 세션에 재접속"
-        : "이전 세션 목록에서 선택해 이어하기 (claude --resume)";
-      resumeBtn.disabled = !p.live && !p.has_history;
-      resumeBtn.onclick = () => connect(p.name, "resume");
+      function makeAgentRow(label, agent, live, hasHistory) {
+        const row = document.createElement("div");
+        row.className = "agent-row";
+        const labelEl = document.createElement("span");
+        labelEl.className = `agent-label ${agent}`;
+        labelEl.textContent = label;
 
-      const newBtn = document.createElement("button");
-      newBtn.textContent = "새 세션";
-      newBtn.onclick = () => {
-        if (p.live && !confirm(`'${p.name}'의 실행 중인 세션을 종료하고 새로 시작할까요?`)) return;
-        connect(p.name, "new");
-      };
+        const resumeBtn = document.createElement("button");
+        resumeBtn.className = "primary";
+        resumeBtn.textContent = live ? "재접속" : "이어하기";
+        resumeBtn.title = live
+          ? `실행 중인 ${label} 세션에 재접속`
+          : `${label}의 이전 세션 목록에서 선택해 이어하기`;
+        resumeBtn.disabled = !live && !hasHistory;
+        resumeBtn.onclick = () => connect(p.name, "resume", agent);
+
+        const newBtn = document.createElement("button");
+        newBtn.textContent = "새 세션";
+        newBtn.onclick = () => {
+          if (live && !confirm(`'${p.name}'의 실행 중인 ${label} 세션을 종료하고 새로 시작할까요?`)) return;
+          connect(p.name, "new", agent);
+        };
+        row.append(labelEl, resumeBtn, newBtn);
+        return row;
+      }
+      actions.append(
+        makeAgentRow("Claude", "claude", p.live, p.has_history),
+        makeAgentRow("Codex", "codex", p.codex_live, p.codex_has_history)
+      );
+
 
       const shellBtn = document.createElement("button");
       shellBtn.textContent = p.shell_live ? "셸 재접속" : "셸";
       shellBtn.title = p.ssh
         ? `원격 셸 열기 (ssh ${p.ssh})`
         : "이 디렉터리에서 로컬 셸 열기";
-      shellBtn.onclick = () => connect(p.name, "attach", true);
+      shellBtn.onclick = () => connect(p.name, "attach", "shell");
 
-      actions.append(resumeBtn, newBtn, shellBtn);
+      const shellRow = document.createElement("div");
+      shellRow.className = "agent-row shell-row";
+      const shellLabel = document.createElement("span");
+      shellLabel.className = "agent-label shell";
+      shellLabel.textContent = "Shell";
+      shellRow.append(shellLabel, shellBtn);
+      actions.append(shellRow);
       card.append(nameEl, pathEl, actions);
       projectListEl.appendChild(card);
     }

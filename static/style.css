@@ -64,7 +64,27 @@ body { display: flex; }
   border-color: #89b4fa;
 }
 
-.project .actions { display: flex; gap: 6px; }
+.project .badge.codex {
+  color: #f9e2af;
+  border-color: #f9e2af;
+}
+
+.project .actions { display: flex; flex-direction: column; gap: 6px; }
+
+.project .agent-row {
+  display: grid;
+  grid-template-columns: 48px 1fr 1fr;
+  gap: 5px;
+}
+.project .agent-label {
+  align-self: center;
+  font-size: 10px;
+  font-weight: 600;
+  color: #b4befe;
+}
+.project .agent-label.codex { color: #f9e2af; }
+.project .agent-label.shell { color: #89b4fa; }
+.project .shell-row button { grid-column: 2 / 4; }
 
 .project button {
   flex: 1;
