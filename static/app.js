@@ -2,6 +2,9 @@
 (() => {
   "use strict";
 
+  const sidebarEl = document.getElementById("sidebar");
+  const sidebarToggleEl = document.getElementById("sidebar-toggle");
+  const terminalPaneEl = document.getElementById("terminal-pane");
   const projectListEl = document.getElementById("project-list");
   const connStatusEl = document.getElementById("conn-status");
   const loginOverlayEl = document.getElementById("login-overlay");
@@ -76,7 +79,54 @@
     fitAddon.fit();
     sendJson({ type: "resize", cols: term.cols, rows: term.rows });
   }
-  window.addEventListener("resize", fitAndReport);
+
+  let fitFrame = null;
+  function scheduleFitAndReport() {
+    if (fitFrame !== null) cancelAnimationFrame(fitFrame);
+    fitFrame = requestAnimationFrame(() => {
+      fitFrame = null;
+      fitAndReport();
+    });
+  }
+
+  window.addEventListener("resize", scheduleFitAndReport);
+  if ("ResizeObserver" in window) {
+    const terminalResizeObserver = new ResizeObserver(scheduleFitAndReport);
+    terminalResizeObserver.observe(terminalPaneEl);
+  }
+
+  const sidebarStorageKey = "wterm.sidebar.collapsed";
+
+  function setSidebarCollapsed(collapsed, persist = false) {
+    document.body.classList.toggle("sidebar-collapsed", collapsed);
+    sidebarEl.toggleAttribute("inert", collapsed);
+    sidebarToggleEl.setAttribute("aria-expanded", String(!collapsed));
+    const label = collapsed ? "사이드바 펼치기" : "사이드바 접기";
+    sidebarToggleEl.setAttribute("aria-label", label);
+    sidebarToggleEl.title = label;
+
+    if (persist) {
+      try {
+        localStorage.setItem(sidebarStorageKey, String(collapsed));
+      } catch {
+        // 저장소가 차단된 브라우저에서도 현재 탭의 접기 기능은 계속 동작한다.
+      }
+    }
+    scheduleFitAndReport();
+  }
+
+  let sidebarCollapsed = false;
+  try {
+    sidebarCollapsed = localStorage.getItem(sidebarStorageKey) === "true";
+  } catch {
+    // localStorage 사용 불가 시 기본값(펼침)을 유지한다.
+  }
+  setSidebarCollapsed(sidebarCollapsed);
+
+  sidebarToggleEl.addEventListener("click", () => {
+    sidebarCollapsed = !sidebarCollapsed;
+    setSidebarCollapsed(sidebarCollapsed, true);
+  });
 
   function connect(name, mode, agent = "claude") {
     intentionalClose = true;
