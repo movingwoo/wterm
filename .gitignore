@@ -10,4 +10,6 @@ run/
 projects.json
 projects.*.json
 !projects.example.json
+*.pem
+*.key
 TODO.md

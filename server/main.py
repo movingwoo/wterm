@@ -5,9 +5,13 @@
 """
 from __future__ import annotations
 
+import atexit
 import json
 import logging
+import os
 import secrets
+import signal
+import ssl
 from contextlib import asynccontextmanager
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -23,6 +27,7 @@ from .session import SessionManager, has_codex_history, latest_session_id, remot
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
+PID_FILE = BASE_DIR / "logs" / "wterm.pid"
 
 config = load_config()
 manager = SessionManager(grace_seconds=config.grace_seconds)
@@ -203,6 +208,72 @@ async def terminal_ws(
         session.detach(ws)
 
 
+# ── TLS (projects.json에 tls_certfile/tls_keyfile이 둘 다 있을 때만) ────
+#
+# 이 서버는 인증서를 발급하지 않는다. 파일을 읽기만 하고, 갱신은 acme.sh 같은
+# 외부 클라이언트가 담당한다(scripts/cert-setup.sh 참고). 갱신 직후 SIGHUP을
+# 받으면 같은 SSLContext에 인증서만 다시 물려서 재시작 없이 반영한다 —
+# PTY 세션이 서버 프로세스에 붙어 있어 재시작하면 전부 죽기 때문이다.
+
+_tls_log = logging.getLogger("wterm.tls")
+# 루트는 ERROR로 잠겨 있지만(setup_logging 참조), 인증서 리로드는 60일에 한 번
+# 일어나는 데다 성공 기록이 남아야 점검이 된다. 자식 로거에 자체 레벨을 주면
+# 전파 시 상위 "로거의 레벨"은 다시 보지 않고 핸들러만 타므로 INFO가 통과한다.
+# 성공을 ERROR로 남기면 로그만 보고 장애로 오해하게 된다.
+_tls_log.setLevel(logging.INFO)
+_ssl_ctx: ssl.SSLContext | None = None
+
+
+def _load_cert(ctx: ssl.SSLContext) -> None:
+    ctx.load_cert_chain(config.tls_certfile, config.tls_keyfile)
+
+
+def _on_sighup(signum, frame) -> None:
+    """인증서 갱신 알림. 기존 연결은 유지되고 새 연결부터 새 인증서를 쓴다."""
+    if _ssl_ctx is None:
+        return
+    try:
+        _load_cert(_ssl_ctx)
+        _tls_log.info("인증서를 다시 읽었습니다: %s", config.tls_certfile)
+    except Exception as exc:
+        # 새 파일이 깨져 있어도 기존 컨텍스트는 온전하므로 서비스는 계속된다.
+        _tls_log.error("인증서 리로드 실패, 기존 인증서를 유지합니다: %s", exc)
+
+
+def _setup_tls():
+    """SSLContext를 만들어 보관하고 SIGHUP 훅을 건 뒤, uvicorn에 넘길 팩토리를 반환."""
+    global _ssl_ctx
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    _load_cert(ctx)  # 기동 시점의 실패는 감추지 않고 그대로 터뜨린다
+    _ssl_ctx = ctx
+    # uvicorn이 가로채는 시그널은 SIGINT/SIGTERM뿐이라 SIGHUP 핸들러는 살아남는다.
+    signal.signal(signal.SIGHUP, _on_sighup)
+    return lambda cfg, default_factory: ctx
+
+
+# ── PID 파일 ────────────────────────────────────────────────────────
+#
+# 서버가 직접 쓴다. start.sh(백그라운드 기동)와 launchd(포그라운드 기동) 어느
+# 쪽으로 띄워도 같은 파일이 나와야 stop.sh와 인증서 --reloadcmd가 동작한다.
+
+
+def _claim_pid_file() -> None:
+    PID_FILE.parent.mkdir(exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    atexit.register(_release_pid_file)
+
+
+def _release_pid_file() -> None:
+    # 내가 쓴 pid일 때만 지운다. 늦게 죽는 이전 프로세스가 새 서버의 pid 파일을
+    # 지워버리는 상황을 막기 위한 것.
+    try:
+        if PID_FILE.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            PID_FILE.unlink()
+    except OSError:
+        pass
+
+
 def setup_logging() -> None:
     """ERROR 이상만 기록. 자정마다 로테이션하며 하루 치(직전 파일 1개)만 보관."""
     log_dir = BASE_DIR / "logs"
@@ -224,19 +295,24 @@ def main() -> None:
     import uvicorn
 
     setup_logging()
+    _claim_pid_file()
     # log_config=None: uvicorn 자체 로깅 설정을 끄고 위 root 로거로 전파시킴
+    kwargs = {"log_config": None, "access_log": False}
     if config.uds:
+        if config.tls_enabled:
+            # UDS는 앞단 프록시가 TLS를 담당하는 구성이므로 여기서 겹칠 이유가 없다.
+            _tls_log.error("uds 사용 중이라 tls_certfile/tls_keyfile을 무시합니다")
         uds_path = Path(config.uds)
         uds_path.parent.mkdir(parents=True, exist_ok=True)
         if uds_path.exists():
             # 이전 비정상 종료로 남은 소켓 파일. 싱글턴은 run.sh의 PID 파일이
             # 보장하므로 여기서 지워도 안전하다.
             uds_path.unlink()
-        uvicorn.run(app, uds=str(uds_path), log_config=None, access_log=False)
+        uvicorn.run(app, uds=str(uds_path), **kwargs)
     else:
-        uvicorn.run(
-            app, host=config.host, port=config.port, log_config=None, access_log=False
-        )
+        if config.tls_enabled:
+            kwargs["ssl_context_factory"] = _setup_tls()
+        uvicorn.run(app, host=config.host, port=config.port, **kwargs)
 
 
 if __name__ == "__main__":
