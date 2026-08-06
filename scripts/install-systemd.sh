@@ -101,6 +101,9 @@ Environment=LANG=ko_KR.UTF-8
 # systemd가 곧바로 되살리지 않게 하려는 것 —
 # launchd의 KeepAlive{SuccessfulExit:false}와 같은 의도다.
 Restart=on-failure
+# 중복 기동 거부(종료 코드 3)도 여기서 재시도된다 — 재기동이 늦게 죽는 이전
+# 프로세스와 겹쳤을 때 10초 뒤 다시 붙으라는 뜻이고, 그것이 원하는 동작이다.
+# 간격이 10초라 systemd 기본 시작 제한(10초에 5회)에도 걸리지 않는다.
 RestartSec=10
 # 서버는 SIGTERM을 받으면 PTY 세션을 SIGTERM→(최대 10초)→SIGKILL로 회수한 뒤
 # 종료한다. 그 시간을 못 기다리고 systemd가 SIGKILL을 보내면 비정상 종료가 되어
@@ -200,8 +203,8 @@ cat <<EOF
 ==> 완료. 이제 부팅 시 자동으로 기동합니다 (로그인 불필요).
 
   상태 확인   systemctl status $SERVER_UNIT
-  재시작      sudo systemctl restart $SERVER_UNIT
-  중지        sudo systemctl stop $SERVER_UNIT
+  재시작      sudo systemctl restart $SERVER_UNIT   (또는 $REPO_DIR/stop.sh && sudo $REPO_DIR/start.sh)
+  중지        $REPO_DIR/stop.sh   (또는 sudo systemctl stop $SERVER_UNIT)
   로그        $REPO_DIR/logs/wterm.out  (또는 journalctl -u $SERVER_UNIT)
   갱신 타이머 systemctl list-timers $RENEW_TIMER
   제거        sudo $0 --uninstall

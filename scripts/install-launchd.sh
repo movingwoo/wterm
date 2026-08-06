@@ -90,7 +90,10 @@ cat > "$DAEMON_DIR/$SERVER_LABEL.plist" <<EOF
     <key>RunAtLoad</key>
     <true/>
     <!-- 비정상 종료일 때만 재기동. stop.sh(SIGTERM → 정상 종료)로 내린 서버를
-         launchd가 곧바로 되살리지 않게 하려는 것. -->
+         launchd가 곧바로 되살리지 않게 하려는 것.
+         중복 기동 거부(종료 코드 3)도 재기동 대상이다 — 재기동이 늦게 죽는 이전
+         프로세스와 겹쳤을 때 ThrottleInterval(기본 10초) 뒤 다시 붙으라는 뜻이고,
+         그것이 원하는 동작이다. -->
     <key>KeepAlive</key>
     <dict>
         <key>SuccessfulExit</key>
@@ -206,10 +209,13 @@ cat <<EOF
 ==> 완료. 이제 부팅 시 자동으로 기동합니다 (로그인 불필요).
 
   상태 확인   sudo launchctl print system/$SERVER_LABEL | head -20
-  재시작      sudo launchctl kickstart -k system/$SERVER_LABEL
-  중지        sudo launchctl bootout system/$SERVER_LABEL
+  재시작      $REPO_DIR/stop.sh && sudo $REPO_DIR/start.sh
+  중지        $REPO_DIR/stop.sh
+  등록 해제   sudo launchctl bootout system/$SERVER_LABEL   (부팅 시에도 안 뜸)
   로그        $REPO_DIR/logs/wterm.out
   제거        sudo $0 --uninstall
 
-주의: 코드를 수정한 뒤에는 kickstart로 재시작해야 반영됩니다 (reload 미사용).
+주의: 코드를 수정한 뒤에는 재시작해야 반영됩니다 (reload 미사용).
+      start.sh가 launchd를 통해 띄우므로 root가 필요합니다. kickstart -k는
+      쓰지 마세요 — SIGTERM 경로를 건너뛰어 PTY 세션이 살아남습니다.
 EOF

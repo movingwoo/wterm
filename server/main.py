@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import errno
+import fcntl
 import json
 import logging
 import os
@@ -435,19 +437,78 @@ def _setup_tls():
 #
 # 서버가 직접 쓴다. start.sh(백그라운드 기동)와 launchd(포그라운드 기동) 어느
 # 쪽으로 띄워도 같은 파일이 나와야 stop.sh와 인증서 --reloadcmd가 동작한다.
+#
+# 동시에 이 파일이 "서버는 하나"라는 잠금이기도 하다. 예전에는 pid를 무조건
+# 덮어썼는데, 그러면 다른 포트로 두 번째 서버가 뜨는 순간 첫 번째의 pid가 파일에서
+# 사라져 stop.sh도 인증서 리로드도 그 프로세스에 영원히 닿지 못했다. 같은 포트면
+# 바인딩 실패로 두 번째가 죽지만 포트가 다르면 둘 다 정상 기동하므로, 포트 충돌에
+# 기대지 않고 여기서 직접 막는다.
+#
+# 방법은 `fcntl.lockf`(POSIX 권고 잠금)다. 파일에 적힌 pid를 보고 `kill -0`으로
+# 살아있는지 확인하는 방식과 달리, 프로세스가 어떻게 죽든 커널이 잠금을 놓아주므로
+# stale pid 판정 자체가 필요 없다. 잠금은 프로세스 단위라 fork한 PTY 자식은
+# 물려받지 않고, `os.open`은 기본이 close-on-exec이라 exec된 claude/셸에도 남지 않는다.
+
+_pid_fd: int | None = None
+
+EXIT_ALREADY_RUNNING = 3
+
+_pid_log = logging.getLogger("wterm.pid")
+_pid_log.setLevel(logging.INFO)  # 루트가 ERROR로 잠겨 있다 — _tls_log 쪽 주석 참조
 
 
 def _claim_pid_file() -> None:
+    """pid 파일을 배타 잠금으로 점유한다. 이미 서버가 떠 있으면 기동을 거부한다."""
+    global _pid_fd
     PID_FILE.parent.mkdir(exist_ok=True)
-    PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    # 잠금은 경로가 아니라 inode에 걸린다. 우리가 여는 것과 잠근 뒤 경로가 가리키는
+    # 것이 같은 파일인지 확인해야, 그 사이에 누가 pid 파일을 지우고 새로 만든 경우
+    # (start.sh/stop.sh의 rm) 서로 다른 inode를 잠근 두 서버가 동시에 살아남지 않는다.
+    for _ in range(5):
+        fd = os.open(PID_FILE, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                os.close(fd)
+                raise
+            other = os.pread(fd, 32, 0).decode("utf-8", "replace").strip() or "?"
+            os.close(fd)
+            _pid_log.error(
+                "이미 서버가 실행 중입니다 (pid %s) — 기동을 중단합니다. "
+                "먼저 ./stop.sh 로 내리세요: %s",
+                other,
+                PID_FILE,
+            )
+            raise SystemExit(EXIT_ALREADY_RUNNING)
+        try:
+            if os.fstat(fd).st_ino == os.stat(PID_FILE).st_ino:
+                break
+        except FileNotFoundError:
+            pass
+        os.close(fd)  # 우리가 잠근 파일은 이미 경로에서 떨어져 나갔다. 다시 연다.
+    else:
+        _pid_log.error("pid 파일이 계속 교체되어 점유하지 못했습니다: %s", PID_FILE)
+        raise SystemExit(EXIT_ALREADY_RUNNING)
+
+    os.ftruncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode("utf-8"))
+    os.fsync(fd)
+    _pid_fd = fd
     atexit.register(_release_pid_file)
 
 
 def _release_pid_file() -> None:
     # 내가 쓴 pid일 때만 지운다. 늦게 죽는 이전 프로세스가 새 서버의 pid 파일을
-    # 지워버리는 상황을 막기 위한 것.
+    # 지워버리는 상황을 막기 위한 것. 확인은 반드시 잠금을 쥔 fd로 한다 —
+    # 같은 파일을 새로 open했다가 close하면 그 순간 이 프로세스의 잠금이 풀린다
+    # (POSIX 권고 잠금의 특성). fd를 닫는 것은 종료 직전이므로 그냥 열어둔다.
+    global _pid_fd
+    if _pid_fd is None:
+        return
+    fd, _pid_fd = _pid_fd, None
     try:
-        if PID_FILE.read_text(encoding="utf-8").strip() == str(os.getpid()):
+        if os.pread(fd, 32, 0).decode("utf-8", "replace").strip() == str(os.getpid()):
             PID_FILE.unlink()
     except OSError:
         pass
