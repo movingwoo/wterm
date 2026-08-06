@@ -6,7 +6,7 @@ Claude Code와 Codex를 브라우저에서 원격 제어하는 내부망용 웹 
 
 - 프로젝트별 라이브 세션 유지, 연결이 끊겨도 grace 기간 동안 프로세스를 보존했다가 재접속 시 화면을 그대로 복원
 - Claude의 `--resume` / `--continue`, Codex의 `resume` / `resume --last`, 새 세션 기동을 지원
-- 같은 프로젝트에서 Claude, Codex, 셸(`bash -l`) 세션을 서로 독립적으로 동시에 운용 가능
+- 같은 프로젝트에서 Claude, Codex, 셸(로컬 `$SHELL -l`, 원격은 `bash -l`) 세션을 서로 독립적으로 동시에 운용 가능
 - ssh로 연결 가능한 원격 호스트의 프로젝트도 동일한 UI로 제어 가능
 - 선택적 비밀번호 인증, 선택적 유닉스 도메인 소켓 리스닝(리버스 프록시 연동용)
 - 프론트엔드 의존성(xterm.js)이 로컬에 내장되어 있어 오프라인에서도 동작, 별도 빌드 과정 없음
@@ -50,7 +50,7 @@ cp projects.example.json projects.json
     { "name": "example-project", "path": "/home/user/example-project" },
     { "name": "remote-project", "path": "/home/user/remote-project", "ssh": "user@remote-host" }
   ],
-  "password_sha256": "패스워드 hash"
+  "password_hash": "argon2id 해시"
 }
 ```
 
@@ -60,7 +60,7 @@ cp projects.example.json projects.json
 | `grace_seconds` | O | 연결 해제 후 프로세스를 무손상 유지하는 시간(초). 이후 SIGTERM → 10초 → SIGKILL |
 | `projects` | O | 화이트리스트. `path`가 실제 존재하지 않는 로컬 프로젝트는 기동 시 제외됨 |
 | `projects[].ssh` | 선택 | `user@host` 형태. 지정하면 Claude/Codex/셸을 해당 원격 호스트에서 실행 |
-| `password_sha256` | 선택 | `echo -n '비밀번호' | sha256sum`. 지정 시에만 로그인 인증 활성화 |
+| `password_hash` | 선택 | argon2id로 생성한 비밀번호 해시. 지정 시에만 로그인 인증 활성화 |
 | `uds` | 선택 | 이 경로의 유닉스 도메인 소켓으로 리슨(TCP 대신). 리버스 프록시 연동용 |
 
 `projects.json`은 내부 경로와 비밀번호 해시가 담기므로 `.gitignore`에 포함되어 있다 — 실제 값은 커밋하지 말 것.

@@ -6,7 +6,7 @@ projects.json 예시:
   "port": 8877,
   "uds": "/app/wterm/run/wterm.sock",
   "grace_seconds": 60,
-  "password_sha256": "<echo -n '패스워드' | sha256sum 결과. 없으면 무인증>",
+  "password_hash": "<argon2id 해시. 없으면 무인증>",
   "projects": [
     {"name": "wterm", "path": "/app/wterm"},
     {"name": "원격예시", "path": "/home/user/foo", "ssh": "user@100.x.x.x"}
@@ -43,7 +43,7 @@ class Config:
     port: int = 8877
     uds: str | None = None  # 설정 시 host/port 대신 유닉스 소켓으로 리슨
     grace_seconds: int = 60
-    password_sha256: str | None = None  # 없으면 인증 비활성화
+    password_hash: str | None = None  # argon2id 해시. 없으면 인증 비활성화
     projects: list[Project] = field(default_factory=list)
 
     def find_project(self, name: str) -> Project | None:
@@ -67,12 +67,12 @@ def load_config() -> Config:
             print(f"[config] 경고: 디렉터리가 없어 제외함: {path}")
             continue
         projects.append(Project(name=item["name"], path=str(path)))
-    password_sha256 = raw.get("password_sha256")
+    password_hash = raw.get("password_hash")
     return Config(
         host=raw.get("host", "127.0.0.1"),
         port=int(raw.get("port", 8877)),
         uds=raw.get("uds") or None,
         grace_seconds=int(raw.get("grace_seconds", 60)),
-        password_sha256=password_sha256.strip().lower() if password_sha256 else None,
+        password_hash=password_hash.strip() if password_hash else None,
         projects=projects,
     )

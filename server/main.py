@@ -5,7 +5,6 @@
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import secrets
@@ -13,6 +12,8 @@ from contextlib import asynccontextmanager
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError, InvalidHash
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -36,16 +37,17 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="W-Term", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# ── 패스워드 인증 (projects.json에 password_sha256이 있을 때만) ──────────
+# ── 패스워드 인증 (projects.json에 password_hash가 있을 때만) ──────────
 # 로그인 성공 시 발급한 토큰을 서버 메모리에만 보관한다 (무상태 철학 유지,
 # 서버 재시작 시 전부 무효화되어 재로그인 필요).
 AUTH_COOKIE = "wterm_token"
 AUTH_COOKIE_MAX_AGE = 30 * 24 * 3600
 _valid_tokens: set[str] = set()
+_password_hasher = PasswordHasher()
 
 
 def is_authed(cookies: dict[str, str]) -> bool:
-    if config.password_sha256 is None:
+    if config.password_hash is None:
         return True
     token = cookies.get(AUTH_COOKIE)
     return token is not None and token in _valid_tokens
@@ -54,15 +56,16 @@ def is_authed(cookies: dict[str, str]) -> bool:
 @app.post("/api/login")
 async def login(request: Request):
     """패스워드 검증 후 HttpOnly 쿠키로 세션 토큰을 발급한다."""
-    if config.password_sha256 is None:
+    if config.password_hash is None:
         return JSONResponse({"ok": True})
     try:
         body = await request.json()
         password = str(body["password"])
     except (json.JSONDecodeError, KeyError, TypeError, UnicodeDecodeError):
         return JSONResponse({"ok": False}, status_code=400)
-    digest = hashlib.sha256(password.encode()).hexdigest()
-    if not secrets.compare_digest(digest, config.password_sha256):
+    try:
+        _password_hasher.verify(config.password_hash, password)
+    except (VerifyMismatchError, InvalidHash):
         return JSONResponse({"ok": False}, status_code=401)
     token = secrets.token_urlsafe(32)
     _valid_tokens.add(token)
