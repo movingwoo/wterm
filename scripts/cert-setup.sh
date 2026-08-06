@@ -41,9 +41,15 @@ elif [ -x "$HOME/.acme.sh/acme.sh" ]; then
     ACME="$HOME/.acme.sh/acme.sh"
 else
     echo "오류: acme.sh를 찾을 수 없습니다. 아래 중 하나로 설치하세요." >&2
-    echo "      brew install acme.sh" >&2
+    [ "$(uname -s)" = "Darwin" ] && echo "      brew install acme.sh" >&2 || true
     echo "      curl https://get.acme.sh | sh -s email=<your@email>" >&2
     exit 1
+fi
+
+if [ "$(uname -s)" = "Darwin" ]; then
+    INSTALLER="install-launchd.sh"
+else
+    INSTALLER="install-systemd.sh"
 fi
 
 mkdir -p "$CERT_DIR"
@@ -77,7 +83,11 @@ cat <<EOF
 
 접속: https://$DOMAIN:<port>
 
-갱신은 acme.sh가 등록한 cron이 자동으로 처리합니다 (crontab -l 로 확인).
+갱신 잡은 아직 등록되지 않았을 수 있습니다. 반드시 아래를 실행하세요.
+
+  sudo ./scripts/$INSTALLER   # 갱신 잡 등록 + 부팅 시 자동 기동
+  ./scripts/cert-status.sh    # "갱신 잡 ... ✅" 가 나와야 정상
+
 갱신 동작을 지금 확인하려면:  $ACME --renew -d $DOMAIN --force
 리로드만 확인하려면:          kill -HUP \$(cat "$PID_FILE")
   → logs/wterm.log 에 "인증서를 다시 읽었습니다" 가 남으면 정상입니다.

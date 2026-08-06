@@ -13,6 +13,7 @@ import fcntl
 import json
 import os
 import pty
+import pwd
 import re
 import shlex
 import signal
@@ -28,6 +29,23 @@ CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 SIGTERM_WAIT = 10  # SIGTERM 후 SIGKILL까지 대기 초
 
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+
+def login_shell() -> str:
+    """이 사용자의 로그인 셸 경로.
+
+    $SHELL을 먼저 보되 없으면 passwd 엔트리로 떨어진다. 데몬(launchd/systemd)은
+    로그인 셸을 거치지 않아 $SHELL을 넣어주지 않으므로, 이게 없으면 zsh 사용자가
+    부팅 자동 기동 환경에서만 bash 셸을 받게 된다 — 재현하기 까다로운 종류의 차이라
+    환경변수에 의존하지 않고 passwd에서 직접 읽는다.
+    """
+    shell = os.environ.get("SHELL")
+    if shell:
+        return shell
+    try:
+        return pwd.getpwuid(os.getuid()).pw_shell or "/bin/sh"
+    except KeyError:
+        return "/bin/sh"
 
 
 def munge_cwd(cwd: str) -> str:
@@ -135,9 +153,10 @@ class Session:
                 remote_cmd = f"exec bash -lc {shlex.quote(remote_cmd)}"
             cmd = ["ssh", "-t", self.ssh, remote_cmd]
         else:
-            # 로컬 셸은 사용자의 로그인 셸($SHELL, macOS 기본값 zsh 등)을 존중한다.
+            # 로컬 셸은 사용자의 로그인 셸(macOS 기본값 zsh, 리눅스는 배포판마다
+            # 다름)을 존중한다.
             cmd = (
-                [os.environ.get("SHELL") or "/bin/bash", "-l"]
+                [login_shell(), "-l"]
                 if self.agent == "shell"
                 else [self.agent, *(extra_args or [])]
             )
@@ -247,6 +266,16 @@ class Session:
             await asyncio.sleep(0.1)
         else:
             self._signal_group(signal.SIGKILL)
+            # SIGKILL 뒤에도 거둬가지 않으면 좀비가 남는다. 서버는 오래 사는
+            # 프로세스라 유예 만료로 강제 종료된 세션마다 하나씩 쌓인다.
+            # SIGKILL은 즉시 반영되므로 짧게만 기다린다.
+            for _ in range(10):
+                try:
+                    if os.waitpid(self.pid, os.WNOHANG)[0] != 0:
+                        break
+                except ChildProcessError:
+                    break
+                await asyncio.sleep(0.1)
         self.alive = False
         self._cleanup_fd()
 
@@ -364,7 +393,13 @@ class SessionManager:
         return session
 
     async def shutdown(self) -> None:
-        for s in list(self.sessions.values()):
+        # 세션마다 SIGTERM 후 최대 SIGTERM_WAIT초를 기다리므로 순차로 돌리면
+        # 종료 시간이 세션 수에 비례해 늘어난다. 감시자(launchd/systemd)와
+        # stop.sh 모두 종료 대기에 상한이 있고, 그 상한을 넘겨 SIGKILL을 맞으면
+        # 비정상 종료로 보여 곧바로 되살아난다 — 총 대기를 SIGTERM_WAIT로 묶는다.
+        sessions = list(self.sessions.values())
+        for s in sessions:
             s.cancel_grace()
-            await s.terminate()
+        if sessions:
+            await asyncio.gather(*(s.terminate() for s in sessions))
         self.sessions.clear()

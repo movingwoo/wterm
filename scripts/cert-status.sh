@@ -108,14 +108,40 @@ fi
 
 # ── 갱신 잡 등록 여부 ────────────────────────────────────────────────
 echo
-if launchctl print system/com.wterm.certrenew >/dev/null 2>&1; then
-    say "갱신 잡" "launchd (com.wterm.certrenew) ✅"
-elif crontab -l 2>/dev/null | grep -q "acme.sh"; then
-    say "갱신 잡" "cron (acme.sh)"
-    echo "                       ⓘ  macOS의 cron은 잠자기 중 실행되지 않고 놓친 작업을"
-    echo "                          따라잡지 않습니다. sudo ./scripts/install-launchd.sh 권장"
+if [ "$(uname -s)" = "Darwin" ]; then
+    INSTALLER="install-launchd.sh"
+    if launchctl print system/com.wterm.certrenew >/dev/null 2>&1; then
+        say "갱신 잡" "launchd (com.wterm.certrenew) ✅"
+        RENEW_JOB=1
+    fi
 else
-    bad "갱신 잡" "등록된 갱신 잡이 없습니다 — 만료되면 접속이 끊깁니다"
+    INSTALLER="install-systemd.sh"
+    # 유닛이 존재하는 것과 타이머가 실제로 켜져 있는 것은 다르다. enable 여부까지 본다.
+    if systemctl is-enabled wterm-certrenew.timer >/dev/null 2>&1; then
+        NEXT="$(systemctl list-timers --all wterm-certrenew.timer 2>/dev/null | sed -n 2p)"
+        say "갱신 잡" "systemd timer (wterm-certrenew.timer) ✅"
+        [ -n "$NEXT" ] && echo "                       다음 실행: $NEXT"
+        RENEW_JOB=1
+    elif systemctl cat wterm-certrenew.timer >/dev/null 2>&1; then
+        bad "갱신 잡" "wterm-certrenew.timer가 설치돼 있지만 enable되지 않았습니다"
+        echo "                       해결: sudo systemctl enable --now wterm-certrenew.timer"
+        RENEW_JOB=1
+    fi
+fi
+
+if [ -z "${RENEW_JOB:-}" ]; then
+    if crontab -l 2>/dev/null | grep -q "acme.sh"; then
+        say "갱신 잡" "cron (acme.sh)"
+        if [ "$INSTALLER" = "install-launchd.sh" ]; then
+            echo "                       ⓘ  macOS의 cron은 잠자기 중 실행되지 않고 놓친 작업을"
+            echo "                          따라잡지 않습니다. sudo ./scripts/$INSTALLER 권장"
+        else
+            echo "                       ⓘ  cron은 머신이 꺼져 있던 동안 놓친 작업을 따라잡지"
+            echo "                          않습니다. sudo ./scripts/$INSTALLER 권장"
+        fi
+    else
+        bad "갱신 잡" "등록된 갱신 잡이 없습니다 — 만료되면 접속이 끊깁니다"
+    fi
 fi
 
 # ── 마지막 갱신 / 리로드 흔적 ────────────────────────────────────────

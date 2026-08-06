@@ -181,7 +181,29 @@ sudo launchctl bootout    system/com.wterm.server     # 중지
 sudo launchctl print       system/com.wterm.server    # 상태
 ```
 
-`KeepAlive`는 비정상 종료일 때만 재기동하도록 설정되어 있어, `./stop.sh`로 내린 서버를 launchd가 곧바로 되살리지 않는다.
+`KeepAlive`는 비정상 종료일 때만 재기동하도록 설정되어 있어, `./stop.sh`로 내린 서버를 launchd가 곧바로 되살리지 않는다. 단 `stop.sh`가 20초 폴백으로 SIGKILL까지 갔다면 비정상 종료로 보여 되살아난다 — 이때는 스크립트가 완전히 내리는 명령을 함께 출력한다.
+
+### 부팅 시 자동 기동 (Linux)
+
+```bash
+sudo ./scripts/install-systemd.sh              # 설치
+sudo ./scripts/install-systemd.sh --uninstall  # 제거
+```
+
+launchd 쪽과 같은 모양이다: **시스템 유닛 + `User=`**. 사용자 유닛(`systemd --user`)은 그 사용자의 로그인 세션이 있어야 뜨고, linger를 켜서 우회하더라도 설정이 계정 상태에 숨어 있어 "왜 안 떴는지"를 추적하기 어렵다.
+
+```bash
+sudo systemctl restart wterm             # 재시작 (코드 수정 후 필수)
+sudo systemctl stop    wterm             # 중지
+systemctl status       wterm             # 상태
+systemctl list-timers  wterm-certrenew.timer
+```
+
+`Restart=on-failure`가 launchd의 `KeepAlive{SuccessfulExit:false}`와 같은 역할을 한다. 인증서 갱신은 `wterm-certrenew.timer`(`OnCalendar` + `Persistent=true`)가 담당하며, `Persistent=true`가 머신이 꺼져 있던 동안 놓친 실행을 다음 부팅 때 따라잡는다.
+
+리눅스에서는 `sysctl net.ipv4.ip_unprivileged_port_start=443`이나 `setcap CAP_NET_BIND_SERVICE`로 root 없이 443을 열 수 있다 — macOS에 없는 선택지다.
+
+> Linux 경로는 작성돼 있지만 아직 실제 리눅스 머신에서 검증하지 않았다.
 
 ### 인증서 점검
 
@@ -203,6 +225,8 @@ sudo launchctl print       system/com.wterm.server    # 상태
 
 - **Homebrew로 설치한 acme.sh는 crontab 항목을 자동 등록하지 않는다.** 즉 `install-launchd.sh`를 돌리기 전까지는 갱신 잡이 cron에도 launchd에도 없는 상태다. `cert-status.sh`가 이를 잡아준다.
 - `cert-setup.sh`를 나중에 실행했다면 `install-launchd.sh`를 **한 번 더** 돌려야 갱신 데몬이 설치된다. acme.sh를 못 찾아 갱신 데몬을 건너뛴 경우 스크립트가 마지막에 크게 경고한다.
+
+리눅스에는 잠자기 문제가 없지만, **머신이 꺼져 있던 동안 놓친 잡을 따라잡지 않는 것은 cron도 마찬가지다.** `install-systemd.sh`도 같은 이유로 acme.sh의 crontab 항목을 제거하고 `Persistent=true` 타이머로 대체한다. 위 주의사항 두 가지는 리눅스에서도 그대로 적용된다.
 
 ### acme.sh는 반드시 `LC_ALL=C`로
 
@@ -234,7 +258,8 @@ static/
 scripts/
   cert-setup.sh          # TLS 인증서 최초 발급(acme.sh + Cloudflare DNS-01). 1회 실행
   cert-status.sh         # 인증서 만료/서빙 일치/갱신 잡 점검
-  install-launchd.sh     # 부팅 자동 기동 + 갱신 잡 launchd 전환. sudo 필요
+  install-launchd.sh     # (macOS) 부팅 자동 기동 + 갱신 잡 launchd 전환. sudo 필요
+  install-systemd.sh     # (Linux) 위와 같은 역할의 systemd 유닛/타이머. sudo 필요
 ```
 
 핵심 동작 방식, 세션 불변조건, WS 프로토콜, 개발 및 검증 규칙은 `AGENTS.md`에 있다. Claude Code로 이 저장소를 작업할 때의 추가 지침은 `CLAUDE.md`를 참고한다.

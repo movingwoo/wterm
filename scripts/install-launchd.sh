@@ -20,6 +20,11 @@ SERVER_LABEL="com.wterm.server"
 RENEW_LABEL="com.wterm.certrenew"
 DAEMON_DIR="/Library/LaunchDaemons"
 
+if [ "$(uname -s)" != "Darwin" ]; then
+    echo "오류: 이 스크립트는 macOS용입니다. 리눅스에서는 scripts/install-systemd.sh를 쓰세요." >&2
+    exit 1
+fi
+
 if [ "$(id -u)" -ne 0 ]; then
     echo "오류: sudo로 실행하세요 — sudo $0 $*" >&2
     exit 1
