@@ -116,12 +116,14 @@ class Session:
     # ── 프로세스 수명 주기 ────────────────────────────────────────────
 
     def spawn(self, extra_args: list[str] | None = None) -> None:
-        base_cmd = (
-            ["bash", "-l"]
-            if self.agent == "shell"
-            else [self.agent, *(extra_args or [])]
-        )
         if self.ssh is not None:
+            # 원격 셸은 로컬 $SHELL 경로가 원격 머신에 존재한다는 보장이 없으므로
+            # bash로 고정한다.
+            base_cmd = (
+                ["bash", "-l"]
+                if self.agent == "shell"
+                else [self.agent, *(extra_args or [])]
+            )
             # -t: 원격에 TTY 강제 할당. resize(SIGWINCH)·시그널은 ssh가 중계하고,
             # ssh가 끊기면(grace 만료 포함) 원격 프로세스는 SIGHUP으로 정리된다.
             # BatchMode는 쓰지 않는다 — 패스워드/호스트키 프롬프트를 터미널에서 처리 가능.
@@ -133,7 +135,12 @@ class Session:
                 remote_cmd = f"exec bash -lc {shlex.quote(remote_cmd)}"
             cmd = ["ssh", "-t", self.ssh, remote_cmd]
         else:
-            cmd = base_cmd
+            # 로컬 셸은 사용자의 로그인 셸($SHELL, macOS 기본값 zsh 등)을 존중한다.
+            cmd = (
+                [os.environ.get("SHELL") or "/bin/bash", "-l"]
+                if self.agent == "shell"
+                else [self.agent, *(extra_args or [])]
+            )
 
         pid, master_fd = pty.fork()  # 자식은 setsid + PTY를 제어 터미널로 가짐
         if pid == 0:  # 자식 프로세스
