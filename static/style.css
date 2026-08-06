@@ -181,6 +181,21 @@ body.sidebar-collapsed #sidebar-toggle svg { transform: rotate(180deg); }
 #conn-status.disconnected { background: #2b1c1e; color: #f38ba8; }
 #conn-status.connecting { background: #2b271c; color: #f9e2af; }
 
+#logout-btn {
+  margin-top: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 12px;
+  color: #a6adc8;
+  background: #313244;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+#logout-btn:hover { background: #45475a; color: #cdd6f4; }
+
 #terminal-pane { flex: 1; position: relative; min-width: 0; }
 
 #terminal { position: absolute; inset: 0; padding: 4px; }

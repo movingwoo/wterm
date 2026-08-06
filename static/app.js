@@ -11,6 +11,7 @@
   const loginFormEl = document.getElementById("login-form");
   const loginPasswordEl = document.getElementById("login-password");
   const loginErrorEl = document.getElementById("login-error");
+  const logoutBtnEl = document.getElementById("logout-btn");
 
   const term = new Terminal({
     fontFamily: '"Cascadia Code", "D2Coding", Menlo, monospace',
@@ -68,11 +69,42 @@
       loginPasswordEl.value = "";
       loginOverlayEl.classList.remove("visible");
       loadProjects();
-    } else {
-      loginErrorEl.textContent =
-        res.status === 401 ? "패스워드가 올바르지 않습니다." : "로그인에 실패했습니다.";
-      loginPasswordEl.select();
+      return;
     }
+    if (res.status === 429) {
+      // 서버가 시도 제한으로 막은 상태. 남은 시간을 알려주지 않으면 사용자는
+      // 패스워드가 틀린 줄 알고 계속 눌러 차단을 더 늘린다.
+      let seconds = 0;
+      try {
+        seconds = (await res.json()).retry_after || 0;
+      } catch {
+        seconds = Number(res.headers.get("Retry-After")) || 0;
+      }
+      loginErrorEl.textContent = `시도가 너무 많습니다. ${seconds}초 후 다시 시도하세요.`;
+    } else if (res.status === 401) {
+      loginErrorEl.textContent = "패스워드가 올바르지 않습니다.";
+    } else if (res.status === 403) {
+      loginErrorEl.textContent = "허용되지 않은 주소로 접속했습니다.";
+    } else {
+      loginErrorEl.textContent = "로그인에 실패했습니다.";
+    }
+    loginPasswordEl.select();
+  });
+
+  logoutBtnEl.addEventListener("click", async () => {
+    try {
+      await fetch("/api/logout", { method: "POST" });
+    } catch {
+      /* 서버에 못 닿아도 아래에서 화면은 잠근다 */
+    }
+    intentionalClose = true;
+    if (ws) ws.close();
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    document.body.classList.remove("session-open");
+    term.reset();
+    setStatus("disconnected", "연결 안 됨");
+    projectListEl.replaceChildren();
+    showLogin("로그아웃되었습니다.");
   });
 
   function fitAndReport() {
@@ -176,6 +208,9 @@
       if (ws !== sock) return; // 이미 다른 연결로 교체됨
       ws = null;
       loadProjects();
+      // 오리진 거절(4403)은 여기로 오지 않는다. 서버가 accept 전에 닫아 핸드셰이크가
+      // HTTP 403으로 끝나고, 브라우저는 그것을 1006으로만 알려준다. 아래 재연결
+      // 경로를 타고 "재연결 실패"로 끝나며, 원인은 서버 로그에 남는다.
       if (intentionalClose || ev.code === 4000 || ev.code === 4401 || ev.code === 4404) {
         setStatus("disconnected", "연결 종료");
         if (ev.code === 4000)

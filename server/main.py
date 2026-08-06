@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import atexit
 import json
 import logging
@@ -12,14 +13,18 @@ import os
 import secrets
 import signal
 import ssl
+import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+from urllib.parse import urlsplit
 
+from anyio import to_thread
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, InvalidHash
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .config import load_config
@@ -42,41 +47,202 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="W-Term", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+# ── Origin 검증 ─────────────────────────────────────────────────────
+#
+# WebSocket 핸드셰이크에는 CORS가 적용되지 않는다. 쿠키만 확인하면, 로그인해 둔
+# 사용자가 아무 웹페이지나 방문했을 때 그 페이지가 wss://<이 서버>/ws/... 를 열 수
+# 있고 브라우저가 쿠키를 붙여준다(CSWSH). 이 서버에서 그것은 곧 임의 명령 실행이라
+# SameSite 쿠키 하나에 기대지 않고 Origin을 직접 확인한다.
+#
+# 브라우저는 WS 핸드셰이크와 POST에 Origin을 반드시 실어 보내고, 공격자는 피해자의
+# 브라우저가 이 서버로 보내는 Host를 바꿀 수 없다. 그래서 기본 규칙은 "Origin의
+# 호스트 == Host 헤더"로 충분하다. 프록시가 Host를 바꿔 쓰는 구성이라면
+# projects.json의 allowed_origins로 명시한다.
+#
+# Origin이 아예 없는 요청은 브라우저가 보낸 것이 아니므로 거부한다. 이 서버의
+# 클라이언트는 static/app.js뿐이라 잃는 것이 없다.
+
+
+def origin_allowed(headers) -> bool:
+    origin = headers.get("origin")
+    if not origin:
+        return False
+    origin = origin.rstrip("/").lower()
+    if config.allowed_origins:
+        return origin in config.allowed_origins
+    host = headers.get("host")
+    return bool(host) and urlsplit(origin).netloc == host.lower()
+
+
 # ── 패스워드 인증 (projects.json에 password_hash가 있을 때만) ──────────
+#
 # 로그인 성공 시 발급한 토큰을 서버 메모리에만 보관한다 (무상태 철학 유지,
 # 서버 재시작 시 전부 무효화되어 재로그인 필요).
+#
+# 만료는 쿠키 max-age가 아니라 서버가 판정한다. max-age는 브라우저에게 하는 부탁일
+# 뿐이라, 탈취된 토큰은 그것만으로는 영원히 유효하다. 발급 시각을 함께 들고 있으면서
+# 검사할 때마다 확인하고, 폐기 수단으로 /api/logout을 둔다 (재시작은 폐기 수단이 될
+# 수 없다 — PTY 세션이 전부 죽는다).
 AUTH_COOKIE = "wterm_token"
-AUTH_COOKIE_MAX_AGE = 30 * 24 * 3600
-_valid_tokens: set[str] = set()
+AUTH_TOKEN_TTL = 30 * 24 * 3600  # 쿠키 max-age와 서버측 만료를 같은 값으로 묶는다
+MAX_TOKENS = 512  # 발급 토큰 상한. 넘으면 오래된 것부터 버린다
+
+# 시계 변경에 영향받지 않도록 monotonic을 쓴다. 토큰은 어차피 프로세스와 수명을
+# 같이 하므로 벽시계 기준으로 보관할 이유가 없다.
+_valid_tokens: OrderedDict[str, float] = OrderedDict()  # token -> 발급 시각
 _password_hasher = PasswordHasher()
+
+_auth_log = logging.getLogger("wterm.auth")
+# 루트가 ERROR로 잠겨 있어(setup_logging 참조) 그대로 두면 차단 기록이 남지 않는다.
+# 차단은 장애가 아니지만 "왜 로그인이 안 되지"의 답이 여기밖에 없다. wterm.tls와
+# 같은 방식으로 자식 로거에 자체 레벨을 준다.
+_auth_log.setLevel(logging.INFO)
+
+
+def _issue_token() -> str:
+    now = time.monotonic()
+    for token in [t for t, at in _valid_tokens.items() if now - at >= AUTH_TOKEN_TTL]:
+        del _valid_tokens[token]
+    token = secrets.token_urlsafe(32)
+    _valid_tokens[token] = now
+    while len(_valid_tokens) > MAX_TOKENS:
+        _valid_tokens.popitem(last=False)  # 가장 먼저 발급된 것부터
+    return token
 
 
 def is_authed(cookies: dict[str, str]) -> bool:
     if config.password_hash is None:
         return True
     token = cookies.get(AUTH_COOKIE)
-    return token is not None and token in _valid_tokens
+    if token is None:
+        return False
+    issued_at = _valid_tokens.get(token)
+    if issued_at is None:
+        return False
+    if time.monotonic() - issued_at >= AUTH_TOKEN_TTL:
+        del _valid_tokens[token]
+        return False
+    return True
+
+
+def _is_secure(request: Request) -> bool:
+    """https로 들어온 요청인지. 앞단 프록시가 TLS를 끝내는 구성에서는 uvicorn이
+    X-Forwarded-Proto로 scheme을 바로잡아 준다. 서버가 직접 TLS를 종단하는 경우
+    평문으로 들어올 길 자체가 없으므로 tls_enabled면 무조건 True로 봐도 된다."""
+    return request.url.scheme == "https" or config.tls_enabled
+
+
+def _set_auth_cookie(resp: Response, request: Request, token: str) -> None:
+    # samesite=strict: 인증 확인은 같은 오리진에서 뜬 페이지의 fetch/WS만 하므로
+    # 교차 사이트 진입 흐름이 없다. 첫 문서 요청(/)은 쿠키를 보지 않는 덕에
+    # 외부 링크로 들어와도 화면이 깨지지 않는다.
+    resp.set_cookie(
+        AUTH_COOKIE,
+        token,
+        max_age=AUTH_TOKEN_TTL,
+        httponly=True,
+        samesite="strict",
+        secure=_is_secure(request),
+    )
+
+
+# ── 로그인 시도 제한 ────────────────────────────────────────────────
+#
+# argon2 검증 1회가 64 MiB / 35ms를 쓴다. 제한이 없으면 인증 없이 누구나 그 비용을
+# 태울 수 있고, 검증을 스레드로 뺀 뒤에도 비용 자체는 그대로다. 그래서 두 겹으로 막는다:
+#   (1) 버킷별 실패 횟수에 지수 백오프 — 반복 시도를 검증 전에 잘라낸다
+#   (2) 전역 동시 검증 수 제한 — IP를 흩뿌리는 시도에도 총비용의 상한을 준다
+# (1)만으로는 분산 시도를 막지 못하고 (2)만으로는 무차별 대입을 막지 못한다.
+
+LOGIN_FREE_ATTEMPTS = 5  # 이 횟수까지는 지연 없음 (오타 여유)
+LOGIN_BACKOFF_MAX = 900.0  # 차단 상한 15분
+LOGIN_FAIL_DECAY = 900.0  # 마지막 차단이 풀린 뒤 이만큼 조용하면 실패 횟수 리셋
+LOGIN_BUCKET_LIMIT = 1024  # 추적할 버킷 상한 (IP를 바꿔가며 채우는 것 방지)
+LOGIN_MAX_CONCURRENT = 2  # 동시 argon2 검증 수
+
+_login_fails: OrderedDict[str, tuple[int, float]] = OrderedDict()  # 키 -> (실패수, 해제시각)
+_login_slots = asyncio.Semaphore(LOGIN_MAX_CONCURRENT)
+
+
+def _client_key(request: Request) -> str:
+    """제한 버킷 키. uds나 프록시 뒤에서는 실제 클라이언트 IP가 없거나 프록시
+    IP뿐이라 전부 한 버킷으로 모인다 — 그 구성에서는 앞단이 IP별 제한을 맡고,
+    여기서는 전역 제한으로만 동작한다."""
+    return request.client.host if request.client else "-"
+
+
+def _login_block_remaining(key: str, now: float) -> float:
+    """남은 차단 시간(초). 0이면 통과."""
+    entry = _login_fails.get(key)
+    return max(0.0, entry[1] - now) if entry else 0.0
+
+
+def _record_login_failure(key: str, now: float) -> None:
+    fails, unblock_at = _login_fails.pop(key, (0, 0.0))
+    if now - unblock_at > LOGIN_FAIL_DECAY:
+        fails = 0  # 한참 조용했으면 새로 센다 (오타가 영구 누적되지 않도록)
+    fails += 1
+    delay = (
+        min(2.0 ** (fails - LOGIN_FREE_ATTEMPTS), LOGIN_BACKOFF_MAX)
+        if fails > LOGIN_FREE_ATTEMPTS
+        else 0.0
+    )
+    if delay:
+        _auth_log.info("로그인 %d회 실패로 %.0f초 차단: %s", fails, delay, key)
+    _login_fails[key] = (fails, now + delay)  # pop 후 재삽입이라 이미 맨 뒤(=최신)
+    while len(_login_fails) > LOGIN_BUCKET_LIMIT:
+        _login_fails.popitem(last=False)
 
 
 @app.post("/api/login")
 async def login(request: Request):
     """패스워드 검증 후 HttpOnly 쿠키로 세션 토큰을 발급한다."""
+    if not origin_allowed(request.headers):
+        return JSONResponse({"ok": False}, status_code=403)
     if config.password_hash is None:
         return JSONResponse({"ok": True})
+    key = _client_key(request)
+    wait = _login_block_remaining(key, time.monotonic())
+    if wait > 0:
+        # 차단 중에는 argon2를 아예 돌리지 않는다. 비용을 안 태우는 것이 요점이다.
+        retry_after = int(wait) + 1
+        return JSONResponse(
+            {"ok": False, "retry_after": retry_after},
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
     try:
         body = await request.json()
         password = str(body["password"])
     except (json.JSONDecodeError, KeyError, TypeError, UnicodeDecodeError):
         return JSONResponse({"ok": False}, status_code=400)
     try:
-        _password_hasher.verify(config.password_hash, password)
+        async with _login_slots:
+            # argon2 검증은 64 MiB짜리 동기 CPU 작업이다. 이벤트 루프에서 그대로
+            # 돌리면 검증 한 번마다 살아있는 모든 PTY 세션의 입출력이 멎는다.
+            await to_thread.run_sync(
+                _password_hasher.verify, config.password_hash, password
+            )
     except (VerifyMismatchError, InvalidHash):
+        _record_login_failure(key, time.monotonic())
         return JSONResponse({"ok": False}, status_code=401)
-    token = secrets.token_urlsafe(32)
-    _valid_tokens.add(token)
+    _login_fails.pop(key, None)
     resp = JSONResponse({"ok": True})
-    resp.set_cookie(
-        AUTH_COOKIE, token, httponly=True, samesite="lax", max_age=AUTH_COOKIE_MAX_AGE
+    _set_auth_cookie(resp, request, _issue_token())
+    return resp
+
+
+@app.post("/api/logout")
+async def logout(request: Request):
+    """토큰을 서버에서 지우고 쿠키를 만료시킨다."""
+    if not origin_allowed(request.headers):
+        return JSONResponse({"ok": False}, status_code=403)
+    token = request.cookies.get(AUTH_COOKIE)
+    if token:
+        _valid_tokens.pop(token, None)
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(
+        AUTH_COOKIE, httponly=True, samesite="strict", secure=_is_secure(request)
     )
     return resp
 
@@ -133,6 +299,19 @@ async def terminal_ws(
       클라이언트→서버: JSON 텍스트 {"type":"input","data":str} | {"type":"resize","cols":N,"rows":M}
       서버→클라이언트: 바이너리(터미널 raw 출력) | JSON 텍스트 {"type":"status"|"exit",...}
     """
+    # 쿠키 검사보다 먼저. 다른 사이트가 연 소켓은 쿠키가 유효해도 붙여선 안 된다.
+    # accept 전에 닫으므로 핸드셰이크 자체가 HTTP 403으로 끝난다 — 공격자 페이지는
+    # 열린 소켓을 단 한 순간도 쥐지 못한다. 대신 close code가 전달되지 않아
+    # 브라우저에는 평범한 연결 실패로만 보이므로, 설정 실수를 가려낼 단서는
+    # 로그로 남긴다(정상 사용 중에는 찍힐 일이 없는 줄이다).
+    if not origin_allowed(ws.headers):
+        _auth_log.info(
+            "오리진 불일치로 WS 거절: origin=%r host=%r",
+            ws.headers.get("origin"), ws.headers.get("host"),
+        )
+        await ws.close(code=4403, reason="허용되지 않은 오리진")
+        return
+
     project = config.find_project(project_name)
     if project is None:
         await ws.close(code=4404, reason="화이트리스트에 없는 프로젝트")

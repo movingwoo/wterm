@@ -7,6 +7,7 @@ projects.json 예시:
   "uds": "/app/wterm/run/wterm.sock",
   "grace_seconds": 60,
   "password_hash": "<argon2id 해시. 없으면 무인증>",
+  "allowed_origins": ["https://wterm.example.com:8443"],
   "tls_certfile": "/Users/me/.wterm/fullchain.pem",
   "tls_keyfile": "/Users/me/.wterm/key.pem",
   "projects": [
@@ -22,6 +23,11 @@ projects.json 예시:
 포트를 아예 열지 않는다). 리버스 프록시 컨테이너가 다른 Docker 네트워크에 있어
 호스트 포트로 접근하기 어려울 때, 소켓 파일이 있는 디렉터리를 컨테이너에
 바인드 마운트해서 쓰는 용도.
+
+"allowed_origins"는 보통 비워둔다 — 비어 있으면 "Origin의 호스트가 Host 헤더와
+같을 것"을 요구하며, 이것이 일반적인 구성에서 옳은 규칙이다. 앞단 프록시가 Host를
+바꿔 쓰는 등 그 규칙이 안 맞는 구성에서만 접속에 쓰는 오리진을 스킴/포트까지
+포함해 명시한다 (예: "https://wterm.example.com:8443").
 
 "tls_certfile"/"tls_keyfile"이 둘 다 있으면 앞단 리버스 프록시 없이 서버가 직접
 HTTPS로 리슨한다 (uds 사용 시에는 무시됨). 인증서를 발급/갱신하는 것은 이 서버의
@@ -51,6 +57,8 @@ class Config:
     uds: str | None = None  # 설정 시 host/port 대신 유닉스 소켓으로 리슨
     grace_seconds: int = 60
     password_hash: str | None = None  # argon2id 해시. 없으면 인증 비활성화
+    # 허용 오리진 화이트리스트. 비어 있으면 Origin 호스트 == Host 헤더로 판정한다.
+    allowed_origins: list[str] = field(default_factory=list)
     tls_certfile: str | None = None  # 풀체인 PEM. keyfile과 함께 있을 때만 HTTPS
     tls_keyfile: str | None = None  # 개인키 PEM
     projects: list[Project] = field(default_factory=list)
@@ -81,6 +89,12 @@ def load_config() -> Config:
             continue
         projects.append(Project(name=item["name"], path=str(path)))
     password_hash = raw.get("password_hash")
+    # 비교는 소문자 기준. 브라우저가 보내는 Origin에는 끝 슬래시가 없으므로 떼어 맞춘다.
+    allowed_origins = [
+        o.strip().rstrip("/").lower()
+        for o in raw.get("allowed_origins", [])
+        if isinstance(o, str) and o.strip()
+    ]
     certfile = raw.get("tls_certfile") or None
     keyfile = raw.get("tls_keyfile") or None
     if bool(certfile) != bool(keyfile):
@@ -93,6 +107,7 @@ def load_config() -> Config:
         uds=raw.get("uds") or None,
         grace_seconds=int(raw.get("grace_seconds", 60)),
         password_hash=password_hash.strip() if password_hash else None,
+        allowed_origins=allowed_origins,
         tls_certfile=certfile,
         tls_keyfile=keyfile,
         projects=projects,
