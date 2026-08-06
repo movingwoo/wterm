@@ -274,6 +274,23 @@ def _release_pid_file() -> None:
         pass
 
 
+# ── 종료 상태 ───────────────────────────────────────────────────────
+#
+# uvicorn(0.34+)은 graceful shutdown을 마친 뒤 잡아뒀던 시그널을 원래 핸들러에게
+# 다시 던진다(Server._reraise_signals). 원래 핸들러가 기본값이면 프로세스는 결국
+# "SIGTERM에 맞아 죽은" 상태로 끝나고, 이건 감시자 입장에서 비정상 종료다:
+# launchd의 KeepAlive(SuccessfulExit=false)가 그대로 걸려 stop.sh로 내린 서버를
+# 곧바로 되살린다 — stop.sh가 아무 효과도 없어 보이는 원인이었다.
+# 미리 우리 핸들러를 걸어두면 uvicorn이 복원한 뒤 되던진 SIGTERM을 여기서 받아
+# 종료 코드 0으로 끝낼 수 있다. 이 시점에는 lifespan shutdown이 이미 끝나
+# 세션 정리(manager.shutdown)도 완료된 상태다.
+
+
+def _exit_success(signum, frame) -> None:
+    _release_pid_file()  # os._exit는 atexit를 타지 않으므로 직접 정리한다
+    os._exit(0)
+
+
 def setup_logging() -> None:
     """ERROR 이상만 기록. 자정마다 로테이션하며 하루 치(직전 파일 1개)만 보관."""
     log_dir = BASE_DIR / "logs"
@@ -296,6 +313,9 @@ def main() -> None:
 
     setup_logging()
     _claim_pid_file()
+    # uvicorn이 serve() 진입 시 이 핸들러를 저장했다가 종료 직전에 복원하고
+    # SIGTERM을 되던진다. 반드시 uvicorn.run() 전에 걸어야 한다.
+    signal.signal(signal.SIGTERM, _exit_success)
     # log_config=None: uvicorn 자체 로깅 설정을 끄고 위 root 로거로 전파시킴
     kwargs = {"log_config": None, "access_log": False}
     if config.uds:

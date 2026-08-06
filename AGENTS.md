@@ -8,7 +8,7 @@ This file contains the detailed architecture, protocol, operational assumptions,
 
 ## Running the project
 
-- Start the service with `./start.sh`. On macOS the long-running deployment is a LaunchDaemon (`scripts/install-launchd.sh`); restart that one with `launchctl kickstart -k system/com.wterm.server`.
+- Start the service with `./start.sh`; stop it with `./stop.sh` on either platform. The long-running deployment is supervised: a LaunchDaemon on macOS (`scripts/install-launchd.sh`, restart with `launchctl kickstart -k system/com.wterm.server`) or a systemd unit on Linux (`scripts/install-systemd.sh`, restart with `systemctl restart wterm`).
 - Server address, authentication, grace period, UDS, TLS certificate paths, and the project whitelist come from `projects.json`.
 - Use the existing `.venv/bin/python`; the system Python does not provide pip or venv.
 - If dependencies must be recreated, use `~/.local/bin/uv` as documented in `CLAUDE.md`.
@@ -24,7 +24,8 @@ This file contains the detailed architecture, protocol, operational assumptions,
 - `static/vendor/`: vendored third-party files; do not edit.
 - `scripts/cert-setup.sh`: one-shot TLS certificate issuance via acme.sh; not invoked by the server.
 - `scripts/cert-status.sh`: certificate health check (expiry, served-vs-file match, renewal job).
-- `scripts/install-launchd.sh`: installs the boot-time LaunchDaemon and moves renewal off cron.
+- `scripts/install-launchd.sh`: installs the boot-time LaunchDaemon and moves renewal off cron (macOS).
+- `scripts/install-systemd.sh`: the Linux counterpart — a `wterm.service` system unit plus a `wterm-certrenew.timer`. Keep the two installers behaviourally equivalent; a change to one usually belongs in the other.
 
 ## Session invariants
 
@@ -64,11 +65,14 @@ The server terminates TLS itself when `tls_certfile` and `tls_keyfile` are both 
 - The server writes `logs/wterm.pid` itself and removes it on clean exit. Do not move this back into `start.sh`: launchd runs the server in the foreground, so a launcher-written pid file would not exist under launchd and both `stop.sh` and the certificate reload hook depend on it.
 - `_release_pid_file` only deletes the file when it still holds this process's pid, so a slow-dying predecessor cannot delete a newer server's pid file.
 - `start.sh` waits for the server to publish its pid and reports startup failures instead of recording a dead pid.
-- Under launchd, `KeepAlive` is `SuccessfulExit: false` so a deliberate `stop.sh` is not immediately undone. Restart with `launchctl kickstart -k`, not by editing the plist.
-- A LaunchDaemon gets a minimal `PATH` and no login shell. `claude` and `codex` are spawned by the server directly, so their directories must stay in the plist's `PATH`.
+- The supervisor restarts the server only on an unsuccessful exit (launchd `KeepAlive: SuccessfulExit: false`, systemd `Restart=on-failure`), so a deliberate `stop.sh` is not immediately undone. Restart with `launchctl kickstart -k` / `systemctl restart wterm`, not by editing the unit.
+- That rule only holds because the server converts a SIGTERM shutdown into exit code 0 (`_exit_success` in `server/main.py`). uvicorn re-raises the signal it captured once graceful shutdown finishes, so without a handler installed *before* `uvicorn.run()` the process dies by signal, the supervisor reads that as a crash, and `stop.sh` gets silently undone. Do not remove that handler, and re-verify it when upgrading uvicorn.
+- Anything that kills the server with SIGKILL — including `stop.sh`'s own 20-second fallback — does read as a crash and will be resurrected. `SessionManager.shutdown` therefore terminates sessions concurrently so total shutdown stays bounded by `SIGTERM_WAIT` rather than scaling with session count.
+- A daemon gets a minimal `PATH`, no login shell, and no `$SHELL`. `claude` and `codex` are spawned by the server directly, so their directories must stay in the unit's `PATH`; shell sessions resolve the login shell from the passwd entry (`login_shell()`) rather than `$SHELL` for the same reason.
 
 ## Development rules
 
+- macOS and Linux are both supported targets. The server code is plain POSIX (`pty`, `fcntl`, `termios`, `os.killpg`) and must stay that way — no `/proc`, no `launchctl`, no Darwin-only syscalls in `server/`. Platform differences belong in `scripts/`, branched on `uname -s`. Note that only macOS has been exercised in production so far; Linux paths are written but unverified.
 - Preserve compatibility for existing Claude URLs; the default `agent` remains `claude`, and legacy `shell=1` remains supported.
 - Do not edit `static/vendor/` or introduce a frontend build pipeline without an explicit requirement.
 - Do not expose the server on `0.0.0.0`. Prefer loopback or UDS behind an authenticated VPN/reverse proxy. When the server terminates TLS itself and other devices must reach it directly, binding to a private VPN-interface address (a tailnet IP, for example) is acceptable; a routable public address is not.
