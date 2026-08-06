@@ -34,6 +34,7 @@ This file contains the detailed architecture, protocol, operational assumptions,
 - Preserve the disconnect grace period, the 256 KB replay buffer, PTY resize handling, and process-group termination behavior.
 - Preserve non-blocking PTY writes. Partial writes and `BlockingIOError` must retain unsent UTF-8 bytes in the write buffer.
 - New clients replace an existing client with close code 4000. Authentication and whitelist failures use their existing close codes.
+- Note that only 4000 and 4401 actually reach the client. The origin (4403), whitelist (4404), and agent (4400) checks run *before* `ws.accept()`, so Starlette rejects the handshake with HTTP 403 and the close code is never delivered — the browser sees a generic 1006. That is the desired trade for 4403 (a hostile page never holds an open socket, and the reason is logged server-side instead); do not "fix" it by moving the origin check after `accept()`.
 - Claude resume commands are `claude --resume` and `claude --continue`.
 - Codex resume commands are `codex resume` and `codex resume --last`.
 - If resume history does not exist, start a new session instead of launching a broken resume flow.
@@ -47,6 +48,16 @@ Client-to-server messages are JSON text:
 - `{"type":"resize","cols":80,"rows":24}`
 
 Server-to-client terminal output is binary. Status and exit notifications are JSON text. When changing the protocol, update both `server/main.py` and `static/app.js` in the same change.
+
+## Authentication
+
+Authentication is a second lock behind the network boundary, not a substitute for it. The binding rule below still governs. Keep these properties:
+
+- **Origin is checked on every WebSocket handshake and every POST.** WS handshakes are not subject to CORS, so a cookie check alone lets any page the user visits open a socket here — which on this server is arbitrary command execution. The default rule needs no configuration: the origin's host must equal the `Host` header, which holds because an attacker cannot change the `Host` the victim's browser sends to us. `allowed_origins` is the escape hatch for proxies that rewrite `Host`. A missing `Origin` is rejected; `static/app.js` is the only client and browsers always send it.
+- **Never call `_password_hasher.verify` on the event loop.** It is a 64 MiB, ~35 ms synchronous CPU operation; running it inline stalls every live PTY session for its duration, and unauthenticated requests can drive it. It goes through `anyio.to_thread.run_sync` under `_login_slots`, which caps concurrent verifications so the total cost stays bounded.
+- **Rate limiting must reject before the hash runs.** The point is not to slow guessing (argon2 already does that) but to avoid paying the cost at all. A blocked bucket returns 429 without touching argon2 — including for the correct password.
+- **Token expiry is enforced server-side.** Cookie `max-age` is only a request to the browser; `_valid_tokens` stores issue times and `is_authed` checks them, so `AUTH_TOKEN_TTL` and the cookie's `max-age` must stay the same value. `/api/logout` is the revocation path — a restart is not one, since it kills every PTY session.
+- Both `_valid_tokens` and `_login_fails` are bounded `OrderedDict`s. They are reachable by unauthenticated requests, so any change must keep them from growing without limit.
 
 ## TLS
 
