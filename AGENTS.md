@@ -25,6 +25,7 @@ This file contains the detailed architecture, protocol, operational assumptions,
 - `scripts/cert-setup.sh`: one-shot TLS certificate issuance via acme.sh; not invoked by the server.
 - `scripts/cert-status.sh`: certificate health check (expiry, served-vs-file match, renewal job).
 - `scripts/install-launchd.sh`: installs the boot-time LaunchDaemon and moves renewal off cron (macOS).
+- `tests/`: pytest smoke suite. `conftest.py` owns the repo-copy fixture that every test's server runs from.
 - `scripts/install-systemd.sh`: the Linux counterpart — a `wterm.service` system unit plus a `wterm-certrenew.timer`. Keep the two installers behaviourally equivalent; a change to one usually belongs in the other.
 
 ## Session invariants
@@ -102,15 +103,24 @@ The server terminates TLS itself when `tls_certfile` and `tls_keyfile` are both 
 For server changes, run at minimum:
 
 ```bash
+.venv/bin/python -m pytest
 .venv/bin/python -m py_compile server/config.py server/session.py server/main.py
 git diff --check
 ```
+
+`tests/` is a pytest smoke suite; `requirements-dev.txt` holds its two extra dependencies. GitHub Actions runs it on pushes to `main` and on pull requests, across ubuntu (3.10/3.13) and macOS (3.10, the production interpreter) — see `.github/workflows/ci.yml`.
+
+- Tests start the server **as a real process from a copy of the repository**, never in-process. `server/main.py` reads `projects.json` and `logs/wterm.pid` from fixed paths at import time, so a copy is what keeps a test run from touching the deployment or colliding with a running server. It is also the only way to cover what has actually broken here: the pid-file lock, exit code 0 on SIGTERM, and `SIGHUP` certificate reload are all process-level behaviour.
+- The suite needs no `claude`/`codex` CLI. Session behaviour is exercised through a login shell, and the agent path is covered only up to "reports exit 127 when the binary is not on `PATH`".
+- Interactive `bash` ignores SIGTERM, so a live shell session makes shutdown wait the full `SIGTERM_WAIT` before `SIGKILL`. Tests that keep a session open end it with `exit` (`end_shell`) rather than leaving it to teardown; that is also the only coverage of a normal exit notification.
+- A separate `systemd` CI job installs `scripts/install-systemd.sh` on the runner for real and walks install → start → SIGKILL/resurrect → `stop.sh`/stay-down → `cert-status.sh` → uninstall. It is the only place the supervisor contract (`Restart=on-failure` paired with exit code 0) is actually exercised, so changes to either installer or to shutdown behaviour must keep it passing. Reboot auto-start and the pre-240 `append:` fallback stay unverifiable there.
+- Do not weaken an assertion to make a test pass. These encode the invariants in this file, and each one exists because that behaviour broke before.
 
 For TLS changes, serve on a spare port with a throwaway self-signed certificate and verify: HTTPS responds, a `wss://` upgrade succeeds, overwriting the files changes nothing until `SIGHUP`, `SIGHUP` swaps the served certificate without dropping the process, and a corrupt certificate file leaves the previous one in service.
 
 For session-lifecycle changes, also verify PTY startup, ANSI output, input, resize, detach/reconnect replay, grace cancellation, and child-process cleanup. Exercise both the affected AI CLI and shell paths. For protocol or UI changes, verify project status badges, new/resume actions, abnormal reconnect, authentication expiry, and mobile-width layout in a browser.
 
-Do not add a test dependency solely for a one-off check. Prefer the installed environment and focused smoke tests unless a maintained test suite is being introduced intentionally.
+Keep `requirements-dev.txt` minimal. The suite deliberately drives the server over the wire with an HTTP client and the WebSocket client uvicorn already pulls in, rather than adding a test-client or async-test framework. Do not add a dependency for a one-off check.
 
 ## Known issues
 

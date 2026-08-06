@@ -1,0 +1,8 @@
+# 스모크 테스트 전용 의존성 (운영에는 필요 없음).
+#   .venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
+#   .venv/bin/python -m pytest
+#
+# WebSocket 클라이언트는 따로 넣지 않는다 — uvicorn[standard]가 가져오는
+# websockets 패키지의 동기 클라이언트를 그대로 쓴다.
+pytest>=8.0
+httpx>=0.27

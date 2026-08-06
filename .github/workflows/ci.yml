@@ -1,0 +1,271 @@
+name: CI
+
+# push를 main으로 한정한다. 모든 브랜치를 대상으로 두면 같은 저장소에서 PR을 열
+# 때 push와 pull_request가 둘 다 발동해 전체 잡이 두 번 돈다 (아래 concurrency는
+# 같은 이벤트끼리만 취소하므로 그건 막지 못한다). PR 전에 돌려보고 싶으면
+# workflow_dispatch로 수동 실행한다.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 같은 브랜치에 연달아 푸시하면 이전 실행은 취소한다.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: 정적 점검
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 파이썬 문법
+        run: python -m py_compile server/*.py
+
+      - name: 셸 스크립트 문법
+        # bash -n은 파일 하나만 읽는다. 나머지는 위치 인자가 되어 조용히 넘어간다.
+        run: |
+          for f in start.sh stop.sh scripts/*.sh; do
+            echo "-- $f"
+            bash -n "$f"
+          done
+
+      - name: 설정 예시 JSON
+        run: python -m json.tool projects.example.json > /dev/null
+
+      # projects.json에는 argon2 패스워드 해시가 들어 있고 PEM은 개인키다.
+      # .gitignore가 이미 막고 있지만, 한 번 커밋되면 되돌리기 어려운 종류다.
+      - name: 비밀 파일이 커밋되지 않았는지
+        run: |
+          leaked="$(git ls-files 'projects.json' 'projects.*.json' '*.pem' '*.key' \
+            | grep -v '^projects.example.json$' || true)"
+          if [ -n "$leaked" ]; then
+            echo "커밋되면 안 되는 파일이 추적되고 있습니다:" >&2
+            echo "$leaked" >&2
+            exit 1
+          fi
+
+      - name: 공백 오류
+        run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD
+
+  test:
+    name: 스모크 (${{ matrix.os }} / py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      # 3.10은 운영 머신의 인터프리터, 3.13은 앞으로 올라갈 자리. 의존성이 고정돼
+      # 있지 않아(requirements.txt가 하한만 지정) 최신 조합이 깨지는 것을 먼저 본다.
+      #
+      # macOS × 3.13은 일부러 뺐다. macOS는 운영 플랫폼이라 3.10(프로덕션 거울)이
+      # 필요하고, 새 파이썬 문제는 ubuntu × 3.13이 잡는다. 그 둘이 동시에 걸려야만
+      # 드러나는 조합은 드물어서 잡 하나 값을 못 한다.
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.10" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: macos-latest, python: "3.10" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: 의존성 설치
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      # 테스트는 저장소 사본에서 서버를 실제 프로세스로 띄운다. basetemp를
+      # 워크스페이스 밖에 두어야 사본이 자기 자신을 다시 복사하지 않는다.
+      - name: 스모크 테스트
+        run: python -m pytest -v --basetemp="${{ runner.temp }}/pytest"
+
+      - name: 실패 시 서버 로그 수집
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wterm-logs-${{ matrix.os }}-py${{ matrix.python }}
+          path: ${{ runner.temp }}/pytest/**/logs/*
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # scripts/install-systemd.sh와 cert-status.sh의 systemd 분기는 개발 머신이
+  # macOS라 손으로 돌려볼 방법이 없다. 러너가 systemd를 PID 1로 돌리는 진짜
+  # 리눅스 VM이고 무암호 sudo가 되므로, 여기서 설치→기동→종료→제거를 왕복시킨다.
+  #
+  # 여기서 확인되지 않는 것: 실제 재부팅(등록 여부까지만 본다)과 systemd 240
+  # 미만의 `append:` 폴백(러너는 최신이다). 배포판도 우분투 하나뿐이다.
+  systemd:
+    name: systemd 유닛 실기 (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      WTERM_PORT: "8899"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # 유닛의 ExecStart가 $REPO_DIR/.venv/bin/python으로 고정돼 있다.
+      - name: venv 준비
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -r requirements.txt
+
+      # TLS를 켜 둔다. cert-status.sh가 TLS 미설정이면 바로 빠져나가서
+      # 정작 보려는 systemd 갱신잡 분기까지 가지 않는다.
+      - name: 인증서와 projects.json 준비
+        run: |
+          mkdir -p demo-project "$HOME/.wterm"
+          openssl req -x509 -newkey rsa:2048 -sha256 -days 90 -nodes \
+            -subj "/CN=wterm.ci.test" \
+            -keyout "$HOME/.wterm/key.pem" -out "$HOME/.wterm/fullchain.pem"
+          chmod 600 "$HOME/.wterm/key.pem"
+          cat > projects.json <<EOF
+          {
+            "host": "127.0.0.1",
+            "port": $WTERM_PORT,
+            "grace_seconds": 10,
+            "tls_certfile": "$HOME/.wterm/fullchain.pem",
+            "tls_keyfile": "$HOME/.wterm/key.pem",
+            "projects": [{"name": "demo", "path": "$PWD/demo-project"}]
+          }
+          EOF
+
+      # acme.sh가 없으면 install-systemd.sh가 갱신 타이머 경로를 아예 타지 않는다.
+      # 스크립트가 이 파일에 하는 일은 -x 확인과 --uninstall-cronjob 호출뿐이다.
+      - name: acme.sh 스텁
+        run: |
+          mkdir -p "$HOME/.acme.sh"
+          printf '#!/bin/sh\nexit 0\n' > "$HOME/.acme.sh/acme.sh"
+          chmod +x "$HOME/.acme.sh/acme.sh"
+
+      - name: 설치
+        run: sudo ./scripts/install-systemd.sh
+
+      - name: 유닛이 실제로 떴는지
+        run: |
+          # enable --now가 돌아온 시점과 서버가 실제로 리슨하는 시점은 다르다.
+          for _ in $(seq 1 60); do
+            if [ -f logs/wterm.pid ] && curl -fsSk "https://127.0.0.1:$WTERM_PORT/" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          systemctl is-active --quiet wterm.service
+          systemctl is-enabled --quiet wterm.service          # 부팅 시 기동 등록
+          systemctl is-enabled --quiet wterm-certrenew.timer
+          test -f logs/wterm.pid
+          # User=로 강등돼 돌아야 한다. root로 돌면 세션이 전부 root가 된다.
+          test "$(ps -o user= -p "$(cat logs/wterm.pid)" | tr -d ' ')" = "$(id -un)"
+          curl -fsSk "https://127.0.0.1:$WTERM_PORT/" > /dev/null
+
+      # 데몬은 로그인 셸을 거치지 않아 $SHELL이 없다. 유닛도 PATH/HOME/LANG만
+      # 준다 — login_shell()이 passwd 엔트리로 떨어지는지를 진짜 데몬에서 본다.
+      - name: 데몬 환경의 로그인 셸
+        run: |
+          .venv/bin/python - <<'PY'
+          import json, os, pwd, ssl, sys, time
+          from websockets.sync.client import connect
+
+          port = os.environ["WTERM_PORT"]
+          expected = pwd.getpwuid(os.getuid()).pw_shell or "/bin/sh"
+          ctx = ssl.create_default_context()
+          ctx.check_hostname = False
+          ctx.verify_mode = ssl.CERT_NONE
+
+          with connect(
+              f"wss://127.0.0.1:{port}/ws/demo?agent=shell",
+              ssl=ctx,
+              additional_headers={"Origin": f"https://127.0.0.1:{port}"},
+              open_timeout=20,
+          ) as ws:
+              ws.send(json.dumps({"type": "input", "data": 'echo "SH$((1 + 1))-IS:$0:"\n'}))
+              seen = ""
+              deadline = time.monotonic() + 30
+              while time.monotonic() < deadline:
+                  try:
+                      msg = ws.recv(timeout=5)
+                  except TimeoutError:
+                      continue
+                  if isinstance(msg, bytes):
+                      seen += msg.decode("utf-8", "replace")
+                  if f"SH2-IS:{expected}:" in seen:
+                      print(f"로그인 셸 확인: {expected}")
+                      sys.exit(0)
+          print(f"기대한 셸({expected})을 보지 못했습니다. 받은 출력:\n{seen}", file=sys.stderr)
+          sys.exit(1)
+          PY
+
+      # cert-status.sh의 리눅스 분기 전체 — stat -c, date -d, systemctl is-enabled.
+      - name: 인증서 점검 스크립트
+        run: |
+          ./scripts/cert-status.sh | tee /tmp/cert-status.txt
+          grep -q "systemd timer" /tmp/cert-status.txt
+          grep -q "파일과 일치" /tmp/cert-status.txt
+
+      # SIGKILL은 감시자에게 비정상 종료로 보인다 — 되살아나는 것이 정상이다.
+      # 남아 있는 pid 파일에도 불구하고 새 서버가 잠금을 잡는지도 같이 확인된다.
+      - name: 비정상 종료는 되살아난다
+        run: |
+          old="$(cat logs/wterm.pid)"
+          kill -9 "$old"
+          for _ in $(seq 1 60); do   # RestartSec=10
+            new="$(cat logs/wterm.pid 2>/dev/null || true)"
+            if [ -n "$new" ] && [ "$new" != "$old" ] && systemctl is-active --quiet wterm.service; then
+              echo "재기동 확인: $old -> $new"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "SIGKILL 후 systemd가 되살리지 않았습니다." >&2
+          exit 1
+
+      # 반대쪽 절반. stop.sh는 SIGTERM → 종료 코드 0으로 끝나고, Restart=on-failure는
+      # 그것을 정상 종료로 읽어야 한다. 이게 깨지면 stop.sh가 아무 효과도 없어 보인다.
+      - name: stop.sh 후 되살아나지 않는다
+        run: |
+          ./stop.sh
+          sleep 20   # RestartSec=10을 두 번 넘긴다
+          if systemctl is-active --quiet wterm.service; then
+            echo "stop.sh로 내렸는데 systemd가 되살렸습니다." >&2
+            systemctl status wterm.service --no-pager || true
+            exit 1
+          fi
+          test ! -f logs/wterm.pid
+
+      - name: 제거
+        run: |
+          sudo ./scripts/install-systemd.sh --uninstall
+          test ! -f /etc/systemd/system/wterm.service
+          test ! -f /etc/systemd/system/wterm-certrenew.timer
+          test ! -f /etc/systemd/system/wterm-certrenew.service
+
+      - name: 실패 시 로그
+        if: failure()
+        run: |
+          echo "=== systemctl status ==="
+          systemctl status wterm.service --no-pager || true
+          echo "=== journalctl ==="
+          sudo journalctl -u wterm.service --no-pager -n 100 || true
+          echo "=== logs/wterm.out ==="
+          cat logs/wterm.out || true
+          echo "=== unit ==="
+          cat /etc/systemd/system/wterm.service || true

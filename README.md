@@ -267,6 +267,7 @@ server/
 static/
   index.html, app.js, style.css   # Vanilla JS + xterm.js UI
   vendor/                          # xterm.js 로컬 사본 — 직접 수정 금지
+tests/                  # pytest 스모크 스위트 (아래 "테스트")
 scripts/
   cert-setup.sh          # TLS 인증서 최초 발급(acme.sh + Cloudflare DNS-01). 1회 실행
   cert-status.sh         # 인증서 만료/서빙 일치/갱신 잡 점검
@@ -290,4 +291,15 @@ scripts/
 
 ## 테스트
 
-별도 테스트 프레임워크 없이 WS 스모크 테스트로 검증한다: 새 세션 기동 → ANSI 출력 수신 → input/resize 주입 → 해제 후 재접속 시 버퍼 replay → 서버 종료 시 자식 프로세스 회수. 세션 로직을 고치면 영향받는 Claude/Codex/셸 경로에서 같은 시나리오를 재확인할 것.
+```bash
+.venv/bin/python -m pip install -r requirements-dev.txt   # 최초 1회
+.venv/bin/python -m pytest
+```
+
+pytest 스모크 스위트(`tests/`)가 있다. 테스트는 저장소 **사본**에서 서버를 실제 프로세스로 띄우므로 운영 `projects.json`이나 실행 중인 서버를 건드리지 않는다. 새 세션 기동 → 입력/리사이즈 → 재접속 replay → 종료 시 자식 회수까지 진짜 셸을 왕복시키고, 인증(Origin/로그인 제한/토큰 폐기), pid 파일 단일 인스턴스 잠금, SIGTERM 종료 코드, SIGHUP 인증서 리로드도 함께 본다.
+
+GitHub Actions(`.github/workflows/ci.yml`)가 main 푸시와 PR마다 같은 스위트를 ubuntu(3.10/3.13)와 macOS(3.10, 운영 환경과 같은 버전)에서 돌린다. 의존성이 하한만 지정돼 있어(`requirements.txt`) 최신 조합이 깨지는 것도 여기서 먼저 드러난다.
+
+리눅스 러너에서는 `systemd` 잡이 `scripts/install-systemd.sh`를 실제로 설치해 유닛 기동 → SIGKILL 시 재기동 → `stop.sh` 후 되살아나지 않음 → `cert-status.sh` → 제거까지 왕복시킨다. 재부팅 자동 기동과 systemd 240 미만의 `append:` 폴백은 러너에서 재현할 수 없어 여전히 실기 확인 대상이다.
+
+`claude`/`codex` CLI는 필요 없다 — 실기 세션은 로그인 셸로 확인하고, 에이전트 경로는 "바이너리가 PATH에 없을 때 exit 127을 알린다"까지만 본다. Claude/Codex 실제 동작은 브라우저에서 확인할 것.
