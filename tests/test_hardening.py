@@ -10,6 +10,7 @@ import json
 import time
 from urllib.parse import quote
 
+from conftest import PASSWORD
 from test_ws import (
     RECV_TIMEOUT, end_shell, recv_until, send_line, status_message, ws_connect,
 )
@@ -53,6 +54,37 @@ def test_security_headers_cover_static_too(start_server):
         assert r.headers["x-content-type-options"] == "nosniff", path
         assert r.headers["x-frame-options"] == "DENY", path
         assert r.headers["referrer-policy"] == "no-referrer", path
+        assert r.headers["cross-origin-resource-policy"] == "same-origin", path
+        assert "camera=()" in r.headers["permissions-policy"], path
+
+
+def test_api_responses_are_not_stored(start_server):
+    """/api/projects에는 프로젝트 이름과 로컬 경로가, /api/login에는 토큰 발급이
+    실린다. 공유 기기의 브라우저 캐시에 남을 이유가 없다.
+
+    정적 자원까지 덮으면 xterm.js 사본을 매번 다시 받게 되므로 /api 아래만이다.
+    """
+    h = start_server()
+    c = h.client()
+    assert c.post("/api/login", json={"password": PASSWORD}).headers[
+        "cache-control"
+    ] == "no-store"
+    assert c.get("/api/projects").headers["cache-control"] == "no-store"
+    assert "no-store" not in c.get("/static/app.js").headers.get("cache-control", "")
+
+
+def test_logout_clears_client_side_state(start_server):
+    """로그아웃한 사람이 기대하는 것은 '흔적이 남지 않는다'다.
+
+    "cookies"는 일부러 빼 둔다 — 그 지시어는 등록 가능 도메인 전체(같은 상위
+    도메인의 다른 서브도메인 포함)의 쿠키를 지워 delete_cookie보다 훨씬 넓게 번진다.
+    """
+    h = start_server()
+    c = h.client()
+    c.post("/api/login", json={"password": PASSWORD})
+    clear = c.post("/api/logout").headers["clear-site-data"]
+    assert "storage" in clear
+    assert "cookies" not in clear
 
 
 def test_csp_keeps_scripts_strict_but_lets_xterm_inject_style(start_server):

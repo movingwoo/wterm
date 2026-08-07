@@ -279,6 +279,73 @@ def test_legacy_shell_query_param(start_server):
         end_shell(ws)
 
 
+# ── 유휴 종료 ────────────────────────────────────────────────────────
+
+
+def test_idle_session_is_closed_and_reaped(start_server, project_dir):
+    """탭을 열어둔 채 잊은 세션은 grace가 잡지 못한다 — 그건 연결이 끊겨야 도는
+    타이머다. idle_seconds가 켜져 있으면 조용한 세션이 스스로 정리되어야 하고,
+    그때 자식 프로세스까지 실제로 죽어야 한다 (닫힌 소켓만으로는 아무것도 안 끝난다).
+
+    4408로 닫는 이유는 app.js의 자동 재연결 때문이다. 평범한 단절로 보이면
+    방금 정리한 세션이 곧바로 다시 뜬다.
+    """
+    pid_marker = project_dir / "idle-shell.pid"  # 셸의 cwd는 프로젝트 경로다
+    pid_marker.unlink(missing_ok=True)
+
+    h = start_server(idle_seconds=3)
+    token = h.login()
+    with ws_connect(h, "/ws/demo?agent=shell", token=token) as ws:
+        status_message(ws)
+        send_line(ws, f"echo $$ > {pid_marker.name}")
+        recv_until(ws, pid_marker.name)
+        child_pid = _read_pid(pid_marker)
+
+        # 여기서부터 양쪽 다 조용하다. 서버가 먼저 말을 걸어와야 한다.
+        with pytest.raises(ConnectionClosed) as exc:
+            while True:
+                msg = ws.recv(timeout=RECV_TIMEOUT)
+                if isinstance(msg, str):
+                    payload = json.loads(msg)
+                    assert payload["type"] == "status"
+                    assert "종료" in payload["message"]
+    assert exc.value.rcvd.code == 4408
+
+    # 대화형 bash는 SIGTERM을 무시하므로 SIGKILL까지 SIGTERM_WAIT(10초)가 걸린다.
+    deadline = time.monotonic() + 25
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.2)
+    raise AssertionError(f"유휴 종료 후에도 자식 프로세스 {child_pid}가 살아 있다")
+
+
+def test_activity_keeps_a_session_alive(start_server):
+    """사람 없이 오래 도는 자동 실행을 유휴로 잡아 죽이는 쪽이 훨씬 비싼 오답이다.
+    그래서 활동은 입력과 출력 **양쪽**으로 세고, 어느 쪽이든 있으면 타이머가 선다."""
+    h = start_server(idle_seconds=4)
+    token = h.login()
+    with ws_connect(h, "/ws/demo?agent=shell", token=token) as ws:
+        status_message(ws)
+        for i in range(3):  # 4.5초 — 리셋이 없으면 이 사이에 죽는다
+            time.sleep(1.5)
+            send_line(ws, f"echo STILL-HERE-{i}")
+            recv_until(ws, f"STILL-HERE-{i}")
+        end_shell(ws)
+
+
+def _read_pid(path, timeout: float = 20.0) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            return int(path.read_text().strip())
+        except (OSError, ValueError):
+            time.sleep(0.1)
+    raise AssertionError(f"셸이 {timeout}초 안에 {path}를 쓰지 않았다")
+
+
 def test_agents_have_independent_sessions(start_server):
     """세션 키는 프로젝트#에이전트. claude와 셸이 서로를 밀어내지 않는다."""
     h = start_server(env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"})

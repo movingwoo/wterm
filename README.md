@@ -58,6 +58,7 @@ cp projects.example.json projects.json
 | --- | --- | --- |
 | `host`, `port` | O | 바인딩 주소. **반드시 내부 IP(기본 `127.0.0.1`)로 유지**할 것. 앞단 프록시 없이 다른 기기에서 접속한다면 루프백이 아니라 그 기기들이 닿을 수 있는 내부 주소(예: 테일넷 IP) |
 | `grace_seconds` | O | 연결 해제 후 프로세스를 무손상 유지하는 시간(초). 이후 SIGTERM → 10초 → SIGKILL |
+| `idle_seconds` | 선택 | 양쪽 방향 모두 이 시간(초) 동안 조용한 세션을 종료. 기본 `0`(끔). 탭을 열어둔 채 잊은 세션용 — 출력이 계속 나오는 자동 실행은 종료되지 않음 |
 | `projects` | O | 화이트리스트. `path`가 없는 로컬 프로젝트는 기동 시 제외됨 |
 | `projects[].ssh` | 선택 | `user@host`. 지정하면 Claude/Codex/셸을 해당 원격 호스트에서 실행 |
 | `password_hash` | 선택 | argon2id 해시. 지정 시에만 로그인 인증이 켜짐 |
