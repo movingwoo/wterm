@@ -217,13 +217,15 @@
       // 경로를 타고 "재연결 실패"로 끝나며, 원인은 서버 로그에 남는다.
       if (
         intentionalClose || ev.code === 4000 || ev.code === 4401 ||
-        ev.code === 4404 || ev.code === 4400
+        ev.code === 4404 || ev.code === 4400 || ev.code === 4408
       ) {
         setStatus("disconnected", "연결 종료");
         if (ev.code === 4000)
           term.write("\r\n\x1b[38;5;210m[W-Term] 다른 클라이언트가 연결하여 종료되었습니다.\x1b[0m\r\n");
         if (ev.code === 4401) showLogin("인증이 만료되었습니다. 다시 로그인하세요.");
-        // 재연결해봐야 같은 이유로 거절당하는 설정 문제다. 서버가 보낸 사유를 그대로 띄운다.
+        // 4408(유휴 종료)에서 재연결하면 방금 정리한 세션이 곧바로 다시 뜬다.
+        // 사유는 서버가 닫기 직전 보낸 status 메시지에 이미 찍혀 있다.
+        // 나머지는 재연결해봐야 같은 이유로 거절당하는 설정 문제다.
         if (ev.code === 4404 || ev.code === 4400)
           term.write(`\r\n\x1b[38;5;210m[W-Term] 연결이 거절되었습니다: ${ev.reason || ev.code}\x1b[0m\r\n`);
         return;

@@ -6,6 +6,7 @@ projects.json 예시:
   "port": 8877,
   "uds": "/app/wterm/run/wterm.sock",
   "grace_seconds": 60,
+  "idle_seconds": 0,
   "password_hash": "<argon2id 해시. 없으면 무인증>",
   "allowed_origins": ["https://wterm.example.com:8443"],
   "tls_certfile": "/Users/me/.wterm/fullchain.pem",
@@ -18,6 +19,11 @@ projects.json 예시:
 
 "ssh"가 있으면 해당 호스트에서 `ssh -t`로 claude를 실행한다 (키 기반 접속 권장,
 원격에 claude CLI 설치 필요). path는 원격 머신 기준 경로라 로컬 존재 검증을 건너뛴다.
+
+"idle_seconds"가 양수면 그 시간 동안 **양방향 트래픽이 전혀 없는** 세션을 종료한다
+(0 = 끔, 기본값). grace_seconds는 연결이 끊겨야 도는 타이머라 탭을 열어둔 채 잊은
+세션을 잡지 못하는데, 이것이 그 경우를 덮는다. 활동으로 세는 것은 클라이언트 입력과
+PTY 출력 양쪽이라, 사람 없이 오래 도는 자동 실행은 출력이 있는 한 종료되지 않는다.
 
 "uds"가 있으면 host/port 대신 해당 경로의 유닉스 도메인 소켓으로 리슨한다 (TCP
 포트를 아예 열지 않는다). 리버스 프록시 컨테이너가 다른 Docker 네트워크에 있어
@@ -61,6 +67,7 @@ class Config:
     port: int = 8877
     uds: str | None = None  # 설정 시 host/port 대신 유닉스 소켓으로 리슨
     grace_seconds: int = 60
+    idle_seconds: int = 0  # 0이면 유휴 종료 없음. 양수면 그만큼 조용한 세션을 종료
     password_hash: str | None = None  # argon2id 해시. 없으면 인증 비활성화
     # 허용 오리진 화이트리스트. 비어 있으면 Origin 호스트 == Host 헤더로 판정한다.
     allowed_origins: list[str] = field(default_factory=list)
@@ -111,6 +118,7 @@ def load_config() -> Config:
         port=int(raw.get("port", 8877)),
         uds=raw.get("uds") or None,
         grace_seconds=int(raw.get("grace_seconds", 60)),
+        idle_seconds=max(0, int(raw.get("idle_seconds", 0))),
         password_hash=password_hash.strip() if password_hash else None,
         allowed_origins=allowed_origins,
         tls_certfile=certfile,

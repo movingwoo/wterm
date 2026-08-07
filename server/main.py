@@ -9,6 +9,7 @@ import asyncio
 import atexit
 import errno
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -38,7 +39,9 @@ STATIC_DIR = BASE_DIR / "static"
 PID_FILE = BASE_DIR / "logs" / "wterm.pid"
 
 config = load_config()
-manager = SessionManager(grace_seconds=config.grace_seconds)
+manager = SessionManager(
+    grace_seconds=config.grace_seconds, idle_seconds=config.idle_seconds
+)
 
 
 @asynccontextmanager
@@ -89,7 +92,22 @@ SECURITY_HEADERS = {
     # frame-ancestors를 이해하지 못하는 구형 브라우저용 중복 방어
     "X-Frame-Options": "DENY",
     "Cross-Origin-Opener-Policy": "same-origin",
+    # 이 앱은 카메라도 위치도 쓰지 않는다. 얻는 것은 크지 않지만, 스크립트 주입이
+    # 곧 임의 명령 실행인 서버에서 주입된 코드가 쓸 수 있는 것을 줄여 둔다.
+    "Permissions-Policy": (
+        "accelerometer=(), camera=(), geolocation=(), gyroscope=(), "
+        "microphone=(), payment=(), usb=()"
+    ),
+    # 다른 오리진이 이 서버의 응답을 <script>/<img>로 끌어가 그 내용을 재는 것
+    # (Spectre류 사이드채널)을 막는다. 우리 페이지는 전부 같은 오리진에서 받는다.
+    "Cross-Origin-Resource-Policy": "same-origin",
 }
+
+# /api 응답은 캐시하지 않는다. /api/projects에는 프로젝트 이름과 **로컬 경로**가
+# 실리고 /api/login은 토큰 쿠키를 발급하는 자리라, 공유 기기의 브라우저 캐시나
+# 중간 캐시에 남을 이유가 없다. 정적 자원은 그대로 캐시된다 — 헤더를 전역으로
+# 붙이면 xterm.js 사본까지 매번 다시 받는다.
+NO_STORE_PREFIX = "/api/"
 
 
 @app.middleware("http")
@@ -97,6 +115,8 @@ async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
     for name, value in SECURITY_HEADERS.items():
         response.headers.setdefault(name, value)
+    if request.url.path.startswith(NO_STORE_PREFIX):
+        response.headers.setdefault("Cache-Control", "no-store")
     return response
 
 # ── Origin 검증 ─────────────────────────────────────────────────────
@@ -219,40 +239,54 @@ def _audit(event: str, **fields) -> None:
 # 뿐이라, 탈취된 토큰은 그것만으로는 영원히 유효하다. 발급 시각을 함께 들고 있으면서
 # 검사할 때마다 확인하고, 폐기 수단으로 /api/logout을 둔다 (재시작은 폐기 수단이 될
 # 수 없다 — PTY 세션이 전부 죽는다).
+#
+# 보관하는 것은 토큰이 아니라 토큰의 sha256이다. dict 조회는 해시가 같은 키끼리
+# 바이트를 순차 비교하므로, 토큰을 그대로 키로 쓰면 조회 시간이 "앞에서 몇 바이트가
+# 맞았나"와 상관을 갖는다 — 32바이트 난수라 실효 공격은 어렵지만, 저장하는 값을
+# 바꾸는 것만으로 그 상관이 사라진다(공격자가 고른 토큰과 저장된 값의 관계가
+# 해시를 지나며 끊긴다). 덤으로 서버 메모리 덤프에 유효 토큰 자체가 남지 않는다.
 AUTH_COOKIE = "wterm_token"
 AUTH_TOKEN_TTL = 30 * 24 * 3600  # 쿠키 max-age와 서버측 만료를 같은 값으로 묶는다
 MAX_TOKENS = 512  # 발급 토큰 상한. 넘으면 오래된 것부터 버린다
 
 # 시계 변경에 영향받지 않도록 monotonic을 쓴다. 토큰은 어차피 프로세스와 수명을
 # 같이 하므로 벽시계 기준으로 보관할 이유가 없다.
-_valid_tokens: OrderedDict[str, float] = OrderedDict()  # token -> 발급 시각
+_valid_tokens: OrderedDict[bytes, float] = OrderedDict()  # 토큰 해시 -> 발급 시각
 _password_hasher = PasswordHasher()
+
+
+def _token_key(token: str) -> bytes:
+    """토큰을 보관·조회에 쓰는 키로. 원문은 어디에도 남기지 않는다."""
+    return hashlib.sha256(token.encode("utf-8", "surrogatepass")).digest()
 
 
 def _issue_token() -> str:
     now = time.monotonic()
-    for token in [t for t, at in _valid_tokens.items() if now - at >= AUTH_TOKEN_TTL]:
-        del _valid_tokens[token]
+    for key in [k for k, at in _valid_tokens.items() if now - at >= AUTH_TOKEN_TTL]:
+        del _valid_tokens[key]
     token = secrets.token_urlsafe(32)
-    _valid_tokens[token] = now
+    _valid_tokens[_token_key(token)] = now
     while len(_valid_tokens) > MAX_TOKENS:
         _valid_tokens.popitem(last=False)  # 가장 먼저 발급된 것부터
     return token
+
+
+def _key_valid(key: bytes) -> bool:
+    """이 토큰 키가 아직 살아 있는지. 만료된 것은 여기서 지운다."""
+    issued_at = _valid_tokens.get(key)
+    if issued_at is None:
+        return False
+    if time.monotonic() - issued_at >= AUTH_TOKEN_TTL:
+        del _valid_tokens[key]
+        return False
+    return True
 
 
 def is_authed(cookies: dict[str, str]) -> bool:
     if config.password_hash is None:
         return True
     token = cookies.get(AUTH_COOKIE)
-    if token is None:
-        return False
-    issued_at = _valid_tokens.get(token)
-    if issued_at is None:
-        return False
-    if time.monotonic() - issued_at >= AUTH_TOKEN_TTL:
-        del _valid_tokens[token]
-        return False
-    return True
+    return token is not None and _key_valid(_token_key(token))
 
 
 # ── 열려 있는 WebSocket의 인증 ──────────────────────────────────────
@@ -267,7 +301,7 @@ def is_authed(cookies: dict[str, str]) -> bool:
 # 새로 만들지 않고 4401을 재사용한다 — static/app.js가 이미 로그인 오버레이를 띄운다.
 AUTH_RECHECK_INTERVAL = 30.0
 
-_ws_tokens: dict[WebSocket, str] = {}  # 열린 소켓 -> 그 소켓을 연 토큰
+_ws_tokens: dict[WebSocket, bytes] = {}  # 열린 소켓 -> 그 소켓을 연 토큰의 키
 
 
 async def _close_unauthed(ws: WebSocket, reason: str) -> None:
@@ -277,20 +311,19 @@ async def _close_unauthed(ws: WebSocket, reason: str) -> None:
         pass  # 이미 끊긴 소켓. 루프 쪽 finally가 정리한다
 
 
-async def _revoke_token_sockets(token: str) -> int:
+async def _revoke_token_sockets(key: bytes) -> int:
     """그 토큰으로 열린 소켓을 전부 닫는다. 닫은 개수를 반환."""
-    victims = [ws for ws, t in _ws_tokens.items() if t == token]
+    victims = [ws for ws, k in _ws_tokens.items() if k == key]
     for ws in victims:
         await _close_unauthed(ws, "세션이 폐기되었습니다")
     return len(victims)
 
 
-async def _auth_watchdog(ws: WebSocket, token: str) -> None:
+async def _auth_watchdog(ws: WebSocket, key: bytes) -> None:
     """토큰이 만료(또는 MAX_TOKENS에 밀려 소멸)되면 소켓을 닫는다."""
-    cookies = {AUTH_COOKIE: token}
     while True:
         await asyncio.sleep(AUTH_RECHECK_INTERVAL)
-        if not is_authed(cookies):
+        if not _key_valid(key):
             await _close_unauthed(ws, "인증이 만료되었습니다")
             return
 
@@ -423,14 +456,20 @@ async def logout(request: Request):
     token = request.cookies.get(AUTH_COOKIE)
     closed = 0
     if token:
-        _valid_tokens.pop(token, None)
+        key = _token_key(token)
+        _valid_tokens.pop(key, None)
         # 토큰만 지우면 이미 열린 소켓은 그대로 살아서 명령을 계속 실행한다.
-        closed = await _revoke_token_sockets(token)
+        closed = await _revoke_token_sockets(key)
     _audit("logout", client=_peer(request), sockets=closed)
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(
         AUTH_COOKIE, httponly=True, samesite="strict", secure=_is_secure(request)
     )
+    # 남는 것은 사이드바 접힘 상태 정도라 실익은 작지만, 공용 기기에서 로그아웃한
+    # 사람이 기대하는 것은 "흔적이 남지 않는다"다. "cookies"는 넣지 않는다 —
+    # 그 지시어는 등록 가능 도메인 전체(같은 상위 도메인의 다른 서브도메인 포함)의
+    # 쿠키를 지워, 위의 delete_cookie가 하는 일보다 훨씬 넓게 번진다.
+    resp.headers["Clear-Site-Data"] = '"cache", "storage"'
     return resp
 
 
@@ -605,8 +644,9 @@ async def terminal_ws(
     token = ws.cookies.get(AUTH_COOKIE) if config.password_hash is not None else None
     watchdog: asyncio.Task | None = None
     if token:
-        _ws_tokens[ws] = token
-        watchdog = asyncio.ensure_future(_auth_watchdog(ws, token))
+        key = _token_key(token)
+        _ws_tokens[ws] = key
+        watchdog = asyncio.ensure_future(_auth_watchdog(ws, key))
 
     # 프로토콜 경계다. 여기서 걸러지지 않은 형식 오류는 전부 루프 밖으로 나가
     # 세션을 끊는다 — 자기 세션만 끊는 자해라 보안 문제는 아니지만, 버그난

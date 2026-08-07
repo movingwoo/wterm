@@ -5,6 +5,9 @@
   재연결되면 그대로 이어붙인다. 유예 시간이 지나면 SIGTERM → SIGKILL 순으로
   프로세스 그룹 전체를 종료한다.
 - 재연결 시 화면 복원을 위해 최근 출력(최대 BUFFER_LIMIT 바이트)을 버퍼링한다.
+- idle_seconds가 켜져 있으면 양방향 트래픽이 그 시간 동안 없는 세션을 종료한다
+  (기본값 0 = 끔). grace는 **연결이 끊겨야** 도는 타이머라 탭을 열어둔 채 잊은
+  세션은 잡지 못한다.
 """
 from __future__ import annotations
 
@@ -34,6 +37,11 @@ WRITE_BUFFER_LIMIT = 1024 * 1024
 READ_CHUNK = 65536
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 SIGTERM_WAIT = 10  # SIGTERM 후 SIGKILL까지 대기 초
+
+# 유휴 종료 close code. 4404/4400과 같은 취급을 받아야 한다 — 클라이언트가 사유를
+# 보여주고 재연결을 멈춰야지, 자동 재연결이 돌면 방금 정리한 세션이 곧바로 다시 뜬다.
+IDLE_CLOSE_CODE = 4408
+IDLE_MIN_SLEEP = 0.5  # 남은 시간이 0에 가까울 때 바쁜 루프가 되지 않도록
 
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
@@ -151,10 +159,12 @@ class Session:
         grace_seconds: int,
         ssh: str | None = None,
         agent: str = "claude",
+        idle_seconds: int = 0,
     ):
         self.project_name = project_name
         self.cwd = cwd
         self.grace_seconds = grace_seconds
+        self.idle_seconds = idle_seconds
         self.ssh = ssh
         self.agent = agent  # "claude" | "codex" | "shell"
         self.pid: int = -1
@@ -163,7 +173,9 @@ class Session:
         self.buffer = bytearray()
         self.websocket: WebSocket | None = None
         self._grace_task: asyncio.Task | None = None
+        self._idle_task: asyncio.Task | None = None
         self._loop = asyncio.get_running_loop()
+        self.last_activity = time.monotonic()
         self._write_buffer = bytearray()
         self._writer_registered = False
         self._input_dropped = False
@@ -211,8 +223,11 @@ class Session:
         self.pid = pid
         self.master_fd = master_fd
         self.alive = True
+        self.last_activity = time.monotonic()
         os.set_blocking(master_fd, False)
         self._loop.add_reader(master_fd, self._on_pty_readable)
+        if self.idle_seconds > 0:
+            self._idle_task = asyncio.ensure_future(self._idle_countdown())
 
     def _on_pty_readable(self) -> None:
         try:
@@ -224,6 +239,7 @@ class Session:
         if not data:
             asyncio.ensure_future(self._handle_exit())
             return
+        self.last_activity = time.monotonic()
         self.buffer.extend(data)
         if len(self.buffer) > BUFFER_LIMIT:
             del self.buffer[: len(self.buffer) - BUFFER_LIMIT]
@@ -243,6 +259,7 @@ class Session:
         if not self.alive:
             return
         self.alive = False
+        self._cancel_idle()
         self._cleanup_fd()
         exit_code = self._reap()
         ws = self.websocket
@@ -291,6 +308,7 @@ class Session:
         """SIGTERM → 대기 → SIGKILL 순으로 프로세스 그룹을 종료한다."""
         if not self.alive:
             return
+        self._cancel_idle()
         self._signal_group(signal.SIGTERM)
         for _ in range(SIGTERM_WAIT * 10):
             if not self.alive:
@@ -322,6 +340,7 @@ class Session:
     async def attach(self, ws: WebSocket) -> None:
         """WebSocket을 세션에 연결한다. 기존 연결이 있으면 끊고 교체한다."""
         self.cancel_grace()
+        self.last_activity = time.monotonic()
         old = self.websocket
         self.websocket = ws
         if old is not None:
@@ -352,6 +371,59 @@ class Session:
             return
         await self.terminate()
 
+    # ── 유휴 종료 ────────────────────────────────────────────────────
+    #
+    # grace는 연결이 끊겨야 도는 타이머라, 탭을 열어둔 채 잊은 세션은 잡지 못한다.
+    # 그 세션은 사람이 다시 볼 때까지 무기한 살면서 자격증명이 붙은 claude 프로세스를
+    # 계속 물고 있다.
+    #
+    # 활동은 **양방향 트래픽**으로 센다: 클라이언트 입력, PTY 출력, 그리고 재접속.
+    # 입력만 세면 사람 없이 몇 시간을 도는 정상적인 자동 실행이 유휴로 잡혀 죽는다 —
+    # 그쪽이 훨씬 비싼 오답이라, 출력이 계속 나오는 세션(`tail -f` 같은)은 영원히
+    # 살아남는 쪽을 택했다. 잊힌 세션은 양쪽 다 조용하다는 것이 이 판정의 근거다.
+
+    def _cancel_idle(self) -> None:
+        task, self._idle_task = self._idle_task, None
+        # 유휴 만료 자신이 terminate를 부르는 경로가 있다. 자기 자신을 취소하면
+        # 그 자리에서 CancelledError가 나 뒷정리가 끊긴다.
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    async def _idle_countdown(self) -> None:
+        try:
+            while True:
+                remaining = self.idle_seconds - (time.monotonic() - self.last_activity)
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(max(remaining, IDLE_MIN_SLEEP))
+        except asyncio.CancelledError:
+            return
+        self._idle_task = None  # 아래 terminate가 자신을 취소하지 않도록
+        await self._expire_idle()
+
+    async def _expire_idle(self) -> None:
+        # 알림이 먼저다. terminate는 대화형 셸처럼 SIGTERM을 무시하는 자식에게
+        # SIGTERM_WAIT초를 꽉 쓰는데, 그 뒤에 알리면 화면이 그동안 아무 이유 없이
+        # 멎어 있다. 소켓을 먼저 떼어 두면 라우트의 detach는 그대로 빠져나가고
+        # (유예 타이머도 걸리지 않는다) 종료는 이 태스크가 마저 끝낸다.
+        ws = self.websocket
+        self.websocket = None
+        if ws is not None:
+            span = (
+                f"{self.idle_seconds // 60}분"
+                if self.idle_seconds >= 60
+                else f"{self.idle_seconds}초"
+            )
+            try:
+                await ws.send_text(json.dumps({
+                    "type": "status",
+                    "message": f"{span} 동안 아무 움직임이 없어 세션을 종료했습니다.",
+                }))
+                await ws.close(code=IDLE_CLOSE_CODE, reason="유휴 상태로 종료됨")
+            except Exception:
+                pass  # 이미 끊긴 소켓. 라우트 쪽 finally가 정리한다
+        await self.terminate()
+
     # ── 입력/리사이즈 ────────────────────────────────────────────────
 
     def write_input(self, data: str) -> bool:
@@ -374,6 +446,7 @@ class Session:
         """
         if not (self.alive and self.master_fd >= 0):
             return False
+        self.last_activity = time.monotonic()
         if len(self._write_buffer) >= WRITE_BUFFER_LIMIT:
             first = not self._input_dropped
             self._input_dropped = True
@@ -425,8 +498,9 @@ class Session:
 class SessionManager:
     """프로젝트 이름 → 라이브 세션 매핑."""
 
-    def __init__(self, grace_seconds: int):
+    def __init__(self, grace_seconds: int, idle_seconds: int = 0):
         self.grace_seconds = grace_seconds
+        self.idle_seconds = idle_seconds
         self.sessions: dict[str, Session] = {}
 
     def get_live(self, project_name: str) -> Session | None:
@@ -450,7 +524,10 @@ class SessionManager:
             await existing.terminate()
             del self.sessions[project_name]
 
-        session = Session(project_name, cwd, self.grace_seconds, ssh=ssh, agent=agent)
+        session = Session(
+            project_name, cwd, self.grace_seconds,
+            ssh=ssh, agent=agent, idle_seconds=self.idle_seconds,
+        )
         session.spawn(extra_args)
         self.sessions[project_name] = session
         return session

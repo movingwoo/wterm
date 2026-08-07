@@ -30,14 +30,24 @@ IP를 알 수 없어 전부 한 버킷으로 모이므로, 그 구성에서는 *
 
 **세션 토큰 만료는 서버가 판정한다.** 쿠키 `max-age`는 브라우저에게 하는 부탁일 뿐이라
 그것만으로는 탈취된 토큰이 영원히 유효하다. 토큰은 발급 30일 후 서버에서 거부되고,
-사이드바의 "로그아웃"으로 즉시 폐기할 수 있다. 재시작은 폐기 수단으로 쓸 수 없다 —
-PTY 세션이 전부 죽는다.
+사이드바의 "로그아웃"으로 즉시 폐기할 수 있다(열려 있는 WebSocket까지 그 자리에서
+끊는다). 재시작은 폐기 수단으로 쓸 수 없다 — PTY 세션이 전부 죽는다. 서버가 들고
+있는 것은 토큰이 아니라 토큰의 sha256이라, 조회 시간이 "앞에서 몇 바이트가 맞았나"와
+상관을 갖지 않고 메모리 덤프에도 그대로 쓸 수 있는 토큰이 남지 않는다.
+
+**유휴 세션 종료(`idle_seconds`, 기본 꺼짐).** 탭을 열어둔 채 잊으면 자격증명이 붙은
+claude 프로세스가 무기한 산다 — `grace`는 연결이 끊겨야 도는 타이머라 이 경우를 못
+잡는다. 켜 두면 입력도 출력도 없는 세션이 스스로 정리된다. 사람 없이 오래 도는 자동
+실행은 출력이 있는 한 살아남는다.
 
 **응답 헤더.** CSP(`default-src 'self'`, `script-src 'self'`, `frame-ancestors 'none'`),
-`nosniff`, `Referrer-Policy: no-referrer`를 미들웨어로 붙여 `/static`까지 덮는다.
-`style-src`만 `'unsafe-inline'`을 여는데, xterm.js DOM 렌더러가 런타임에 `<style>`을
-만들어 CSS를 밀어넣기 때문이다(막으면 터미널 렌더링이 깨지고, nonce로도 못 푼다).
-스크립트 쪽은 조인 채로 둔다 — 이 서버에서 스크립트 주입은 곧 임의 명령 실행이다.
+`nosniff`, `Referrer-Policy: no-referrer`, `Cross-Origin-Resource-Policy: same-origin`,
+`Permissions-Policy`를 미들웨어로 붙여 `/static`까지 덮는다. `style-src`만
+`'unsafe-inline'`을 여는데, xterm.js DOM 렌더러가 런타임에 `<style>`을 만들어 CSS를
+밀어넣기 때문이다(막으면 터미널 렌더링이 깨지고, nonce로도 못 푼다). 스크립트 쪽은
+조인 채로 둔다 — 이 서버에서 스크립트 주입은 곧 임의 명령 실행이다.
+`/api` 응답에는 `Cache-Control: no-store`가 붙는다(프로젝트 이름과 로컬 경로가 브라우저
+캐시에 남지 않도록). 로그아웃 응답은 `Clear-Site-Data`로 남은 클라이언트 상태를 지운다.
 
 **비밀 파일 권한.** 인증서 개인키와 `projects.json`은 `600`이어야 한다. 개인키는
 저장소 밖에 두고(`cert-setup.sh` 기본값 `~/.wterm/`), `projects.json`의 argon2 해시도
