@@ -108,7 +108,7 @@ For server changes, run at minimum:
 git diff --check
 ```
 
-`tests/` is a pytest smoke suite; `requirements-dev.txt` holds its two extra dependencies. GitHub Actions runs it on pushes to `main` and on pull requests, across ubuntu (3.10/3.13) and macOS (3.10, the production interpreter) — see `.github/workflows/ci.yml`.
+`tests/` is a pytest smoke suite; `requirements-dev.txt` holds its two extra dependencies. GitHub Actions runs it on pushes to `main` and on pull requests, on macOS and ubuntu with Python 3.10 (the production interpreter) — see `.github/workflows/ci.yml`. A 3.13 job existed and was removed: `test_https_and_wss_work` times out on its wss handshake there, on 3.13 only. Restore that job before moving production off 3.10.
 
 - Tests start the server **as a real process from a copy of the repository**, never in-process. `server/main.py` reads `projects.json` and `logs/wterm.pid` from fixed paths at import time, so a copy is what keeps a test run from touching the deployment or colliding with a running server. It is also the only way to cover what has actually broken here: the pid-file lock, exit code 0 on SIGTERM, and `SIGHUP` certificate reload are all process-level behaviour.
 - The suite needs no `claude`/`codex` CLI. Session behaviour is exercised through a login shell, and the agent path is covered only up to "reports exit 127 when the binary is not on `PATH`".

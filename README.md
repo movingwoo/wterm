@@ -298,7 +298,7 @@ scripts/
 
 pytest 스모크 스위트(`tests/`)가 있다. 테스트는 저장소 **사본**에서 서버를 실제 프로세스로 띄우므로 운영 `projects.json`이나 실행 중인 서버를 건드리지 않는다. 새 세션 기동 → 입력/리사이즈 → 재접속 replay → 종료 시 자식 회수까지 진짜 셸을 왕복시키고, 인증(Origin/로그인 제한/토큰 폐기), pid 파일 단일 인스턴스 잠금, SIGTERM 종료 코드, SIGHUP 인증서 리로드도 함께 본다.
 
-GitHub Actions(`.github/workflows/ci.yml`)가 main 푸시와 PR마다 같은 스위트를 ubuntu(3.10/3.13)와 macOS(3.10, 운영 환경과 같은 버전)에서 돌린다. 의존성이 하한만 지정돼 있어(`requirements.txt`) 최신 조합이 깨지는 것도 여기서 먼저 드러난다.
+GitHub Actions(`.github/workflows/ci.yml`)가 main 푸시와 PR마다 같은 스위트를 운영과 같은 Python 3.10으로 macOS와 ubuntu 양쪽에서 돌린다. 의존성이 하한만 지정돼 있어(`requirements.txt`) 최신 조합이 깨지는 것도 여기서 먼저 드러난다.
 
 리눅스 러너에서는 `systemd` 잡이 `scripts/install-systemd.sh`를 실제로 설치해 유닛 기동 → SIGKILL 시 재기동 → `stop.sh` 후 되살아나지 않음 → `cert-status.sh` → 제거까지 왕복시킨다. 재부팅 자동 기동과 systemd 240 미만의 `append:` 폴백은 러너에서 재현할 수 없어 여전히 실기 확인 대상이다.
 
