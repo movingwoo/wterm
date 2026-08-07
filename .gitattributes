@@ -1,0 +1,2 @@
+# 마크다운의 줄끝 두 칸은 하드 개행(<br>)이다. blank-at-eol 검사에서 제외한다.
+*.md whitespace=-blank-at-eol

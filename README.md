@@ -1,29 +1,29 @@
 # W-Term
 
-브라우저에서 Claude Code와 Codex를 원격 제어하는 내부망용 웹 터미널.  
+브라우저에서 Claude Code와 Codex를 원격 제어하는 내부망용 웹 터미널.
 
 브라우저(xterm.js) ↔ FastAPI WebSocket ↔ PTY로 실행된 `claude`/`codex` CLI를 실시간으로 중계합니다.  
-노트북을 덮고 나가도 서버의 세션은 계속 돌고, 폰에서 다시 열면 화면이 그대로 이어집니다.  
+노트북을 덮고 나가도 서버의 세션은 계속 돌고, 폰에서 다시 열면 화면이 그대로 이어집니다.
 
 > ⚠️ **임의 명령을 실행할 수 있는 서버입니다.**  
 > 반드시 내부 IP에만 바인딩하고 VPN/테일넷 같은 네트워크 경계 뒤에서만 운용해야 합니다.  
-> 자세한 내용은 [docs/security.md](docs/security.md).  
+> 자세한 내용은 [docs/security.md](docs/security.md).
 
 ## 특징
 
-- **세션이 끊겨도 살아남음.** 연결이 끊기면 grace 기간 동안 프로세스를 보존했다가 재접속하면 화면을 그대로 복원합니다.  
-- **한 프로젝트에서 Claude, Codex, 셸을 동시에.** 세 세션이 서로 독립적으로 유지됩니다.  
-- **이어하기 지원.** Claude의 `--resume`/`--continue`, Codex의 `resume`/`resume --last`.  
-- **원격 프로젝트.** ssh로 닿는 호스트의 프로젝트도 같은 UI로 제어합니다.  
-- **자체 HTTPS.** 앞단 웹서버 없이 직접 TLS를 종료하고, 인증서 갱신 시 세션을 죽이지 않고 무중단 리로드합니다.  
-- **빌드 과정 없음.** xterm.js가 저장소에 내장돼 있어 오프라인에서도 그대로 뜹니다.  
+- **세션이 끊겨도 살아남음.** 연결이 끊기면 grace 기간 동안 프로세스를 보존했다가 재접속하면 화면을 그대로 복원합니다.
+- **한 프로젝트에서 Claude, Codex, 셸을 동시에.** 세 세션이 서로 독립적으로 유지됩니다.
+- **이어하기 지원.** Claude의 `--resume`/`--continue`, Codex의 `resume`/`resume --last`.
+- **원격 프로젝트.** ssh로 닿는 호스트의 프로젝트도 같은 UI로 제어합니다.
+- **자체 HTTPS.** 앞단 웹서버 없이 직접 TLS를 종료하고, 인증서 갱신 시 세션을 죽이지 않고 무중단 리로드합니다.
+- **빌드 과정 없음.** xterm.js가 저장소에 내장돼 있어 오프라인에서도 그대로 뜹니다.
 
 ## 요구 사항
 
-- Python 3 (시스템 Python에 pip/venv가 없다는 전제로 아래에서 [uv](https://github.com/astral-sh/uv)를 사용)  
-- 쓰려는 AI의 `claude` 및/또는 `codex` CLI가 PATH에 설치돼 있을 것  
-- (원격 프로젝트) 서버 → 원격 호스트로의 키 기반 ssh 접속, 원격에도 AI CLI 설치  
-- (Linux + Codex 샌드박스) `bubblewrap` 패키지와 비특권 user namespace 지원  
+- Python 3 (시스템 Python에 pip/venv가 없다는 전제로 아래에서 [uv](https://github.com/astral-sh/uv)를 사용)
+- 쓰려는 AI의 `claude` 및/또는 `codex` CLI가 PATH에 설치돼 있을 것
+- (원격 프로젝트) 서버 → 원격 호스트로의 키 기반 ssh 접속, 원격에도 AI CLI 설치
+- (Linux + Codex 샌드박스) `bubblewrap` 패키지와 비특권 user namespace 지원
 
 ## 설치
 
@@ -33,7 +33,7 @@
 ```
 
 Linux에서 Codex 샌드박스를 쓴다면 `sudo apt install bubblewrap`도 필요합니다.  
-Ubuntu 24.04에서 user namespace 경고가 계속되면 [Codex sandbox prerequisites](https://developers.openai.com/codex/concepts/sandboxing#prerequisites)의 AppArmor 설정을 적용합니다.  
+Ubuntu 24.04에서 user namespace 경고가 계속되면 [Codex sandbox prerequisites](https://developers.openai.com/codex/concepts/sandboxing#prerequisites)의 AppArmor 설정을 적용합니다.
 
 ## 설정
 
@@ -65,16 +65,16 @@ cp projects.example.json projects.json
 | `uds` | 선택 | 이 경로의 유닉스 도메인 소켓으로 리슨(TCP 대신). 리버스 프록시 연동용 |
 | `tls_certfile`, `tls_keyfile` | 선택 | 풀체인/개인키 PEM 경로. **둘 다** 지정하면 HTTPS로 리슨 |
 
-패스워드 해시는 이렇게 만듭니다.  
+패스워드 해시는 이렇게 만듭니다.
 
 ```bash
 .venv/bin/python -c "from argon2 import PasswordHasher; from getpass import getpass; print(PasswordHasher().hash(getpass('패스워드: ')))"
 ```
 
 또는 W-Tools의 비밀번호 해시 생성 기능을 이용합니다.  
-[https://wtools.movingwoo.com/#/tool/password-hash](https://wtools.movingwoo.com/#/tool/password-hash)  
+[https://wtools.movingwoo.com/#/tool/password-hash](https://wtools.movingwoo.com/#/tool/password-hash)
 
-`projects.json`은 내부 경로와 패스워드 해시가 담기므로 `.gitignore`에 있으니 실제 값은 커밋하지 않는게 좋습니다.  
+`projects.json`은 내부 경로와 패스워드 해시가 담기므로 `.gitignore`에 있으니 실제 값은 커밋하지 않는게 좋습니다.
 
 ## 실행
 
@@ -83,25 +83,25 @@ cp projects.example.json projects.json
 ./stop.sh    # 정상 종료 (자식 Claude/Codex/셸 세션까지 정리)
 ```
 
-브라우저로 `http://<host>:<port>`에 접속하면 됩니다. 재시작은 `./stop.sh && ./start.sh`.  
+브라우저로 `http://<host>:<port>`에 접속하면 됩니다. 재시작은 `./stop.sh && ./start.sh`.
 
-여기까지가 최소 구성이며 실제로 다른 기기에서 쓰려면 아래 두 가지를 더 설정합니다.  
+여기까지가 최소 구성이며 실제로 다른 기기에서 쓰려면 아래 두 가지를 더 설정합니다.
 
-- **HTTPS 켜기** → [docs/https.md](docs/https.md). 인증서 발급(Cloudflare DNS-01), 무중단 갱신, 점검까지.  
+- **HTTPS 켜기** → [docs/https.md](docs/https.md). 인증서 발급(Cloudflare DNS-01), 무중단 갱신, 점검까지.
 - **부팅 시 자동 기동** → [docs/operations.md](docs/operations.md).  
-  macOS는 launchd, Linux는 systemd. `sudo ./scripts/install-launchd.sh` 한 줄이지만 재시작 방법이 달라지므로 한 번은 읽을 것.  
+  macOS는 launchd, Linux는 systemd. `sudo ./scripts/install-launchd.sh` 한 줄이지만 재시작 방법이 달라지므로 한 번은 읽을 것.
 
 ## 보안
 
-앞단에 네트워크 경계가 있다는 전제 하에 서버는 아래와 같은 보안 정책을 가집니다.  
+앞단에 네트워크 경계가 있다는 전제 하에 서버는 아래와 같은 보안 정책을 가집니다.
 
-- Origin 검증 (WebSocket에는 CORS가 없어 CSWSH로 임의 명령이 실행될 수 있음)  
-- argon2id 패스워드 인증 + 로그인 시도 제한 (지수 백오프, 동시 검증 수 제한)  
-- 서버가 판정하는 30일 토큰 만료와 즉시 로그아웃  
-- CSP를 포함한 응답 헤더, 비밀 파일 권한(`600`) 점검  
-- 90일 보관 감사 로그 — **터미널 내용은 남기지 않음**  
+- Origin 검증 (WebSocket에는 CORS가 없어 CSWSH로 임의 명령이 실행될 수 있음)
+- argon2id 패스워드 인증 + 로그인 시도 제한 (지수 백오프, 동시 검증 수 제한)
+- 서버가 판정하는 30일 토큰 만료와 즉시 로그아웃
+- CSP를 포함한 응답 헤더, 비밀 파일 권한(`600`) 점검
+- 90일 보관 감사 로그 — **터미널 내용은 남기지 않음**
 
-각 항목의 이유와 **침해가 의심될 때의 자격증명 회전 순서**는 [docs/security.md](docs/security.md)에 있습니다.  
+각 항목의 이유와 **침해가 의심될 때의 자격증명 회전 순서**는 [docs/security.md](docs/security.md)에 있습니다.
 
 ## 구조
 
@@ -133,9 +133,9 @@ scripts/
 
 저장소 **사본**에서 서버를 실제 프로세스로 띄우므로 운영 `projects.json`이나 실행 중인 서버를 건드리지 않습니다.  
 진짜 셸로 세션 기동 → 입력/리사이즈 → 재접속 replay → 자식회수까지 왕복하고 인증·pid 잠금·SIGTERM 종료 코드·SIGHUP 인증서 리로드도 함께 봅니다.  
-`claude`/`codex` CLI는 필요 없습니다.  
+`claude`/`codex` CLI는 필요 없습니다.
 
-GitHub Actions가 main 푸시와 PR마다 macOS와 Ubuntu 양쪽에서 같은 스위트를 돌리고 리눅스에서는 systemd 유닛 설치까지 실제로 왕복시킵니다.  
+GitHub Actions가 main 푸시와 PR마다 macOS와 Ubuntu 양쪽에서 같은 스위트를 돌리고 리눅스에서는 systemd 유닛 설치까지 실제로 왕복시킵니다.
 
 ## 문서
 
