@@ -17,7 +17,7 @@ This file contains the detailed architecture, protocol, operational assumptions,
 ## Repository map
 
 - `server/config.py`: loads and validates `projects.json`.
-- `server/session.py`: spawns PTYs and manages input, resize, replay, detach grace, and termination.
+- `server/session.py`: spawns PTYs and manages input, resize, replay, detach grace, and termination. Also answers "does this cwd have Claude/Codex history". The Codex answer walks the whole session tree, so it runs in a thread and its result is cached for `CODEX_CACHE_TTL`: `/api/projects` is polled every 10 seconds and those files only accumulate, so doing it inline stalls every live PTY session for longer as time passes.
 - `server/main.py`: FastAPI routes, authentication, project status, and the WebSocket protocol.
 - `static/app.js`: project actions, xterm.js integration, authentication UI, and reconnect behavior.
 - `static/style.css`: application layout and visual states.
@@ -52,11 +52,15 @@ Client-to-server messages are JSON text:
 
 Server-to-client terminal output is binary. Status and exit notifications are JSON text. When changing the protocol, update both `server/main.py` and `static/app.js` in the same change.
 
+Anything else a client sends is ignored silently, and the receive loop must stay that way: a malformed message that escapes as an exception closes that client's own socket, so a buggy client sees an unexplained disconnect and the log fills with tracebacks instead. That covers non-JSON text, JSON that is not an object, binary frames (`receive_text` raises `KeyError` on them), missing or non-numeric `cols`/`rows`, and non-string `data`. Sizes are clamped in `Session.resize` rather than validated at the route, because `struct.pack("HHHH", …)` raises above 65535 and that is a number the client chooses.
+
 ## Authentication
 
 Authentication is a second lock behind the network boundary, not a substitute for it. The binding rule below still governs. Keep these properties:
 
 - **Origin is checked on every WebSocket handshake and every POST.** WS handshakes are not subject to CORS, so a cookie check alone lets any page the user visits open a socket here — which on this server is arbitrary command execution. The default rule needs no configuration: the origin's host must equal the `Host` header, which holds because an attacker cannot change the `Host` the victim's browser sends to us. `allowed_origins` is the escape hatch for proxies that rewrite `Host`. A missing `Origin` is rejected; `static/app.js` is the only client and browsers always send it.
+- **The default rule checks the origin's scheme too, but only in one direction.** On standard ports `http://host` and `https://host` have the same netloc, so a host-only comparison lets a plaintext origin through — a page an attacker already inside the tailnet can serve on port 80, whose `wss://` request still carries the `Secure` cookie (cookies follow the request's scheme, not the page's). A request that arrived over https therefore requires an https origin. A request that arrived in plaintext requires nothing, because that is exactly what a TLS-terminating proxy in front of us looks like.
+- **`_is_secure` is the single judgment behind both the cookie's `Secure` flag and that scheme check.** Under `uds` it reads `X-Forwarded-Proto` itself and defaults to https when the header is absent: a unix socket has no client address (`scope["client"]` is `None`), so uvicorn's `forwarded_allow_ips` test always fails and the scheme it reports stays `http` no matter what the proxy sent. Defaulting the other way loses the `Secure` flag silently on an HTTPS deployment; defaulting this way fails loudly (the browser drops the cookie) and a plaintext proxy can correct it with `X-Forwarded-Proto: http`.
 - **Never call `_password_hasher.verify` on the event loop.** It is a 64 MiB, ~35 ms synchronous CPU operation; running it inline stalls every live PTY session for its duration, and unauthenticated requests can drive it. It goes through `anyio.to_thread.run_sync` under `_login_slots`, which caps concurrent verifications so the total cost stays bounded.
 - **Rate limiting must reject before the hash runs.** The point is not to slow guessing (argon2 already does that) but to avoid paying the cost at all. A blocked bucket returns 429 without touching argon2 — including for the correct password.
 - **The login body is capped before it is parsed.** `request.json()` materialises the whole body, and this route runs before authentication and before the attempt limiter bites, so an uncapped body routes around the argon2 cost defence through memory instead. `LOGIN_BODY_LIMIT` is checked against `Content-Length` (over → 413), and a request that declares no length is refused with 411 — otherwise omitting the header is enough to skip the check.
@@ -117,7 +121,7 @@ The server terminates TLS itself when `tls_certfile` and `tls_keyfile` are both 
 - Do not edit `static/vendor/` or introduce a frontend build pipeline without an explicit requirement.
 - Do not expose the server on `0.0.0.0`. Prefer loopback or UDS behind an authenticated VPN/reverse proxy. When the server terminates TLS itself and other devices must reach it directly, binding to a private VPN-interface address (a tailnet IP, for example) is acceptable; a routable public address is not.
 - Invoke `acme.sh` with `LC_ALL=C`. It parses certificate dates with `date -j -f "%b %d ..."`, which fails under non-English locales and silently disables its "renewal scheduled after expiry" guard.
-- Treat `projects.json`, authentication settings, and certificate paths as deployment configuration. Do not print or duplicate secrets, and never commit certificate or key files.
+- Treat `projects.json`, authentication settings, and certificate paths as deployment configuration. Do not print or duplicate secrets, and never commit certificate or key files. The server warns at startup when that file is readable by group or other (the argon2 hash in it is an offline-cracking target) but must not `chmod` it — silently changing the permissions of deployment configuration causes a different class of accident.
 - Do not terminate processes found only through broad commands such as `pgrep claude` or `pgrep codex`; verify ownership and parentage first.
 - The running server does not auto-reload. Code changes require a deliberate restart before they become active.
 

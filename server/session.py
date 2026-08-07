@@ -19,8 +19,10 @@ import shlex
 import signal
 import struct
 import termios
+import time
 from pathlib import Path
 
+from anyio import to_thread
 from fastapi import WebSocket
 
 BUFFER_LIMIT = 256 * 1024  # 재연결 replay 버퍼 상한
@@ -69,22 +71,51 @@ def latest_session_id(cwd: str) -> str | None:
     return jsonls[0].stem if jsonls else None
 
 
-def has_codex_history(cwd: str) -> bool:
-    """Codex 세션 메타데이터에서 해당 cwd의 대화 기록 존재 여부를 확인한다."""
+# Codex 세션 파일은 ~/.codex/sessions 아래에 쌓이기만 하는 구조다. 프로젝트마다
+# 전체를 rglob으로 훑으면 /api/projects 한 번이 O(파일 수 × 프로젝트 수)가 되고,
+# 프론트는 그 목록을 10초마다 폴링한다 — 시간이 지날수록 느려지는 형태다. 게다가
+# 동기 파일 I/O라 그동안 살아있는 모든 PTY 세션의 입출력이 멎는다(argon2 검증을
+# 스레드로 뺀 것과 정확히 같은 이유의 문제다).
+#
+# 그래서 세 가지를 함께 한다: 한 번의 스캔으로 cwd 집합을 통째로 만들고(프로젝트
+# 수와 무관해진다), 결과를 폴링 주기보다 넉넉히 길게 캐시하고, 스캔 자체는
+# 스레드에서 돌린다. 대가는 방금 생긴 기록이 최대 CODEX_CACHE_TTL초 늦게 보이는
+# 것인데, 그 사이 그 세션은 라이브라 재접속 경로를 타므로 기록 조회에 닿지 않는다.
+CODEX_CACHE_TTL = 30.0
+
+_codex_cwds: set[str] = set()
+_codex_scanned_at = float("-inf")
+_codex_scan_lock = asyncio.Lock()  # 폴링이 겹칠 때 같은 스캔을 두 번 돌리지 않는다
+
+
+def _scan_codex_cwds() -> set[str]:
+    """세션 메타데이터 첫 줄에서 cwd를 모은다. 동기 함수 — 스레드에서 부를 것."""
+    cwds: set[str] = set()
     if not CODEX_SESSIONS_DIR.is_dir():
-        return False
+        return cwds
     for path in CODEX_SESSIONS_DIR.rglob("*.jsonl"):
         try:
             with path.open(encoding="utf-8") as f:
                 meta = json.loads(f.readline())
-            if (
-                meta.get("type") == "session_meta"
-                and meta.get("payload", {}).get("cwd") == cwd
-            ):
-                return True
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             continue
-    return False
+        # 첫 줄이 유효한 JSON이라고 해서 객체라는 보장은 없다 ("5"도 JSON이다).
+        if not isinstance(meta, dict) or meta.get("type") != "session_meta":
+            continue
+        payload = meta.get("payload")
+        if isinstance(payload, dict) and isinstance(payload.get("cwd"), str):
+            cwds.add(payload["cwd"])
+    return cwds
+
+
+async def has_codex_history(cwd: str) -> bool:
+    """해당 cwd에 Codex 대화 기록이 있는지. 결과는 CODEX_CACHE_TTL초 캐시된다."""
+    global _codex_cwds, _codex_scanned_at
+    async with _codex_scan_lock:
+        if time.monotonic() - _codex_scanned_at >= CODEX_CACHE_TTL:
+            _codex_cwds = await to_thread.run_sync(_scan_codex_cwds)
+            _codex_scanned_at = time.monotonic()
+    return cwd in _codex_cwds
 
 
 async def remote_has_history(ssh: str, cwd: str, agent: str = "claude") -> bool:
@@ -374,12 +405,21 @@ class Session:
                 self._writer_registered = False
 
     def resize(self, cols: int, rows: int) -> None:
-        if self.alive and self.master_fd >= 0:
-            winsize = struct.pack("HHHH", rows, cols, 0, 0)
-            try:
-                fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
-            except OSError:
-                pass
+        """터미널 크기를 PTY에 반영한다.
+
+        값은 winsize에 담을 수 있는 범위로 자른다. struct.pack("HHHH", ...)은
+        0..65535를 벗어나면 struct.error를 던지는데, 이 호출은 클라이언트가 보낸
+        숫자를 그대로 받는 자리라 그러면 메시지 하나로 세션이 끊긴다.
+        """
+        if not (self.alive and self.master_fd >= 0):
+            return
+        winsize = struct.pack(
+            "HHHH", max(0, min(rows, 0xFFFF)), max(0, min(cols, 0xFFFF)), 0, 0
+        )
+        try:
+            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
+        except OSError:
+            pass
 
 
 class SessionManager:

@@ -159,16 +159,42 @@ def test_shell_session_roundtrip(start_server):
         send_line(ws, "stty size")
         recv_until(ws, "40 100")
 
-        # 깨진 메시지는 세션을 죽이지 않고 무시된다.
-        ws.send("이건 JSON이 아니다")
-        send_line(ws, "echo STILL-ALIVE")
-        recv_until(ws, "STILL-ALIVE")
-
         status = h.client(headers={"Origin": h.origin, "Cookie": f"wterm_token={token}"})
         (demo,) = status.get("/api/projects").json()
         assert demo["shell_live"] is True
         assert demo["live"] is False  # claude 세션과 키가 분리되어 있다
 
+        end_shell(ws)
+
+
+def test_malformed_messages_do_not_kill_the_session(start_server):
+    """프로토콜 경계에서 잘못된 메시지는 조용히 무시되어야 한다.
+
+    걸러지지 않으면 예외가 수신 루프 밖으로 나가 소켓이 닫힌다. 자기 세션만
+    끊는 자해라 보안 문제는 아니지만, 버그난 클라이언트는 원인 모를 단절을 겪고
+    서버 로그에는 트레이스백만 쌓인다. 잘못된 JSON은 원래 무시하고 있었으므로
+    나머지도 같은 규칙으로 맞춘 것이다.
+    """
+    h = start_server()
+    token = h.login()
+    with ws_connect(h, "/ws/demo?agent=shell", token=token) as ws:
+        status_message(ws)
+        for bad in (
+            "이건 JSON이 아니다",                                   # JSON이 아님
+            "5",                                                    # JSON이지만 객체가 아님
+            b"\x00\x01\x02",                                        # 바이너리 프레임
+            json.dumps({"type": "resize"}),                         # cols/rows 없음
+            json.dumps({"type": "resize", "cols": "80", "rows": "24"}),  # 숫자가 아님
+            json.dumps({"type": "resize", "cols": 99999, "rows": 24}),   # winsize 범위 밖
+            json.dumps({"type": "input", "data": {"nope": 1}}),      # data가 문자열이 아님
+            json.dumps({"type": "없는타입"}),
+        ):
+            ws.send(bad)
+
+        # 위 리사이즈가 struct.error를 냈다면 이 시점에 소켓은 이미 닫혀 있다.
+        ws.send(json.dumps({"type": "resize", "cols": 100, "rows": 40}))
+        send_line(ws, "stty size")
+        recv_until(ws, "40 100")
         end_shell(ws)
 
 

@@ -18,9 +18,10 @@ import time
 
 import httpx
 import pytest
+from websockets.exceptions import InvalidStatus
 from websockets.sync.client import connect
 
-from conftest import PASSWORD, free_port
+from conftest import PASSWORD, free_port, wait_for_uds
 from test_ws import end_shell
 
 pytestmark = pytest.mark.skipif(
@@ -156,6 +157,40 @@ def test_missing_cert_at_startup_is_fatal(start_server, tmp_path):
     assert not h.pid_file.exists()
 
 
+def test_plaintext_origin_is_rejected_over_https(tls_server):
+    """https로 서비스하는데 http:// 오리진이 통과하면 안 된다.
+
+    호스트만 비교하면 표준 포트에서 http://<호스트>와 https://<호스트>의 netloc이
+    같아 평문 오리진이 그냥 통과한다. 테일넷 안에 들어온 공격자가 그 호스트명의
+    80포트를 잡으면 만들 수 있는 페이지이고, 거기서 연 wss:// 요청에는 Secure
+    쿠키가 그대로 실린다 — 쿠키는 페이지가 아니라 요청의 스킴을 보기 때문이다.
+    """
+    h, *_ = tls_server
+    plain = f"http://{h.host}:{h.port}"  # netloc은 Host 헤더와 완전히 같다
+
+    with httpx.Client(verify=False, timeout=10.0) as c:
+        r = c.post(
+            f"{h.base_url}/api/login",
+            json={"password": PASSWORD},
+            headers={"Origin": plain},
+        )
+        assert r.status_code == 403
+        assert "set-cookie" not in r.headers
+
+    # 실제로 막고 싶은 것은 이쪽이다. WS는 CORS가 막아주지 않는다.
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with pytest.raises(InvalidStatus) as exc:
+        connect(
+            f"{h.ws_url}/ws/demo?agent=shell",
+            ssl=ctx,
+            additional_headers={"Origin": plain},
+            open_timeout=15,
+        )
+    assert exc.value.response.status_code == 403
+
+
 def test_tls_ignored_under_uds(start_server, tmp_path, short_tmp_dir):
     """uds 구성에서는 앞단 프록시가 TLS를 담당한다. 서버는 무시하고 뜬다."""
     cert, key = make_cert(tmp_path, "unused")
@@ -169,14 +204,7 @@ def test_tls_ignored_under_uds(start_server, tmp_path, short_tmp_dir):
         tls_certfile=str(cert),
         tls_keyfile=str(key),
     )
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        if sock.exists() and h.pid_file.exists():
-            break
-        assert h.proc.poll() is None, f"기동 중 종료됨:\n{h.output()}"
-        time.sleep(0.1)
-    else:
-        raise AssertionError(f"유닉스 소켓이 생기지 않았다:\n{h.output()}")
+    wait_for_uds(h, sock)
 
     assert "무시합니다" in h.output()
     transport = httpx.HTTPTransport(uds=str(sock))

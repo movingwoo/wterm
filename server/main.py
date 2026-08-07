@@ -30,7 +30,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from .config import load_config
+from .config import CONFIG_PATH, load_config
 from .session import SessionManager, has_codex_history, latest_session_id, remote_has_history
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -115,15 +115,52 @@ async def add_security_headers(request: Request, call_next):
 # 클라이언트는 static/app.js뿐이라 잃는 것이 없다.
 
 
-def origin_allowed(headers) -> bool:
-    origin = headers.get("origin")
+def _is_secure(conn) -> bool:
+    """이 요청이 https/wss로 들어왔는지. Request와 WebSocket 둘 다 받는다.
+    쿠키의 Secure 플래그와 아래 Origin 스킴 검사가 같은 판정을 쓴다.
+
+    - 서버가 직접 TLS를 종단하면 평문으로 들어올 길 자체가 없다.
+    - uds 구성은 앞단 프록시가 TLS를 담당하는 형태다. 그런데 유닉스 소켓에는
+      클라이언트 주소가 없어(scope["client"]가 None — 확인함) uvicorn의
+      forwarded_allow_ips 판정이 **항상** 실패하고, X-Forwarded-Proto가 무시된
+      채 scheme이 "http"로 남는다. HTTPS로 서비스하면서 토큰 쿠키가 Secure 없이
+      나가는 상황이라, 이 구성에서는 헤더를 직접 본다. 헤더가 없으면 https로
+      본다 — uds는 앞단이 TLS를 맡는 구성이라는 것이 이 서버의 전제이고,
+      평문 프록시라면 `X-Forwarded-Proto: http`를 붙여 뒤집을 수 있다.
+      틀렸을 때 조용히 새는 쪽(Secure 누락)보다 바로 드러나는 쪽(브라우저가
+      쿠키를 버려 로그인이 안 됨)으로 기울인다.
+    - 그 밖에는 uvicorn이 보정해 준 scheme을 그대로 믿는다. TCP로 리슨하는
+      경우 프록시는 같은 호스트에 있고 forwarded_allow_ips 기본값(127.0.0.1)에
+      걸리므로 보정이 정상 동작한다.
+    """
+    if config.uds:
+        return conn.headers.get("x-forwarded-proto", "https").lower() in ("https", "wss")
+    if config.tls_enabled:
+        return True
+    return conn.url.scheme in ("https", "wss")
+
+
+def origin_allowed(conn) -> bool:
+    origin = conn.headers.get("origin")
     if not origin:
         return False
     origin = origin.rstrip("/").lower()
     if config.allowed_origins:
         return origin in config.allowed_origins
-    host = headers.get("host")
-    return bool(host) and urlsplit(origin).netloc == host.lower()
+    host = conn.headers.get("host")
+    if not host:
+        return False
+    parts = urlsplit(origin)
+    if parts.netloc != host.lower():
+        return False
+    # 호스트만 비교하면 표준 포트로 서비스할 때 http://<호스트>와
+    # https://<호스트>의 netloc이 같아 **평문 오리진이 통과한다.** 테일넷 안에
+    # 들어온 공격자가 그 호스트명의 80포트를 잡으면 만들 수 있는 페이지이고,
+    # 거기서 연 wss:// 요청에는 Secure 쿠키가 그대로 실린다 — 쿠키는 페이지의
+    # 스킴이 아니라 요청의 스킴을 보기 때문이다.
+    # 반대로 평문으로 들어온 요청에는 스킴을 강제하지 않는다. 앞단 프록시가
+    # TLS를 끝내고 평문으로 넘겨주는 구성이 정확히 그렇게 보이기 때문이다.
+    return parts.scheme == "https" if _is_secure(conn) else True
 
 
 # ── 감사 로그 ───────────────────────────────────────────────────────
@@ -258,13 +295,6 @@ async def _auth_watchdog(ws: WebSocket, token: str) -> None:
             return
 
 
-def _is_secure(request: Request) -> bool:
-    """https로 들어온 요청인지. 앞단 프록시가 TLS를 끝내는 구성에서는 uvicorn이
-    X-Forwarded-Proto로 scheme을 바로잡아 준다. 서버가 직접 TLS를 종단하는 경우
-    평문으로 들어올 길 자체가 없으므로 tls_enabled면 무조건 True로 봐도 된다."""
-    return request.url.scheme == "https" or config.tls_enabled
-
-
 def _set_auth_cookie(resp: Response, request: Request, token: str) -> None:
     # samesite=strict: 인증 확인은 같은 오리진에서 뜬 페이지의 fetch/WS만 하므로
     # 교차 사이트 진입 흐름이 없다. 첫 문서 요청(/)은 쿠키를 보지 않는 덕에
@@ -334,7 +364,7 @@ def _record_login_failure(key: str, now: float) -> None:
 async def login(request: Request):
     """패스워드 검증 후 HttpOnly 쿠키로 세션 토큰을 발급한다."""
     key = _peer(request)
-    if not origin_allowed(request.headers):
+    if not origin_allowed(request):
         _audit(
             "login-reject", reason="origin", client=key,
             origin=request.headers.get("origin"), host=request.headers.get("host"),
@@ -388,7 +418,7 @@ async def login(request: Request):
 @app.post("/api/logout")
 async def logout(request: Request):
     """토큰을 서버에서 지우고 쿠키를 만료시킨다."""
-    if not origin_allowed(request.headers):
+    if not origin_allowed(request):
         return JSONResponse({"ok": False}, status_code=403)
     token = request.cookies.get(AUTH_COOKIE)
     closed = 0
@@ -427,7 +457,9 @@ async def list_projects(request: Request):
                 # 원격은 목록 조회 때마다 ssh를 돌리기엔 느려서 낙관적으로 true
                 # (실제 판단은 WS 접속 시 remote_has_history로 수행)
                 "has_history": True if p.ssh else latest_session_id(p.path) is not None,
-                "codex_has_history": True if p.ssh else has_codex_history(p.path),
+                "codex_has_history": (
+                    True if p.ssh else await has_codex_history(p.path)
+                ),
             }
         )
     return result
@@ -477,7 +509,7 @@ async def terminal_ws(
     # 브라우저에는 평범한 연결 실패로만 보이므로, 설정 실수를 가려낼 단서는
     # 로그로 남긴다(정상 사용 중에는 찍힐 일이 없는 줄이다).
     client = _peer(ws)
-    if not origin_allowed(ws.headers):
+    if not origin_allowed(ws):
         _audit(
             "ws-reject", reason="origin", client=client,
             origin=ws.headers.get("origin"), host=ws.headers.get("host"),
@@ -536,12 +568,10 @@ async def terminal_ws(
     else:
         if project.ssh is not None:
             has_history = await remote_has_history(project.ssh, project.path, agent)
+        elif agent == "codex":
+            has_history = await has_codex_history(project.path)
         else:
-            has_history = (
-                has_codex_history(project.path)
-                if agent == "codex"
-                else latest_session_id(project.path) is not None
-            )
+            has_history = latest_session_id(project.path) is not None
         if mode == "resume" and has_history:
             action = "resume"
             extra_args = ["resume"] if agent == "codex" else ["--resume"]
@@ -578,6 +608,10 @@ async def terminal_ws(
         _ws_tokens[ws] = token
         watchdog = asyncio.ensure_future(_auth_watchdog(ws, token))
 
+    # 프로토콜 경계다. 여기서 걸러지지 않은 형식 오류는 전부 루프 밖으로 나가
+    # 세션을 끊는다 — 자기 세션만 끊는 자해라 보안 문제는 아니지만, 버그난
+    # 클라이언트가 원인 모를 단절을 겪고 서버 로그에는 트레이스백만 쌓인다.
+    # 잘못된 JSON을 이미 조용히 무시하고 있으므로 나머지도 같은 규칙으로 맞춘다.
     try:
         while True:
             try:
@@ -587,17 +621,28 @@ async def terminal_ws(
                 # Starlette은 닫힌 소켓에서의 receive를 RuntimeError로 알린다.
                 # 정상 종료 경로이므로 트레이스백을 남기지 않는다.
                 break
+            except KeyError:
+                # 바이너리 프레임. receive_text는 message["text"]를 그냥 꺼내므로
+                # KeyError가 된다. 서버→클라이언트만 바이너리를 쓴다.
+                continue
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            if msg.get("type") == "input":
-                if session.write_input(msg.get("data", "")):
+            if not isinstance(msg, dict):
+                continue  # "5"나 "[]"도 유효한 JSON이다
+            kind = msg.get("type")
+            if kind == "input":
+                data = msg.get("data")
+                if isinstance(data, str) and session.write_input(data):
                     # 자식이 stdin을 읽지 않아 입력이 버려졌다. 조용히 버리면
                     # 타이핑이 사라진 것처럼 보인다.
                     await _notify_input_dropped(ws)
-            elif msg.get("type") == "resize":
-                session.resize(int(msg["cols"]), int(msg["rows"]))
+            elif kind == "resize":
+                cols, rows = msg.get("cols"), msg.get("rows")
+                # bool도 int이지만 resize가 값을 범위로 자르므로 해가 없다.
+                if isinstance(cols, int) and isinstance(rows, int):
+                    session.resize(cols, rows)
     except WebSocketDisconnect:
         pass
     finally:
@@ -791,10 +836,37 @@ def setup_logging() -> None:
     _audit_log.addHandler(audit_handler)
 
 
+# ── 비밀 파일 권한 ──────────────────────────────────────────────────
+#
+# projects.json에는 argon2 해시가 들어 있고, 그건 오프라인 크래킹 대상이다.
+# logs/는 기동할 때마다 700으로 조이면서(setup_logging) 정작 설정 파일은 보지
+# 않았다 — 점검이 scripts/cert-status.sh에만 있는데 그건 TLS를 쓰지 않으면
+# 실행할 이유가 없는 스크립트다.
+#
+# 경고만 하고 chmod는 하지 않는다. 배포 설정의 권한을 서버가 말없이 바꾸는 것은
+# 다른 종류의 사고를 만든다 (앞단 프록시나 배포 도구가 그 파일을 읽고 있을 수 있다).
+_config_log = logging.getLogger("wterm.config")
+_config_log.setLevel(logging.INFO)  # 루트가 ERROR로 잠겨 있다 — _tls_log 주석 참조
+
+
+def _warn_on_config_permissions() -> None:
+    try:
+        mode = CONFIG_PATH.stat().st_mode & 0o777
+    except OSError:
+        return
+    if mode & 0o077:
+        _config_log.warning(
+            "%s 권한이 %04o입니다 — 같은 머신의 다른 사용자가 읽을 수 있습니다. "
+            "password_hash가 들어 있으면 오프라인 크래킹 대상입니다: chmod 600 %s",
+            CONFIG_PATH, mode, CONFIG_PATH,
+        )
+
+
 def main() -> None:
     import uvicorn
 
     setup_logging()
+    _warn_on_config_permissions()
     _claim_pid_file()
     # 재시작은 모든 토큰과 PTY 세션이 끊기는 경계다. 감사 기록을 읽을 때
     # 이 줄이 없으면 "그 시각 이후 기록이 왜 비었는지"를 알 수 없다.
