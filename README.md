@@ -145,4 +145,3 @@ GitHub Actions가 main 푸시와 PR마다 macOS와 Ubuntu 양쪽에서 같은 �
 | [docs/operations.md](docs/operations.md) | 기동/재시작, 부팅 시 자동 기동 |
 | [docs/security.md](docs/security.md) | 위협 전제, 방어 구현, 침해 시 회전 순서 |
 | [AGENTS.md](AGENTS.md) | 세션 불변조건, WS 프로토콜, 개발·검증 규칙 |
-| [CLAUDE.md](CLAUDE.md) | Claude Code로 이 저장소를 작업할 때의 추가 지침 |

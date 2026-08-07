@@ -4,14 +4,14 @@
 
 W-Term is an internal web terminal for controlling Claude Code, Codex, and login-shell sessions. The browser uses xterm.js, the FastAPI server relays terminal traffic over WebSocket, and `server/session.py` owns PTY process lifecycles.
 
-This file contains the detailed architecture, protocol, operational assumptions, and security constraints. `CLAUDE.md` only adds rules specific to working in this repo via Claude Code — read it too if you are Claude Code.
+This file contains the detailed architecture, protocol, operational assumptions, and security constraints, and it is the only such file — agent-specific guidance goes here too rather than into a second document that drifts out of sync.
 
 ## Running the project
 
 - Start the service with `./start.sh`; stop it with `./stop.sh` on either platform; restart with `./stop.sh && ./start.sh`. The long-running deployment is supervised — a LaunchDaemon on macOS (`scripts/install-launchd.sh`) or a systemd unit on Linux (`scripts/install-systemd.sh`) — and `start.sh` goes through the supervisor when one is installed, which needs root (`sudo ./start.sh`). See "Process lifecycle".
 - Server address, authentication, grace period, UDS, TLS certificate paths, and the project whitelist come from `projects.json`.
 - Use the existing `.venv/bin/python`; the system Python does not provide pip or venv.
-- If dependencies must be recreated, use `~/.local/bin/uv` as documented in `CLAUDE.md`.
+- If dependencies must be recreated, use `~/.local/bin/uv`.
 - The frontend has no build step. xterm.js dependencies are vendored under `static/vendor/`.
 
 ## Repository map
@@ -122,7 +122,7 @@ The server terminates TLS itself when `tls_certfile` and `tls_keyfile` are both 
 - Do not expose the server on `0.0.0.0`. Prefer loopback or UDS behind an authenticated VPN/reverse proxy. When the server terminates TLS itself and other devices must reach it directly, binding to a private VPN-interface address (a tailnet IP, for example) is acceptable; a routable public address is not.
 - Invoke `acme.sh` with `LC_ALL=C`. It parses certificate dates with `date -j -f "%b %d ..."`, which fails under non-English locales and silently disables its "renewal scheduled after expiry" guard.
 - Treat `projects.json`, authentication settings, and certificate paths as deployment configuration. Do not print or duplicate secrets, and never commit certificate or key files. The server warns at startup when that file is readable by group or other (the argon2 hash in it is an offline-cracking target) but must not `chmod` it — silently changing the permissions of deployment configuration causes a different class of accident.
-- Do not terminate processes found only through broad commands such as `pgrep claude` or `pgrep codex`; verify ownership and parentage first.
+- Do not terminate processes found only through broad commands such as `pgrep claude` or `pgrep codex`; verify ownership and parentage first. This repository is on its own whitelist, so a session started from the web UI and a session the developer is running by hand look identical to `pgrep` — check the pid before killing anything.
 - The running server does not auto-reload. Code changes require a deliberate restart before they become active.
 
 ## Verification

@@ -3,7 +3,7 @@
 # 서버가 기록한 logs/wterm.pid를 사용해 이 저장소에서 띄운 서버 프로세스만 종료한다.
 # (/proc/$pid/cwd 기반 조회는 macOS에 /proc이 없어 항상 실패하므로 사용하지 않는다)
 # 서버는 종료 시 SessionManager.shutdown()으로 자식 claude 세션을 직접 회수하므로
-# 여기서는 서버 pid에만 시그널을 보내면 된다 (pgrep claude 금지 — CLAUDE.md 참조).
+# 여기서는 서버 pid에만 시그널을 보내면 된다 (pgrep claude 금지 — AGENTS.md 참조).
 #
 # 감시자(launchd/systemd)와의 관계: 서버는 SIGTERM을 받으면 종료 코드 0으로 끝나고
 # 감시자는 "정상 종료"로 보아 되살리지 않는다(server/main.py의 _exit_success 참조).
