@@ -23,7 +23,7 @@ This file contains the detailed architecture, protocol, operational assumptions,
 - `static/style.css`: application layout and visual states.
 - `static/vendor/`: vendored third-party files; do not edit.
 - `scripts/cert-setup.sh`: one-shot TLS certificate issuance via acme.sh; not invoked by the server.
-- `scripts/cert-status.sh`: certificate health check (expiry, served-vs-file match, renewal job).
+- `scripts/cert-status.sh`: certificate health check (expiry, served-vs-file match, renewal job) plus secret-file permissions. The permission section runs before the "TLS not configured" early exit, so it covers deployments without TLS.
 - `scripts/install-launchd.sh`: installs the boot-time LaunchDaemon and moves renewal off cron (macOS).
 - `tests/`: pytest smoke suite. `conftest.py` owns the repo-copy fixture that every test's server runs from.
 - `scripts/install-systemd.sh`: the Linux counterpart — a `wterm.service` system unit plus a `wterm-certrenew.timer`. Keep the two installers behaviourally equivalent; a change to one usually belongs in the other.
@@ -59,6 +59,24 @@ Authentication is a second lock behind the network boundary, not a substitute fo
 - **Rate limiting must reject before the hash runs.** The point is not to slow guessing (argon2 already does that) but to avoid paying the cost at all. A blocked bucket returns 429 without touching argon2 — including for the correct password.
 - **Token expiry is enforced server-side.** Cookie `max-age` is only a request to the browser; `_valid_tokens` stores issue times and `is_authed` checks them, so `AUTH_TOKEN_TTL` and the cookie's `max-age` must stay the same value. `/api/logout` is the revocation path — a restart is not one, since it kills every PTY session.
 - Both `_valid_tokens` and `_login_fails` are bounded `OrderedDict`s. They are reachable by unauthenticated requests, so any change must keep them from growing without limit.
+
+## Audit log
+
+`wterm.audit` writes to its own file, `logs/wterm-audit.log`, with 90 days of rotation. It exists for post-incident investigation, not detection.
+
+- **Never log terminal content — input or output.** Only session metadata (project, agent, mode, time, peer address). Logging input would turn this file into a channel for every password and API key typed into a session. `tests/test_hardening.py` asserts this.
+- It does not propagate to the root logger. `wterm.log` is ERROR-only and keeps `backupCount=1`, so anything that leaks there effectively has two days of retention and drowns real errors in routine traffic.
+- A blocked login is recorded once, when the block is set — not per rejected attempt. Per-attempt logging would let an unauthenticated caller inflate the file without limit.
+- The handler is installed in `setup_logging()`. Entry points that skip it (importing the app under a bare `uvicorn` invocation) silently drop audit records.
+- `server-start` / `server-stop` mark the boundary where every token and PTY session dies. Without them a gap in the log is unreadable.
+
+## Response headers
+
+`SECURITY_HEADERS` is applied by an HTTP middleware, not a route dependency, because `/static` is a `StaticFiles` mount and never runs route hooks — an unprotected `app.js` makes the CSP pointless.
+
+- `style-src` carries `'unsafe-inline'` and must keep it. The xterm.js DOM renderer creates `<style>` elements at runtime and assigns `textContent` (`_dimensionsStyleElement`, `_themeStyleElement`); blocking that leaves cell metrics and theme colours wrong. A nonce cannot fix it — the element is created by vendored xterm.js, not by our code.
+- `script-src` must stay strict. Script injection on this server is arbitrary command execution, so `'unsafe-inline'`/`'unsafe-eval'` never belong there. Both directions are asserted in `tests/test_hardening.py`.
+- No HSTS. When `tls_enabled` there is no plaintext listener to be downgraded from, and the remaining threat requires the attacker to already be inside the tailnet — not worth a directive that persists in browsers.
 
 ## TLS
 
@@ -113,6 +131,8 @@ git diff --check
 - Tests start the server **as a real process from a copy of the repository**, never in-process. `server/main.py` reads `projects.json` and `logs/wterm.pid` from fixed paths at import time, so a copy is what keeps a test run from touching the deployment or colliding with a running server. It is also the only way to cover what has actually broken here: the pid-file lock, exit code 0 on SIGTERM, and `SIGHUP` certificate reload are all process-level behaviour.
 - The suite needs no `claude`/`codex` CLI. Session behaviour is exercised through a login shell, and the agent path is covered only up to "reports exit 127 when the binary is not on `PATH`".
 - Interactive `bash` ignores SIGTERM, so a live shell session makes shutdown wait the full `SIGTERM_WAIT` before `SIGKILL`. Tests that keep a session open end it with `exit` (`end_shell`) rather than leaving it to teardown; that is also the only coverage of a normal exit notification.
+- `end_shell` sends `true` before `exit` deliberately. A bare `exit` returns `$?`, which at that point is whatever the shell's startup files left behind — macOS `/etc/bashrc` ends on `[ -r "/etc/bashrc_$TERM_PROGRAM" ] && …`, false whenever `TERM_PROGRAM` is unset, so a login shell in a daemon or CI environment starts with `$?` at 1. The assertion is about the server propagating the child's exit code, not about someone else's rc file; do not "fix" a failure here by relaxing `assert payload["code"] == 0`.
+- `tests/test_hardening.py` reads `logs/wterm-audit.log` scoped to `server-start pid=<this process>`. `repo_copy` is session-scoped, so the whole file is shared across every server in a run and unscoped assertions would pass on another test's records.
 - A separate `systemd` CI job installs `scripts/install-systemd.sh` on the runner for real and walks install → start → SIGKILL/resurrect → `stop.sh`/stay-down → `cert-status.sh` → uninstall. It is the only place the supervisor contract (`Restart=on-failure` paired with exit code 0) is actually exercised, so changes to either installer or to shutdown behaviour must keep it passing. Reboot auto-start and the pre-240 `append:` fallback stay unverifiable there.
 - Do not weaken an assertion to make a test pass. These encode the invariants in this file, and each one exists because that behaviour broke before.
 

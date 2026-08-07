@@ -49,6 +49,55 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="W-Term", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+# ── 보안 응답 헤더 ──────────────────────────────────────────────────
+#
+# 라우트 데코레이터가 아니라 미들웨어인 이유는 /static이 StaticFiles 마운트라
+# 라우트 훅을 타지 않기 때문이다. app.js가 헤더 없이 나가면 CSP는 의미가 없다.
+#
+# script-src가 이 목록의 핵심이다. 이 서버에서 스크립트 주입은 곧 임의 명령
+# 실행이라, 외부 스크립트와 인라인 스크립트를 둘 다 막는 것이 실질적인 방어다.
+# index.html에는 인라인 스크립트도 이벤트 속성도 없어 'self'로 그냥 통과한다.
+#
+# style-src만 'unsafe-inline'을 연다. xterm.js DOM 렌더러가 런타임에 <style>
+# 엘리먼트를 만들어 textContent로 CSS를 밀어넣기 때문이다(_dimensionsStyleElement,
+# _themeStyleElement). 벤더링과 무관하게 이건 인라인 스타일로 취급되어 차단되고,
+# 차단되면 셀 크기와 테마 색이 어긋난 채로 렌더링된다. nonce로도 못 푼다 —
+# 엘리먼트를 만드는 것이 우리 코드가 아니라 xterm.js라 nonce를 붙일 수 없다.
+# 스타일 주입만으로는 명령 실행에 이르지 못하므로 여기서 멈춘다.
+#
+# HSTS는 넣지 않는다. tls_enabled면 평문 리스너 자체가 없어 강등당할 대상이
+# 없고, 남는 위협(그 호스트명을 사칭하는 중간자)은 이미 테일넷 안에 들어와 있어야
+# 성립한다. 얻는 것에 비해 브라우저에 오래 남는 부작용이 크다.
+SECURITY_HEADERS = {
+    "Content-Security-Policy": "; ".join(
+        (
+            "default-src 'self'",
+            "script-src 'self'",
+            "style-src 'self' 'unsafe-inline'",  # xterm.js 런타임 <style> 주입
+            "img-src 'self'",
+            "font-src 'self'",
+            "connect-src 'self'",  # CSP3에서 'self'는 같은 호스트의 wss도 포함한다
+            "base-uri 'none'",
+            "form-action 'self'",
+            "frame-ancestors 'none'",  # 터미널 클릭재킹
+            "object-src 'none'",
+        )
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    # frame-ancestors를 이해하지 못하는 구형 브라우저용 중복 방어
+    "X-Frame-Options": "DENY",
+    "Cross-Origin-Opener-Policy": "same-origin",
+}
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for name, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(name, value)
+    return response
+
 # ── Origin 검증 ─────────────────────────────────────────────────────
 #
 # WebSocket 핸드셰이크에는 CORS가 적용되지 않는다. 쿠키만 확인하면, 로그인해 둔
@@ -76,6 +125,37 @@ def origin_allowed(headers) -> bool:
     return bool(host) and urlsplit(origin).netloc == host.lower()
 
 
+# ── 감사 로그 ───────────────────────────────────────────────────────
+#
+# 탐지용이 아니라 사후 조사용이다. 뚫렸다고 판단했을 때 "언제 무엇이 실행됐나"를
+# 모르면 전부 초기화하는 것 말고 선택지가 없다.
+#
+# wterm.log가 아니라 자체 파일을 쓴다. 그쪽은 backupCount=1이라 이틀치만 남아
+# 사후 조사라는 목적에 애초에 못 쓴다. propagate=False로 끊어서 ERROR 전용인
+# wterm.log에 INFO가 섞이지 않게 한다 (핸들러는 setup_logging에서 붙인다).
+#
+# **터미널 내용은 절대 남기지 않는다.** 여기 들어갈 수 있는 것은 세션
+# 메타데이터(프로젝트/에이전트/모드/시각/상대 주소)뿐이다. 입력을 남기면 이
+# 파일 자체가 패스워드와 API 키가 흐르는 통로가 된다.
+AUDIT_BACKUP_DAYS = 90
+
+_audit_log = logging.getLogger("wterm.audit")
+_audit_log.setLevel(logging.INFO)
+_audit_log.propagate = False
+
+
+def _peer(conn) -> str:
+    """요청/소켓의 상대 주소. uds나 프록시 뒤에서는 없거나 프록시 IP뿐이다.
+    감사 기록의 client와 로그인 제한 버킷 키가 같은 값을 쓴다."""
+    return conn.client.host if conn.client else "-"
+
+
+def _audit(event: str, **fields) -> None:
+    """감사 기록 한 줄. `event key=value ...` 형태라 grep으로 추려낼 수 있다."""
+    detail = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+    _audit_log.info("%s%s", event, f" {detail}" if detail else "")
+
+
 # ── 패스워드 인증 (projects.json에 password_hash가 있을 때만) ──────────
 #
 # 로그인 성공 시 발급한 토큰을 서버 메모리에만 보관한다 (무상태 철학 유지,
@@ -93,12 +173,6 @@ MAX_TOKENS = 512  # 발급 토큰 상한. 넘으면 오래된 것부터 버린�
 # 같이 하므로 벽시계 기준으로 보관할 이유가 없다.
 _valid_tokens: OrderedDict[str, float] = OrderedDict()  # token -> 발급 시각
 _password_hasher = PasswordHasher()
-
-_auth_log = logging.getLogger("wterm.auth")
-# 루트가 ERROR로 잠겨 있어(setup_logging 참조) 그대로 두면 차단 기록이 남지 않는다.
-# 차단은 장애가 아니지만 "왜 로그인이 안 되지"의 답이 여기밖에 없다. wterm.tls와
-# 같은 방식으로 자식 로거에 자체 레벨을 준다.
-_auth_log.setLevel(logging.INFO)
 
 
 def _issue_token() -> str:
@@ -166,11 +240,9 @@ _login_fails: OrderedDict[str, tuple[int, float]] = OrderedDict()  # 키 -> (실
 _login_slots = asyncio.Semaphore(LOGIN_MAX_CONCURRENT)
 
 
-def _client_key(request: Request) -> str:
-    """제한 버킷 키. uds나 프록시 뒤에서는 실제 클라이언트 IP가 없거나 프록시
-    IP뿐이라 전부 한 버킷으로 모인다 — 그 구성에서는 앞단이 IP별 제한을 맡고,
-    여기서는 전역 제한으로만 동작한다."""
-    return request.client.host if request.client else "-"
+# 제한 버킷 키는 상대 주소(_peer)를 그대로 쓴다. uds나 프록시 뒤에서는 실제
+# 클라이언트 IP가 없거나 프록시 IP뿐이라 전부 한 버킷으로 모인다 — 그 구성에서는
+# 앞단이 IP별 제한을 맡고, 여기서는 전역 제한으로만 동작한다.
 
 
 def _login_block_remaining(key: str, now: float) -> float:
@@ -190,7 +262,7 @@ def _record_login_failure(key: str, now: float) -> None:
         else 0.0
     )
     if delay:
-        _auth_log.info("로그인 %d회 실패로 %.0f초 차단: %s", fails, delay, key)
+        _audit("login-blocked", client=key, fails=fails, seconds=int(delay))
     _login_fails[key] = (fails, now + delay)  # pop 후 재삽입이라 이미 맨 뒤(=최신)
     while len(_login_fails) > LOGIN_BUCKET_LIMIT:
         _login_fails.popitem(last=False)
@@ -199,14 +271,21 @@ def _record_login_failure(key: str, now: float) -> None:
 @app.post("/api/login")
 async def login(request: Request):
     """패스워드 검증 후 HttpOnly 쿠키로 세션 토큰을 발급한다."""
+    key = _peer(request)
     if not origin_allowed(request.headers):
+        _audit(
+            "login-reject", reason="origin", client=key,
+            origin=request.headers.get("origin"), host=request.headers.get("host"),
+        )
         return JSONResponse({"ok": False}, status_code=403)
     if config.password_hash is None:
         return JSONResponse({"ok": True})
-    key = _client_key(request)
     wait = _login_block_remaining(key, time.monotonic())
     if wait > 0:
         # 차단 중에는 argon2를 아예 돌리지 않는다. 비용을 안 태우는 것이 요점이다.
+        # 여기서 감사 기록을 남기지 않는 것도 같은 이유다 — 차단된 상대가 계속
+        # 두드리면 인증 없이 감사 파일을 무한히 부풀릴 수 있다. 차단이 걸린
+        # 순간의 login-blocked 한 줄이면 사후 조사에는 충분하다.
         retry_after = int(wait) + 1
         return JSONResponse(
             {"ok": False, "retry_after": retry_after},
@@ -226,9 +305,11 @@ async def login(request: Request):
                 _password_hasher.verify, config.password_hash, password
             )
     except (VerifyMismatchError, InvalidHash):
+        _audit("login-fail", client=key)
         _record_login_failure(key, time.monotonic())
         return JSONResponse({"ok": False}, status_code=401)
     _login_fails.pop(key, None)
+    _audit("login-ok", client=key)
     resp = JSONResponse({"ok": True})
     _set_auth_cookie(resp, request, _issue_token())
     return resp
@@ -242,6 +323,7 @@ async def logout(request: Request):
     token = request.cookies.get(AUTH_COOKIE)
     if token:
         _valid_tokens.pop(token, None)
+    _audit("logout", client=_peer(request))
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(
         AUTH_COOKIE, httponly=True, samesite="strict", secure=_is_secure(request)
@@ -306,22 +388,25 @@ async def terminal_ws(
     # 열린 소켓을 단 한 순간도 쥐지 못한다. 대신 close code가 전달되지 않아
     # 브라우저에는 평범한 연결 실패로만 보이므로, 설정 실수를 가려낼 단서는
     # 로그로 남긴다(정상 사용 중에는 찍힐 일이 없는 줄이다).
+    client = _peer(ws)
     if not origin_allowed(ws.headers):
-        _auth_log.info(
-            "오리진 불일치로 WS 거절: origin=%r host=%r",
-            ws.headers.get("origin"), ws.headers.get("host"),
+        _audit(
+            "ws-reject", reason="origin", client=client,
+            origin=ws.headers.get("origin"), host=ws.headers.get("host"),
         )
         await ws.close(code=4403, reason="허용되지 않은 오리진")
         return
 
     project = config.find_project(project_name)
     if project is None:
+        _audit("ws-reject", reason="unknown-project", client=client, project=project_name)
         await ws.close(code=4404, reason="화이트리스트에 없는 프로젝트")
         return
 
     if shell:
         agent = "shell"
     if agent not in ("claude", "codex", "shell"):
+        _audit("ws-reject", reason="bad-agent", client=client, agent=agent)
         await ws.close(code=4400, reason="지원하지 않는 에이전트")
         return
 
@@ -329,17 +414,20 @@ async def terminal_ws(
 
     # accept 후에 닫아야 close code(4401)가 클라이언트까지 전달된다
     if not is_authed(ws.cookies):
+        _audit("ws-reject", reason="unauthorized", client=client, project=project_name)
         await ws.close(code=4401, reason="인증 필요")
         return
 
     session_key = f"{project_name}#{agent}"
     session = manager.get_live(session_key)
     if session is not None and mode != "new":
+        action = "reattach"
         await session.attach(ws)
         await ws.send_text(
             json.dumps({"type": "status", "message": "실행 중인 세션에 재접속했습니다."})
         )
     elif agent == "shell":
+        action = "start"
         session = await manager.start(
             session_key, project.path, ssh=project.ssh, agent="shell"
         )
@@ -357,20 +445,32 @@ async def terminal_ws(
                 else latest_session_id(project.path) is not None
             )
         if mode == "resume" and has_history:
+            action = "resume"
             extra_args = ["resume"] if agent == "codex" else ["--resume"]
             msg = "이어할 세션을 목록에서 선택하세요."
         elif mode == "continue" and has_history:
+            action = "continue"
             extra_args = ["resume", "--last"] if agent == "codex" else ["--continue"]
             msg = "가장 최근 세션을 이어합니다."
         elif mode in ("resume", "continue"):
+            action = "start"
             extra_args, msg = None, "이어할 세션 기록이 없어 새 세션을 시작합니다."
         else:
+            action = "start"
             extra_args, msg = None, "새 세션을 시작합니다."
         session = await manager.start(
             session_key, project.path, extra_args, ssh=project.ssh, agent=agent
         )
         await session.attach(ws)
         await ws.send_text(json.dumps({"type": "status", "message": msg}))
+
+    # 사후 조사에서 가장 중요한 줄. "어느 시각에 어느 프로젝트에서 무엇이 떴나"가
+    # 여기 남는다. 실행된 명령이나 터미널 내용은 남기지 않는다.
+    _audit(
+        "ws-open", client=client, project=project_name, agent=agent,
+        mode=mode, action=action, remote=project.ssh,
+    )
+    opened_at = time.monotonic()
 
     try:
         while True:
@@ -387,6 +487,10 @@ async def terminal_ws(
         pass
     finally:
         session.detach(ws)
+        _audit(
+            "ws-close", client=client, project=project_name, agent=agent,
+            seconds=int(time.monotonic() - opened_at),
+        )
 
 
 # ── TLS (projects.json에 tls_certfile/tls_keyfile이 둘 다 있을 때만) ────
@@ -527,14 +631,26 @@ def _release_pid_file() -> None:
 
 
 def _exit_success(signum, frame) -> None:
+    _audit("server-stop", pid=os.getpid())
     _release_pid_file()  # os._exit는 atexit를 타지 않으므로 직접 정리한다
     os._exit(0)
 
 
 def setup_logging() -> None:
-    """ERROR 이상만 기록. 자정마다 로테이션하며 하루 치(직전 파일 1개)만 보관."""
+    """ERROR 이상만 기록. 자정마다 로테이션하며 하루 치(직전 파일 1개)만 보관.
+
+    감사 로그(wterm.audit)만 별도 파일에 장기 보관한다 — 위 보관 주기로는
+    사후 조사가 불가능하기 때문이다.
+    """
     log_dir = BASE_DIR / "logs"
     log_dir.mkdir(exist_ok=True)
+    # 감사 로그에는 접속 주소와 프로젝트 이름이 남고, wterm.out에는 기동 시
+    # 설정 경고가 남는다. 로테이션으로 새로 생기는 파일까지 한 번에 덮으려면
+    # 파일마다 chmod하는 것보다 디렉터리를 닫는 쪽이 확실하다.
+    try:
+        log_dir.chmod(0o700)
+    except OSError:
+        pass  # 권한이 없으면(다른 사용자 소유 등) 로깅 자체를 막지는 않는다
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     file_handler = TimedRotatingFileHandler(
         log_dir / "wterm.log", when="midnight", backupCount=1, encoding="utf-8"
@@ -547,12 +663,29 @@ def setup_logging() -> None:
     root.addHandler(file_handler)
     root.addHandler(stream_handler)
 
+    audit_handler = TimedRotatingFileHandler(
+        log_dir / "wterm-audit.log",
+        when="midnight",
+        backupCount=AUDIT_BACKUP_DAYS,
+        encoding="utf-8",
+    )
+    audit_handler.setFormatter(fmt)
+    _audit_log.addHandler(audit_handler)
+
 
 def main() -> None:
     import uvicorn
 
     setup_logging()
     _claim_pid_file()
+    # 재시작은 모든 토큰과 PTY 세션이 끊기는 경계다. 감사 기록을 읽을 때
+    # 이 줄이 없으면 "그 시각 이후 기록이 왜 비었는지"를 알 수 없다.
+    _audit(
+        "server-start", pid=os.getpid(),
+        listen=config.uds or f"{config.host}:{config.port}",
+        tls=config.tls_enabled and not config.uds,
+        auth=config.password_hash is not None,
+    )
     # uvicorn이 serve() 진입 시 이 핸들러를 저장했다가 종료 직전에 복원하고
     # SIGTERM을 되던진다. 반드시 uvicorn.run() 전에 걸어야 한다.
     signal.signal(signal.SIGTERM, _exit_success)

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# W-Term TLS 인증서 점검.
+# W-Term TLS 인증서 및 비밀 파일 권한 점검.
 #
 # 이 구조의 위험은 "조용한 실패"다. 갱신이 멈춰도 만료일까지 아무 증상이 없고,
 # 갱신은 됐는데 SIGHUP이 안 갔으면 파일과 실제 서빙 인증서가 어긋난 채로 돈다.
-# 둘 다 눈으로는 안 보이므로 이 스크립트로 확인한다.
+# 파일 권한도 마찬가지로 틀려 있어도 아무 증상이 없다 — 넓게 열린 채 몇 달을
+# 돈다. 셋 다 눈으로는 안 보이므로 이 스크립트로 확인한다.
 #
 #   ./scripts/cert-status.sh
 #
@@ -36,17 +37,51 @@ from pathlib import Path
 raw = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 for key in ("tls_certfile", "tls_keyfile", "host", "port"):
     print(f"CFG_{key.upper()}={shlex.quote(str(raw.get(key) or ''))}")
+print(f"CFG_HAS_PASSWORD_HASH={'1' if raw.get('password_hash') else ''}")
 EOF
 )" || { echo "projects.json을 읽을 수 없습니다." >&2; exit 1; }
 eval "$CFG_VARS"
 
-echo "=== W-Term 인증서 상태 ==="
+# 권한은 macOS(BSD)와 리눅스(GNU)의 stat 문법이 달라 둘 다 시도한다.
+file_mode() {
+    stat -f "%OLp" "$1" 2>/dev/null || stat -c "%a" "$1" 2>/dev/null
+}
+
+# group/other 비트가 하나라도 서 있으면 지적한다. 정확히 600일 필요는 없고
+# (700인 디렉터리 등) 본인 외에 읽히지 않는 것이 요건이다.
+check_private() {
+    local label="$1" path="$2" why="$3" mode
+    [ -e "$path" ] || { bad "$label" "파일이 없습니다: $path"; return; }
+    mode="$(file_mode "$path")"
+    if [ -z "$mode" ]; then
+        bad "$label" "권한을 읽지 못했습니다: $path"
+    elif [ "${mode: -2}" = "00" ]; then
+        say "$label" "$mode"
+    else
+        bad "$label" "$mode — $why"
+        echo "                       해결: chmod 600 '$path'"
+    fi
+}
+
+echo "=== W-Term 상태 점검 ==="
 echo
 
-if [ -z "${CFG_TLS_CERTFILE:-}" ] || [ -z "${CFG_TLS_KEYFILE:-}" ]; then
-    echo "TLS가 설정되어 있지 않습니다 (projects.json의 tls_certfile/tls_keyfile 없음)."
-    exit 0
+# ── 비밀 파일 권한 ───────────────────────────────────────────────────
+# TLS 설정 여부와 무관하게 먼저 본다. password_hash는 오프라인 크래킹 대상이라
+# 해시라는 이유로 공개돼도 되는 값이 아니다.
+if [ -n "${CFG_HAS_PASSWORD_HASH:-}" ]; then
+    check_private "projects.json" "$REPO_DIR/projects.json" \
+        "패스워드 해시가 들어 있어 다른 사용자에게 읽히면 안 됩니다"
 fi
+
+if [ -z "${CFG_TLS_CERTFILE:-}" ] || [ -z "${CFG_TLS_KEYFILE:-}" ]; then
+    echo
+    echo "TLS가 설정되어 있지 않습니다 (projects.json의 tls_certfile/tls_keyfile 없음)."
+    [ "$PROBLEMS" -eq 0 ] && exit 0
+    echo "확인이 필요한 항목 ${PROBLEMS}건."
+    exit 1
+fi
+echo
 
 say "인증서 파일" "$CFG_TLS_CERTFILE"
 
@@ -79,12 +114,8 @@ else
 fi
 
 # ── 키 권한 ──────────────────────────────────────────────────────────
-KEY_MODE="$(stat -f "%OLp" "$CFG_TLS_KEYFILE" 2>/dev/null || stat -c "%a" "$CFG_TLS_KEYFILE" 2>/dev/null)"
-if [ "$KEY_MODE" = "600" ]; then
-    say "개인키 권한" "600"
-else
-    bad "개인키 권한" "$KEY_MODE (600 권장: chmod 600 '$CFG_TLS_KEYFILE')"
-fi
+check_private "개인키 권한" "$CFG_TLS_KEYFILE" \
+    "개인키가 다른 사용자에게 읽히면 TLS가 무의미해집니다"
 
 # ── 파일 vs 실제 서빙 중인 인증서 ────────────────────────────────────
 # 여기가 어긋나면 갱신은 됐는데 SIGHUP이 전달되지 않았다는 뜻이다.

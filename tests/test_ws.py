@@ -51,7 +51,16 @@ def end_shell(ws, timeout: float = RECV_TIMEOUT) -> None:
 
     정리 시간도 같이 줄어든다 — 대화형 bash는 SIGTERM을 무시하므로, 세션을
     살려둔 채 서버를 내리면 종료 경로가 SIGKILL까지 SIGTERM_WAIT(10초)를 꽉 채운다.
+
+    `true`를 먼저 보내는 이유: 인자 없는 `exit`는 `$?`를 그대로 반환하는데, 그
+    시점의 `$?`는 셸 시작 파일이 남긴 값이다. macOS `/etc/bashrc`의 마지막 줄이
+    `[ -r "/etc/bashrc_$TERM_PROGRAM" ] && . ...` 이고, 데몬처럼 TERM_PROGRAM이
+    없는 환경에서는 이 줄이 거짓이라 rc 파일이 1을 남긴 채 끝난다 (로그인 셸만
+    /etc/profile → /etc/bashrc를 타므로 평소 터미널에서는 드러나지 않는다).
+    검사하려는 것은 서버가 자식의 종료 코드를 그대로 전달하는가이지 남의 rc
+    파일 내용이 아니므로, 시작 상태를 0으로 맞춰 놓고 종료시킨다.
     """
+    send_line(ws, "true")
     send_line(ws, "exit")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
