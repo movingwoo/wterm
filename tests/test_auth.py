@@ -11,7 +11,7 @@ import httpx
 import pytest
 from websockets.exceptions import ConnectionClosed
 
-from conftest import PASSWORD
+from conftest import PASSWORD, free_port, wait_for_uds
 from test_ws import RECV_TIMEOUT, end_shell, recv_until, send_line, status_message, ws_connect
 
 
@@ -136,6 +136,47 @@ def test_allowed_origins_overrides_host_rule(start_server):
         assert c.post(
             "/api/login", json={"password": PASSWORD}, headers={"Origin": h.origin}
         ).status_code == 403
+
+
+def test_uds_cookie_stays_secure_unless_proxy_says_plaintext(
+    start_server, short_tmp_dir
+):
+    """uds 뒤에서는 uvicorn이 scheme을 보정해 주지 못한다.
+
+    유닉스 소켓에는 클라이언트 주소가 없어(scope["client"]가 None)
+    forwarded_allow_ips 판정이 **항상** 실패하고, X-Forwarded-Proto가 무시된 채
+    scheme이 "http"로 남는다. 그것만 믿으면 HTTPS로 서비스하는 구성에서 토큰
+    쿠키가 Secure 없이 나간다 — uds는 앞단이 TLS를 맡는 구성이라는 것이 이
+    서버의 전제이므로 그쪽을 기본값으로 두고, 평문 프록시는 헤더로 뒤집는다.
+    """
+    sock = short_tmp_dir / "w.sock"
+    h = start_server(wait=False, uds=str(sock), port=free_port())
+    wait_for_uds(h, sock)
+
+    with httpx.Client(transport=httpx.HTTPTransport(uds=str(sock)), timeout=10.0) as c:
+        r = c.post(
+            "http://wterm.local/api/login",
+            json={"password": PASSWORD},
+            headers={"Origin": "https://wterm.local"},
+        )
+        assert r.status_code == 200, r.text
+        assert "secure" in r.headers["set-cookie"].lower()
+
+        # 같은 이유로 평문 오리진도 이 구성에서는 통과하면 안 된다.
+        assert c.post(
+            "http://wterm.local/api/login",
+            json={"password": PASSWORD},
+            headers={"Origin": "http://wterm.local"},
+        ).status_code == 403
+
+        # 앞단이 평문이라고 밝히면 Secure를 빼야 브라우저가 쿠키를 받는다.
+        plain = c.post(
+            "http://wterm.local/api/login",
+            json={"password": PASSWORD},
+            headers={"Origin": "http://wterm.local", "X-Forwarded-Proto": "http"},
+        )
+        assert plain.status_code == 200, plain.text
+        assert "secure" not in plain.headers["set-cookie"].lower()
 
 
 def test_bad_body_is_rejected(start_server):

@@ -233,6 +233,23 @@ def _spawn(
     )
 
 
+def wait_for_uds(h: ServerHandle, sock: Path, timeout: float = STARTUP_TIMEOUT) -> None:
+    """유닉스 소켓으로 뜬 서버가 준비될 때까지 기다린다.
+
+    `_wait_ready`는 host/port로 HTTP를 찔러 보므로 uds 구성에서는 쓸 수 없다
+    (`start_server(wait=False, uds=...)`와 짝을 이룬다).
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rc = h.proc.poll()
+        if rc is not None:
+            raise AssertionError(f"서버가 기동 중 종료됨 (exit {rc})\n{h.output()}")
+        if sock.exists() and h.pid_file.exists():
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"{timeout}초 안에 유닉스 소켓이 생기지 않았다:\n{h.output()}")
+
+
 def _wait_ready(h: ServerHandle) -> None:
     """pid 파일과 HTTP 응답이 모두 확인될 때까지 기다린다."""
     deadline = time.monotonic() + STARTUP_TIMEOUT

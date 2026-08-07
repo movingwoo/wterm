@@ -74,6 +74,31 @@ def test_csp_keeps_scripts_strict_but_lets_xterm_inject_style(start_server):
     assert "'unsafe-inline'" in directives["style-src"]
 
 
+# ── 비밀 파일 권한 ──────────────────────────────────────────────────
+
+
+def test_warns_when_config_is_readable_by_others(start_server, repo_copy):
+    """projects.json에는 argon2 해시가 들어 있고 그건 오프라인 크래킹 대상이다.
+
+    logs/는 기동할 때마다 700으로 조이면서 정작 설정 파일은 보지 않았다 —
+    점검이 scripts/cert-status.sh에만 있는데 그건 TLS를 안 쓰면 실행할 이유가
+    없는 스크립트다. 경고만 하고 chmod하지는 않는다: 배포 설정의 권한을 서버가
+    말없이 바꾸는 것은 다른 종류의 사고를 만든다.
+    """
+    cfg = repo_copy / "projects.json"
+    # start_server는 내용만 덮어쓰므로(권한은 그대로) 기동 전에 여기서 정해둔다.
+    cfg.touch()
+
+    cfg.chmod(0o600)
+    quiet = start_server()
+    assert "chmod 600" not in quiet.output()
+    assert quiet.stop() == 0  # pid 잠금 때문에 서버는 한 번에 하나만 뜬다
+
+    cfg.chmod(0o644)
+    loud = start_server()
+    assert "chmod 600" in loud.output()
+
+
 # ── 감사 로그 ───────────────────────────────────────────────────────
 
 
@@ -222,6 +247,38 @@ def test_input_flood_is_capped_and_reported(start_server):
             break
         else:
             raise AssertionError("입력이 넘쳤는데 알림이 오지 않았다")
+
+
+# ── 프로젝트 목록 스캔 ──────────────────────────────────────────────
+
+
+def test_codex_history_scan_ignores_junk_and_caches(start_server, tmp_path, project_dir):
+    """Codex 기록 조회는 ~/.codex/sessions 전체를 훑는다 — 프론트가 10초마다
+    폴링하는 경로라 그대로 두면 파일이 쌓일수록 느려지고, 그동안 살아있는 모든
+    PTY 세션의 입출력이 멎는다. 스캔은 스레드에서 돌고 결과는 짧게 캐시된다.
+
+    HOME을 갈아끼워 가짜 세션 디렉터리를 물린다 (경로는 import 시점에 정해진다).
+    """
+    home = tmp_path / "home"
+    sessions = home / ".codex" / "sessions" / "2026" / "08" / "07"
+    sessions.mkdir(parents=True)
+    cwd = str(project_dir.resolve())
+    meta = {"type": "session_meta", "payload": {"cwd": cwd}}
+    (sessions / "rollout-ok.jsonl").write_text(json.dumps(meta) + "\n", encoding="utf-8")
+    # 옆에 있는 깨진 파일 하나가 목록 조회 전체를 죽여서는 안 된다.
+    (sessions / "rollout-broken.jsonl").write_text("{잘린 JSON\n", encoding="utf-8")
+    (sessions / "rollout-scalar.jsonl").write_text("5\n", encoding="utf-8")  # JSON이지만 객체가 아님
+
+    h = start_server(env={"HOME": str(home)})
+    c = h.client(headers={"Origin": h.origin, "Cookie": f"wterm_token={h.login()}"})
+    (demo,) = c.get("/api/projects").json()
+    assert demo["codex_has_history"] is True
+
+    # 캐시가 있다는 것을 결정적으로 확인한다: 기록을 지워도 TTL 안에서는 그대로다.
+    # 최신성을 조금 내주고 폴링마다 도는 전체 스캔을 없앤 것이 이 설계의 거래다.
+    (sessions / "rollout-ok.jsonl").unlink()
+    (demo,) = c.get("/api/projects").json()
+    assert demo["codex_has_history"] is True
 
 
 def test_audit_does_not_leak_into_error_log(start_server):
