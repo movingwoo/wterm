@@ -27,7 +27,12 @@
   <div id="login-overlay">
     <form id="login-form">
       <h2>W-Term</h2>
-      <input type="password" id="login-password" placeholder="패스워드"
+      <!-- 인증에 쓰이지 않는다. 서버는 패스워드 하나만 보고 계정 개념 자체가 없다.
+           비밀번호 관리자가 자격증명을 "아이디+패스워드" 쌍으로만 저장해서, 이 칸이
+           없으면 저장할 때마다 아이디를 물어본다. 그 프롬프트를 없애는 라벨일 뿐이다. -->
+      <input type="text" name="username" id="login-username" value="wterm"
+             autocomplete="username" readonly hidden>
+      <input type="password" name="password" id="login-password" placeholder="패스워드"
              autocomplete="current-password" required>
       <div id="login-error"></div>
       <button type="submit">로그인</button>
