@@ -6,7 +6,9 @@
 """
 from __future__ import annotations
 
+import json
 import time
+from urllib.parse import quote
 
 from test_ws import (
     RECV_TIMEOUT, end_shell, recv_until, send_line, status_message, ws_connect,
@@ -138,6 +140,88 @@ def test_audit_records_rejected_websocket(start_server):
         except Exception:
             pass  # 핸드셰이크 거절(4403)이든 accept 뒤 close든 둘 다 정상
         assert f"ws-reject reason={reason}" in audit_log(h), reason
+
+
+def test_audit_rejects_forged_lines_from_query(start_server):
+    """감사 기록에 줄을 심을 수 있으면 이 파일의 존재 이유가 무너진다.
+
+    URL의 %0A는 디코딩되어 진짜 개행이 되고, 쿼리 파라미터는 그대로 감사 값으로
+    실린다. 침해당한 세션이 자기 흔적 사이에 그럴듯한 줄을 끼워 넣을 수 있다는 뜻이라
+    "뚫린 뒤에 무엇이 실행됐나"를 읽을 수 없게 된다.
+    """
+    h = start_server()
+    token = h.login()
+    before = len(audit_log(h).splitlines())
+
+    forged = "bogus\n2026-01-01 00:00:00,000 INFO wterm.audit: login-ok client=1.2.3.4"
+    try:
+        with ws_connect(h, f"/ws/demo?agent={quote(forged)}", token=token) as ws:
+            ws.recv(timeout=RECV_TIMEOUT)  # 서버가 닫을 때까지
+    except Exception:
+        pass
+
+    # 요청 하나가 만들 수 있는 것은 기록 한 줄이다. 값 안에 무엇이 들었든
+    # 그것이 별도의 줄(=별도의 기록)이 되어서는 안 된다.
+    added = audit_log(h).splitlines()[before:]
+    assert len(added) == 1, added
+    record = added[0].split("wterm.audit: ", 1)[1]
+    assert record.startswith("ws-reject reason=bad-agent"), record
+    assert "\n" not in record
+
+
+def test_unknown_mode_is_rejected(start_server):
+    """mode는 네 개뿐이다. 검증 없이 감사 기록에 실리는 필드를 남겨두지 않는다."""
+    h = start_server()
+    token = h.login()
+    with ws_connect(h, "/ws/demo?agent=shell&mode=bogus", token=token) as ws:
+        try:
+            ws.recv(timeout=RECV_TIMEOUT)
+        except Exception:
+            pass
+    assert "ws-reject reason=bad-mode" in audit_log(h)
+
+
+# ── 입력 배압 ───────────────────────────────────────────────────────
+
+
+def test_input_flood_is_capped_and_reported(start_server):
+    """자식이 stdin을 읽지 않는 동안 들어오는 입력에 상한이 있어야 한다.
+
+    `sleep`이 도는 동안 bash는 stdin을 읽지 않으므로 PTY 쓰기가 EAGAIN으로 막히고,
+    그 뒤 입력은 서버의 쓰기 버퍼에 쌓이기만 한다. 출력 쪽은 BUFFER_LIMIT으로 이미
+    잘리는데 입력 쪽만 열려 있으면 세션 하나가 서버 프로세스 전체를 OOM으로 끌고 갈
+    수 있다. 버리는 쪽은 반드시 **새 입력**이어야 한다 — 앞을 버리면 이미 받아둔
+    UTF-8 멀티바이트가 잘려 한글 입력이 깨진다.
+
+    `sleep ...; exit`을 한 줄로 먼저 넣는 것은 정리를 위한 것이다. bash는 이 줄
+    뒤로 stdin을 다시 읽지 않으므로, 쌓인 입력이 명령으로 실행되는 일 없이 세션이
+    스스로 끝난다.
+    """
+    h = start_server()
+    token = h.login()
+    with ws_connect(h, "/ws/demo?agent=shell", token=token) as ws:
+        status_message(ws)
+        # -icanon: 정규 모드에서는 개행 없이 길어진 줄을 라인 디시플린이 그냥
+        # 버려서 마스터 쓰기가 끝까지 성공한다 — 배압 자체가 생기지 않는다.
+        # 비정규 모드로 두어야 입력 큐가 차고 쓰기가 EAGAIN으로 막힌다.
+        send_line(ws, "stty -icanon -echo; sleep 20; exit")
+        time.sleep(0.5)  # sleep이 실제로 stdin을 놓을 때까지
+
+        chunk = json.dumps({"type": "input", "data": "A" * 65536})
+        for _ in range(48):  # 3 MB — WRITE_BUFFER_LIMIT(1 MB)을 넉넉히 넘긴다
+            ws.send(chunk)
+
+        deadline = time.monotonic() + RECV_TIMEOUT
+        while time.monotonic() < deadline:
+            msg = ws.recv(timeout=max(0.1, deadline - time.monotonic()))
+            if isinstance(msg, bytes):
+                continue  # 터미널이 받아준 만큼의 에코
+            payload = json.loads(msg)
+            assert payload["type"] == "status"
+            assert "버렸" in payload["message"]  # 조용히 버리면 타이핑이 사라진 것처럼 보인다
+            break
+        else:
+            raise AssertionError("입력이 넘쳤는데 알림이 오지 않았다")
 
 
 def test_audit_does_not_leak_into_error_log(start_server):
