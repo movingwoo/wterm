@@ -12,6 +12,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import secrets
 import signal
 import ssl
@@ -139,6 +140,14 @@ def origin_allowed(headers) -> bool:
 # 파일 자체가 패스워드와 API 키가 흐르는 통로가 된다.
 AUDIT_BACKUP_DAYS = 90
 
+# 값에는 쿼리 파라미터(mode, agent)와 요청 헤더(origin, host)가 그대로 실린다.
+# URL의 %0A는 디코딩되어 진짜 개행이 되므로, 거르지 않으면 요청 하나로 감사
+# 로그에 위조된 줄을 심을 수 있다 — 이 파일의 용도가 "뚫린 뒤에 무엇이
+# 실행됐나"를 읽는 것이라, 침해당한 쪽이 자기 흔적을 흐릴 수 있다는 뜻이 된다.
+# 호출부마다 검증하는 대신 여기 한 곳에서 막아 앞으로 추가되는 필드까지 덮는다.
+AUDIT_VALUE_MAX = 128  # 한 줄을 길이로 밀어내는 것도 흔적 흐리기다
+_AUDIT_UNSAFE = re.compile(r"[\x00-\x1f\x7f]")
+
 _audit_log = logging.getLogger("wterm.audit")
 _audit_log.setLevel(logging.INFO)
 _audit_log.propagate = False
@@ -150,9 +159,17 @@ def _peer(conn) -> str:
     return conn.client.host if conn.client else "-"
 
 
+def _audit_value(value) -> str:
+    """감사 기록에 실을 수 있는 형태로 값을 정규화한다 (개행·제어문자 제거)."""
+    text = _AUDIT_UNSAFE.sub("?", str(value))
+    return text if len(text) <= AUDIT_VALUE_MAX else text[:AUDIT_VALUE_MAX] + "…"
+
+
 def _audit(event: str, **fields) -> None:
     """감사 기록 한 줄. `event key=value ...` 형태라 grep으로 추려낼 수 있다."""
-    detail = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+    detail = " ".join(
+        f"{k}={_audit_value(v)}" for k, v in fields.items() if v is not None
+    )
     _audit_log.info("%s%s", event, f" {detail}" if detail else "")
 
 
@@ -201,6 +218,46 @@ def is_authed(cookies: dict[str, str]) -> bool:
     return True
 
 
+# ── 열려 있는 WebSocket의 인증 ──────────────────────────────────────
+#
+# 인증 검사는 핸드셰이크 때 한 번뿐이라, 그것만으로는 **이미 붙어 있는 소켓**을
+# 아무것도 끊지 못한다. 로그아웃이 토큰만 지우고 끝나면 폰을 잃어버렸을 때
+# "다른 기기에서 로그아웃"이 통하지 않고, 30일 만료도 열린 세션은 비껴간다 —
+# 그러면 /api/logout이 폐기 수단이라는 설명과 실제 동작이 어긋난다.
+#
+# 그래서 소켓마다 붙은 토큰을 들고 있다가 로그아웃 시 즉시 닫고(아래 revoke),
+# 만료처럼 알림이 없는 경우는 주기적으로 다시 확인한다(watchdog). close code는
+# 새로 만들지 않고 4401을 재사용한다 — static/app.js가 이미 로그인 오버레이를 띄운다.
+AUTH_RECHECK_INTERVAL = 30.0
+
+_ws_tokens: dict[WebSocket, str] = {}  # 열린 소켓 -> 그 소켓을 연 토큰
+
+
+async def _close_unauthed(ws: WebSocket, reason: str) -> None:
+    try:
+        await ws.close(code=4401, reason=reason)
+    except Exception:
+        pass  # 이미 끊긴 소켓. 루프 쪽 finally가 정리한다
+
+
+async def _revoke_token_sockets(token: str) -> int:
+    """그 토큰으로 열린 소켓을 전부 닫는다. 닫은 개수를 반환."""
+    victims = [ws for ws, t in _ws_tokens.items() if t == token]
+    for ws in victims:
+        await _close_unauthed(ws, "세션이 폐기되었습니다")
+    return len(victims)
+
+
+async def _auth_watchdog(ws: WebSocket, token: str) -> None:
+    """토큰이 만료(또는 MAX_TOKENS에 밀려 소멸)되면 소켓을 닫는다."""
+    cookies = {AUTH_COOKIE: token}
+    while True:
+        await asyncio.sleep(AUTH_RECHECK_INTERVAL)
+        if not is_authed(cookies):
+            await _close_unauthed(ws, "인증이 만료되었습니다")
+            return
+
+
 def _is_secure(request: Request) -> bool:
     """https로 들어온 요청인지. 앞단 프록시가 TLS를 끝내는 구성에서는 uvicorn이
     X-Forwarded-Proto로 scheme을 바로잡아 준다. 서버가 직접 TLS를 종단하는 경우
@@ -235,6 +292,11 @@ LOGIN_BACKOFF_MAX = 900.0  # 차단 상한 15분
 LOGIN_FAIL_DECAY = 900.0  # 마지막 차단이 풀린 뒤 이만큼 조용하면 실패 횟수 리셋
 LOGIN_BUCKET_LIMIT = 1024  # 추적할 버킷 상한 (IP를 바꿔가며 채우는 것 방지)
 LOGIN_MAX_CONCURRENT = 2  # 동시 argon2 검증 수
+# 본문 상한. request.json()은 본문을 통째로 메모리에 올리는데 이 경로는 인증
+# 이전이고, 시도 제한은 LOGIN_FREE_ATTEMPTS회를 지나야 걸린다 — 그 사이에 몇 백
+# MB짜리 본문을 그대로 받으면 argon2 비용을 아끼려고 만든 방어가 그 앞단의
+# 메모리로 우회된다. 받는 것이 패스워드 하나뿐이라 아주 낮게 잡아도 잃는 것이 없다.
+LOGIN_BODY_LIMIT = 4096
 
 _login_fails: OrderedDict[str, tuple[int, float]] = OrderedDict()  # 키 -> (실패수, 해제시각)
 _login_slots = asyncio.Semaphore(LOGIN_MAX_CONCURRENT)
@@ -280,6 +342,14 @@ async def login(request: Request):
         return JSONResponse({"ok": False}, status_code=403)
     if config.password_hash is None:
         return JSONResponse({"ok": True})
+    # 본문을 읽기 전에 크기부터 본다. Content-Length가 없는 요청(chunked)도
+    # 거부한다 — 그러지 않으면 길이를 안 밝히는 것만으로 이 검사를 건너뛴다.
+    # 브라우저 fetch는 문자열 본문에 항상 Content-Length를 붙이므로 잃는 것이 없다.
+    declared = request.headers.get("content-length")
+    if declared is None or not declared.isdigit():
+        return JSONResponse({"ok": False}, status_code=411)
+    if int(declared) > LOGIN_BODY_LIMIT:
+        return JSONResponse({"ok": False}, status_code=413)
     wait = _login_block_remaining(key, time.monotonic())
     if wait > 0:
         # 차단 중에는 argon2를 아예 돌리지 않는다. 비용을 안 태우는 것이 요점이다.
@@ -321,9 +391,12 @@ async def logout(request: Request):
     if not origin_allowed(request.headers):
         return JSONResponse({"ok": False}, status_code=403)
     token = request.cookies.get(AUTH_COOKIE)
+    closed = 0
     if token:
         _valid_tokens.pop(token, None)
-    _audit("logout", client=_peer(request))
+        # 토큰만 지우면 이미 열린 소켓은 그대로 살아서 명령을 계속 실행한다.
+        closed = await _revoke_token_sockets(token)
+    _audit("logout", client=_peer(request), sockets=closed)
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(
         AUTH_COOKIE, httponly=True, samesite="strict", secure=_is_secure(request)
@@ -358,6 +431,21 @@ async def list_projects(request: Request):
             }
         )
     return result
+
+
+WS_MODES = ("attach", "new", "resume", "continue")
+
+
+async def _notify_input_dropped(ws: WebSocket) -> None:
+    try:
+        await ws.send_text(
+            json.dumps({
+                "type": "status",
+                "message": "입력이 밀려 일부를 버렸습니다 (세션이 입력을 읽지 않는 중).",
+            })
+        )
+    except Exception:
+        pass  # 이 알림 때문에 세션이 끊길 이유는 없다
 
 
 @app.websocket("/ws/{project_name}")
@@ -421,6 +509,13 @@ async def terminal_ws(
         await ws.close(code=4400, reason="지원하지 않는 에이전트")
         return
 
+    # mode도 값을 확인한다. 아래에서 알 수 없는 값은 attach로 떨어지므로 동작에는
+    # 문제가 없지만, 검증 없이 감사 기록에 실리는 필드를 남겨두지 않는다.
+    if mode not in WS_MODES:
+        _audit("ws-reject", reason="bad-mode", client=client, mode=mode)
+        await ws.close(code=4400, reason="지원하지 않는 모드")
+        return
+
     session_key = f"{project_name}#{agent}"
     session = manager.get_live(session_key)
     if session is not None and mode != "new":
@@ -475,20 +570,40 @@ async def terminal_ws(
     )
     opened_at = time.monotonic()
 
+    # 이 소켓을 연 토큰을 기록해 두면 로그아웃이 여기까지 닿는다. 인증이 꺼진
+    # 구성(password_hash 없음)에는 폐기할 토큰 자체가 없으므로 건너뛴다.
+    token = ws.cookies.get(AUTH_COOKIE) if config.password_hash is not None else None
+    watchdog: asyncio.Task | None = None
+    if token:
+        _ws_tokens[ws] = token
+        watchdog = asyncio.ensure_future(_auth_watchdog(ws, token))
+
     try:
         while True:
-            raw = await ws.receive_text()
+            try:
+                raw = await ws.receive_text()
+            except RuntimeError:
+                # 폐기(로그아웃/만료)로 다른 태스크가 이 소켓을 이미 닫아둔 경우.
+                # Starlette은 닫힌 소켓에서의 receive를 RuntimeError로 알린다.
+                # 정상 종료 경로이므로 트레이스백을 남기지 않는다.
+                break
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 continue
             if msg.get("type") == "input":
-                session.write_input(msg.get("data", ""))
+                if session.write_input(msg.get("data", "")):
+                    # 자식이 stdin을 읽지 않아 입력이 버려졌다. 조용히 버리면
+                    # 타이핑이 사라진 것처럼 보인다.
+                    await _notify_input_dropped(ws)
             elif msg.get("type") == "resize":
                 session.resize(int(msg["cols"]), int(msg["rows"]))
     except WebSocketDisconnect:
         pass
     finally:
+        if watchdog is not None:
+            watchdog.cancel()
+        _ws_tokens.pop(ws, None)
         session.detach(ws)
         _audit(
             "ws-close", client=client, project=project_name, agent=agent,

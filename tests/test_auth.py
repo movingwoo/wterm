@@ -8,8 +8,11 @@ from __future__ import annotations
 import time
 
 import httpx
+import pytest
+from websockets.exceptions import ConnectionClosed
 
 from conftest import PASSWORD
+from test_ws import RECV_TIMEOUT, end_shell, recv_until, send_line, status_message, ws_connect
 
 
 def test_index_is_served(start_server):
@@ -63,6 +66,45 @@ def test_logout_revokes_token_server_side(start_server):
     assert stale.get("/api/projects").status_code == 401
 
 
+def test_logout_closes_live_websocket(start_server):
+    """토큰만 지우는 것으로는 폐기가 되지 않는다.
+
+    인증 검사는 핸드셰이크 때 한 번뿐이라, 이미 붙어 있는 소켓은 로그아웃 뒤에도
+    그대로 살아서 명령을 계속 실행한다 — 폰을 잃어버렸을 때 "다른 기기에서
+    로그아웃"이 아무것도 못 끊는다는 뜻이다. 4401로 닫아야 app.js가 로그인
+    화면을 띄운다.
+    """
+    h = start_server()
+    c = h.client()
+    c.post("/api/login", json={"password": PASSWORD})
+    token = c.cookies["wterm_token"]
+
+    with ws_connect(h, "/ws/demo?agent=shell", token=token) as ws:
+        status_message(ws)
+        send_line(ws, "echo BEFORE-LOGOUT")
+        recv_until(ws, "BEFORE-LOGOUT")
+
+        assert c.post("/api/logout").status_code == 200
+
+        with pytest.raises(ConnectionClosed) as exc:
+            while True:
+                ws.recv(timeout=RECV_TIMEOUT)
+        assert exc.value.rcvd.code == 4401
+
+    # 폐기된 토큰으로는 다시 붙지도 못한다 (여기가 실제로 막고 싶은 것).
+    with ws_connect(h, "/ws/demo?agent=shell", token=token) as ws:
+        with pytest.raises(ConnectionClosed) as exc:
+            ws.recv(timeout=RECV_TIMEOUT)
+    assert exc.value.rcvd.code == 4401
+
+    # 세션 자체는 유예 시간 동안 살아 있다. 다시 로그인하면 그대로 이어붙는다
+    # (로그아웃은 접근 폐기이지 실행 중인 프로세스를 죽이는 수단이 아니다).
+    with ws_connect(h, "/ws/demo?agent=shell", token=h.login()) as ws:
+        assert "재접속" in status_message(ws)
+        recv_until(ws, "BEFORE-LOGOUT")  # 같은 프로세스의 replay 버퍼
+        end_shell(ws)
+
+
 def test_post_requires_matching_origin(start_server):
     """WS/POST는 CORS가 막아주지 않으므로 서버가 직접 Origin을 본다."""
     h = start_server()
@@ -101,6 +143,28 @@ def test_bad_body_is_rejected(start_server):
     c = h.client()
     assert c.post("/api/login", content=b"not json").status_code == 400
     assert c.post("/api/login", json={}).status_code == 400
+
+
+def test_login_body_size_is_capped(start_server):
+    """본문 상한이 없으면 argon2 비용 방어가 그 앞단의 메모리로 우회된다.
+
+    /api/login은 인증 이전 경로이고 시도 제한은 LOGIN_FREE_ATTEMPTS회를 지나야
+    걸리므로, 그 사이에 request.json()이 몇 백 MB짜리 본문을 통째로 메모리에
+    올릴 수 있다. 받는 것이 패스워드 하나뿐이라 상한을 낮게 잡아도 잃는 것이 없다.
+    """
+    h = start_server()
+    c = h.client()
+
+    assert c.post("/api/login", json={"password": "x" * 20000}).status_code == 413
+
+    # 길이를 안 밝히는 것만으로 검사를 건너뛸 수 있으면 상한이 무의미하다.
+    def chunked():
+        yield b'{"password": "whatever"}'
+
+    assert c.post("/api/login", content=chunked()).status_code == 411
+
+    # 상한에 걸린 요청은 argon2를 태우지 않으므로 시도 횟수에도 잡히지 않는다.
+    assert c.post("/api/login", json={"password": PASSWORD}).status_code == 200
 
 
 def test_login_rate_limit(start_server):

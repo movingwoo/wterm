@@ -85,6 +85,10 @@
       loginErrorEl.textContent = "패스워드가 올바르지 않습니다.";
     } else if (res.status === 403) {
       loginErrorEl.textContent = "허용되지 않은 주소로 접속했습니다.";
+    } else if (res.status === 413) {
+      // 서버가 본문 크기로 먼저 끊은 것. 일반 실패 문구로 두면 패스워드가 틀린
+      // 줄 알고 같은 것을 계속 붙여넣게 된다.
+      loginErrorEl.textContent = "입력이 너무 깁니다.";
     } else {
       loginErrorEl.textContent = "로그인에 실패했습니다.";
     }

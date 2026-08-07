@@ -24,6 +24,11 @@ from pathlib import Path
 from fastapi import WebSocket
 
 BUFFER_LIMIT = 256 * 1024  # 재연결 replay 버퍼 상한
+# PTY 쓰기 대기 버퍼 상한. 자식이 stdin을 읽지 않는 동안(출력 처리에 바쁘거나
+# 페이저처럼 입력을 기다리지 않는 상태) 들어오는 입력이 여기 쌓인다. 출력 쪽은
+# BUFFER_LIMIT으로 이미 잘리는데 입력 쪽만 열려 있으면 세션 하나가 서버 프로세스
+# 전체를 OOM으로 끌고 갈 수 있다.
+WRITE_BUFFER_LIMIT = 1024 * 1024
 READ_CHUNK = 65536
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 SIGTERM_WAIT = 10  # SIGTERM 후 SIGKILL까지 대기 초
@@ -130,6 +135,7 @@ class Session:
         self._loop = asyncio.get_running_loop()
         self._write_buffer = bytearray()
         self._writer_registered = False
+        self._input_dropped = False
 
     # ── 프로세스 수명 주기 ────────────────────────────────────────────
 
@@ -230,6 +236,7 @@ class Session:
                     pass
                 self._writer_registered = False
             self._write_buffer.clear()
+            self._input_dropped = False
             try:
                 os.close(self.master_fd)
             except OSError:
@@ -316,8 +323,8 @@ class Session:
 
     # ── 입력/리사이즈 ────────────────────────────────────────────────
 
-    def write_input(self, data: str) -> None:
-        """PTY master fd에 입력을 쓴다.
+    def write_input(self, data: str) -> bool:
+        """PTY master fd에 입력을 쓴다. 넘쳐서 버렸으면 True를 반환한다.
 
         master_fd는 non-blocking이라 os.write()가 부분 쓰기(반환값 < len)로
         끝나거나 EAGAIN(BlockingIOError)을 던질 수 있다 (claude가 stdin을
@@ -325,10 +332,24 @@ class Session:
         삼키기만 하면 한글처럼 문자당 여러 바이트(UTF-8 3바이트)인 입력이
         중간에 잘려 깨진다 — 못 쓴 나머지는 버퍼에 남겨두고 add_writer로
         fd가 다시 쓰기 가능해질 때 이어서 쓴다.
+
+        그 버퍼가 WRITE_BUFFER_LIMIT을 넘으면 **새로 들어온 입력을** 통째로
+        버린다. 앞을 버리면 이미 받아둔 UTF-8 멀티바이트가 잘려 한글 입력이
+        깨지고, 그건 이 버퍼가 존재하는 이유 자체를 무너뜨린다. 한 메시지는
+        통째로 받거나 통째로 버려서 경계에서도 문자가 갈라지지 않게 한다.
+
+        반환값은 "넘침이 시작된 순간"에만 True다 — 호출자가 상태 메시지를
+        한 번만 보내도록. 버퍼가 다 빠지면 다시 알릴 수 있는 상태로 돌아간다.
         """
-        if self.alive and self.master_fd >= 0:
-            self._write_buffer.extend(data.encode())
-            self._flush_write()
+        if not (self.alive and self.master_fd >= 0):
+            return False
+        if len(self._write_buffer) >= WRITE_BUFFER_LIMIT:
+            first = not self._input_dropped
+            self._input_dropped = True
+            return first
+        self._write_buffer.extend(data.encode())
+        self._flush_write()
+        return False
 
     def _flush_write(self) -> None:
         if self.master_fd < 0:
@@ -346,9 +367,11 @@ class Session:
             if not self._writer_registered:
                 self._loop.add_writer(self.master_fd, self._flush_write)
                 self._writer_registered = True
-        elif self._writer_registered:
-            self._loop.remove_writer(self.master_fd)
-            self._writer_registered = False
+        else:
+            self._input_dropped = False  # 다 빠졌으니 다음 넘침은 다시 알린다
+            if self._writer_registered:
+                self._loop.remove_writer(self.master_fd)
+                self._writer_registered = False
 
     def resize(self, cols: int, rows: int) -> None:
         if self.alive and self.master_fd >= 0:
