@@ -397,6 +397,17 @@ async def terminal_ws(
         await ws.close(code=4403, reason="허용되지 않은 오리진")
         return
 
+    # 나머지 거절은 accept 뒤에 닫는다 — 그래야 close code가 클라이언트까지 전달돼
+    # 앱이 원인을 알고 재연결을 멈춘다(4403만 위에서 예외적으로 먼저 닫는다).
+    await ws.accept()
+
+    # 인증을 프로젝트/에이전트 검사보다 먼저 본다. 순서가 반대면 인증 없는 상대가
+    # 4404/4400 여부로 화이트리스트에 무엇이 있는지 떠볼 수 있다.
+    if not is_authed(ws.cookies):
+        _audit("ws-reject", reason="unauthorized", client=client, project=project_name)
+        await ws.close(code=4401, reason="인증 필요")
+        return
+
     project = config.find_project(project_name)
     if project is None:
         _audit("ws-reject", reason="unknown-project", client=client, project=project_name)
@@ -408,14 +419,6 @@ async def terminal_ws(
     if agent not in ("claude", "codex", "shell"):
         _audit("ws-reject", reason="bad-agent", client=client, agent=agent)
         await ws.close(code=4400, reason="지원하지 않는 에이전트")
-        return
-
-    await ws.accept()
-
-    # accept 후에 닫아야 close code(4401)가 클라이언트까지 전달된다
-    if not is_authed(ws.cookies):
-        _audit("ws-reject", reason="unauthorized", client=client, project=project_name)
-        await ws.close(code=4401, reason="인증 필요")
         return
 
     session_key = f"{project_name}#{agent}"

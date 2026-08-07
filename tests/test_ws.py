@@ -85,33 +85,57 @@ def status_message(ws) -> str:
 
 # ── 접속 거부 경로 ───────────────────────────────────────────────────
 #
-# 오리진/화이트리스트/에이전트 검사는 ws.accept() 전에 닫으므로 Starlette이
-# 핸드셰이크를 HTTP 403으로 끝낸다. close code는 전달되지 않는다 — 4403은
-# 의도한 동작이고(공격자 페이지가 열린 소켓을 쥐지 못한다), 4404/4400은
-# 알려진 UX 문제다(TODO 2 참조). 지금 동작을 그대로 못박아 둔다.
+# 오리진 검사만 ws.accept() 전에 닫는다. Starlette이 핸드셰이크를 HTTP 403으로
+# 끝내 close code가 전달되지 않는데, 4403은 그것이 의도한 동작이다 — 공격자
+# 페이지가 열린 소켓을 단 한 순간도 쥐지 못하는 쪽이 낫고 원인은 서버 로그에
+# 남는다. 나머지 거절은 accept 뒤라 close code가 그대로 도착한다.
 
 
 @pytest.mark.parametrize(
-    "path, origin",
+    "origin",
     [
-        ("/ws/demo", None),                       # Origin 없음
-        ("/ws/demo", "https://evil.example"),     # 다른 사이트
-        ("/ws/not-whitelisted", ""),              # 화이트리스트 밖
-        ("/ws/demo?agent=bogus", ""),             # 지원하지 않는 에이전트
+        None,                       # Origin 없음
+        "https://evil.example",     # 다른 사이트
     ],
 )
-def test_handshake_rejected(start_server, path, origin):
+def test_bad_origin_fails_handshake(start_server, origin):
     h = start_server()
     token = h.login()
     with pytest.raises(InvalidStatus) as exc:
-        ws_connect(h, path, token=token, origin=origin)
+        ws_connect(h, "/ws/demo", token=token, origin=origin)
     assert exc.value.response.status_code == 403
 
 
+@pytest.mark.parametrize(
+    "path, code",
+    [
+        ("/ws/not-whitelisted", 4404),   # 화이트리스트 밖
+        ("/ws/demo?agent=bogus", 4400),  # 지원하지 않는 에이전트
+    ],
+)
+def test_rejected_after_accept_delivers_close_code(start_server, path, code):
+    """close code가 도착해야 클라이언트가 원인을 알고 재연결을 멈춘다."""
+    h = start_server()
+    token = h.login()
+    with ws_connect(h, path, token=token) as ws:
+        with pytest.raises(ConnectionClosed) as exc:
+            ws.recv(timeout=RECV_TIMEOUT)
+    assert exc.value.rcvd.code == code
+
+
 def test_unauthenticated_ws_closes_with_4401(start_server):
-    """4401만은 accept 뒤에 닫아서 클라이언트가 재로그인 화면을 띄울 수 있다."""
+    """인증 실패는 클라이언트가 재로그인 화면을 띄울 수 있게 4401로 알린다."""
     h = start_server()
     with ws_connect(h, "/ws/demo") as ws:
+        with pytest.raises(ConnectionClosed) as exc:
+            ws.recv(timeout=RECV_TIMEOUT)
+    assert exc.value.rcvd.code == 4401
+
+
+def test_unauthenticated_unknown_project_still_says_4401(start_server):
+    """인증 없는 상대에게 화이트리스트 내용을 알려주지 않는다 (4404가 아니라 4401)."""
+    h = start_server()
+    with ws_connect(h, "/ws/not-whitelisted") as ws:
         with pytest.raises(ConnectionClosed) as exc:
             ws.recv(timeout=RECV_TIMEOUT)
     assert exc.value.rcvd.code == 4401

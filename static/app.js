@@ -211,11 +211,17 @@
       // 오리진 거절(4403)은 여기로 오지 않는다. 서버가 accept 전에 닫아 핸드셰이크가
       // HTTP 403으로 끝나고, 브라우저는 그것을 1006으로만 알려준다. 아래 재연결
       // 경로를 타고 "재연결 실패"로 끝나며, 원인은 서버 로그에 남는다.
-      if (intentionalClose || ev.code === 4000 || ev.code === 4401 || ev.code === 4404) {
+      if (
+        intentionalClose || ev.code === 4000 || ev.code === 4401 ||
+        ev.code === 4404 || ev.code === 4400
+      ) {
         setStatus("disconnected", "연결 종료");
         if (ev.code === 4000)
           term.write("\r\n\x1b[38;5;210m[W-Term] 다른 클라이언트가 연결하여 종료되었습니다.\x1b[0m\r\n");
         if (ev.code === 4401) showLogin("인증이 만료되었습니다. 다시 로그인하세요.");
+        // 재연결해봐야 같은 이유로 거절당하는 설정 문제다. 서버가 보낸 사유를 그대로 띄운다.
+        if (ev.code === 4404 || ev.code === 4400)
+          term.write(`\r\n\x1b[38;5;210m[W-Term] 연결이 거절되었습니다: ${ev.reason || ev.code}\x1b[0m\r\n`);
         return;
       }
       // 비정상 단절: 자동 재연결 (라이브 세션이면 재접속, 아니면 claude -c로 최근 세션 이어하기)

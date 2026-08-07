@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import time
 
-from test_ws import end_shell, recv_until, send_line, status_message, ws_connect
+from test_ws import (
+    RECV_TIMEOUT, end_shell, recv_until, send_line, status_message, ws_connect,
+)
 
 
 def audit_log(h, timeout: float = 5.0) -> str:
@@ -121,7 +123,8 @@ def test_audit_records_failed_login_and_rejected_origin(start_server):
 
 def test_audit_records_rejected_websocket(start_server):
     """오리진 거절은 accept 전에 끝나 브라우저에는 평범한 연결 실패로만 보인다
-    (AGENTS.md "Session invariants"). 서버 기록이 유일한 단서다."""
+    (AGENTS.md "Session invariants"). 서버 기록이 유일한 단서다. 나머지는 close
+    code가 가지만, 원인을 남기는 것은 그쪽도 마찬가지다."""
     h = start_server()
     token = h.login()
     for path, origin, reason in (
@@ -130,10 +133,10 @@ def test_audit_records_rejected_websocket(start_server):
         ("/ws/demo?agent=bogus", "", "bad-agent"),
     ):
         try:
-            with ws_connect(h, path, token=token, origin=origin):
-                pass
+            with ws_connect(h, path, token=token, origin=origin) as ws:
+                ws.recv(timeout=RECV_TIMEOUT)  # 서버가 닫을 때까지 기다린다
         except Exception:
-            pass  # 핸드셰이크가 거절되는 것이 정상
+            pass  # 핸드셰이크 거절(4403)이든 accept 뒤 close든 둘 다 정상
         assert f"ws-reject reason={reason}" in audit_log(h), reason
 
 

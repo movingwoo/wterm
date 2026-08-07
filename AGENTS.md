@@ -35,7 +35,8 @@ This file contains the detailed architecture, protocol, operational assumptions,
 - Preserve the disconnect grace period, the 256 KB replay buffer, PTY resize handling, and process-group termination behavior.
 - Preserve non-blocking PTY writes. Partial writes and `BlockingIOError` must retain unsent UTF-8 bytes in the write buffer.
 - New clients replace an existing client with close code 4000. Authentication and whitelist failures use their existing close codes.
-- Note that only 4000 and 4401 actually reach the client. The origin (4403), whitelist (4404), and agent (4400) checks run *before* `ws.accept()`, so Starlette rejects the handshake with HTTP 403 and the close code is never delivered — the browser sees a generic 1006. That is the desired trade for 4403 (a hostile page never holds an open socket, and the reason is logged server-side instead); do not "fix" it by moving the origin check after `accept()`.
+- Note that 4403 never reaches the client. The origin check runs *before* `ws.accept()`, so Starlette rejects the handshake with HTTP 403 and the close code is never delivered — the browser sees a generic 1006. That is the desired trade (a hostile page never holds an open socket, and the reason is logged server-side instead); do not "fix" it by moving the origin check after `accept()`. Every other rejection closes after `accept()` so the code does arrive and the client can stop retrying.
+- Check authentication (4401) *before* the whitelist (4404) and agent (4400) checks. Both of those run after `accept()`, so reversing the order would let an unauthenticated caller probe which projects exist by reading the close code.
 - Claude resume commands are `claude --resume` and `claude --continue`.
 - Codex resume commands are `codex resume` and `codex resume --last`.
 - If resume history does not exist, start a new session instead of launching a broken resume flow.
