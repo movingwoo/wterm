@@ -283,19 +283,28 @@ body.split .pane-head { display: flex; }
   padding: 0 6px;
 }
 
+/* 창 버튼은 키 바(#key-bar .key)와 같은 언어를 쓴다 — 테두리와 배경이 있고
+   눌리면 반응하는 것. 배경 없이 흐린 글리프만 두면 장식으로 읽혀서, 누를 수 있는
+   것인지 알아보기 전에 지나친다. 아이콘 대신 글자를 쓰는 이유도 같다: ◧와 ⇥는
+   뜻을 짐작해야 하는 기호고, 이 자리에는 그럴 만한 가로 폭이 있다. */
 .pane-btn {
-  width: 26px;
   height: 26px;
-  font-size: 13px;
+  padding: 0 10px;
+  font: inherit;
+  font-size: 12px;
   line-height: 1;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  color: #6c7086;
+  border: 1px solid #45475a;
+  border-radius: 7px;
+  background: #313244;
+  color: #cdd6f4;
   cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 90ms ease, border-color 90ms ease;
 }
-.pane-btn:hover { background: #313244; color: #cdd6f4; }
-.pane-btn:focus-visible { outline: 2px solid #cba6f7; outline-offset: -2px; }
+.pane-btn:hover { background: #45475a; border-color: #585b70; }
+/* 누른 순간의 반응. 이게 없으면 클릭이 먹었는지 화면 변화로만 알아야 한다. */
+.pane-btn:active { background: #585b70; transform: translateY(1px); }
+.pane-btn:focus-visible { outline: 2px solid #cba6f7; outline-offset: 1px; }
 
 .tab {
   display: flex;
@@ -351,33 +360,37 @@ body.split .pane-head { display: flex; }
 .tab-agent.shell { color: #89b4fa; }
 
 /* 옆 창으로 보내기. 나뉘어 있을 때만 app.js가 hidden을 푼다. */
-.tab-move {
-  flex: 0 0 auto;
-  width: 18px;
-  height: 18px;
-  line-height: 1;
-  font-size: 12px;
-  border: none;
-  border-radius: 4px;
-  background: transparent;
-  color: #6c7086;
-  cursor: pointer;
-}
-.tab-move:hover { background: #45475a; color: #cba6f7; }
-
+/* 탭 안의 버튼은 창 버튼만큼 크게 만들 수 없다(탭이 몇 개만 열려도 줄이 어지럽다).
+   대신 투명 배경을 버리고 옅은 칩 모양을 깔아서 "누를 수 있는 것"으로는 읽히게 한다.
+   크기도 18 → 20px로 올렸다 — 18px는 마우스로도 빗나간다. */
+.tab-move,
 .tab-close {
   flex: 0 0 auto;
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   line-height: 1;
-  font-size: 14px;
   border: none;
-  border-radius: 4px;
-  background: transparent;
-  color: #6c7086;
+  border-radius: 5px;
+  background: #313244;
+  color: #a6adc8;
   cursor: pointer;
+  transition: background-color 90ms ease, color 90ms ease;
 }
-.tab-close:hover { background: #45475a; color: #f38ba8; }
+
+.tab-move { font-size: 12px; }
+.tab-close { font-size: 14px; }
+
+.tab-move:hover { background: #585b70; color: #cba6f7; }
+.tab-close:hover { background: #585b70; color: #f38ba8; }
+.tab-move:active,
+.tab-close:active { transform: translateY(1px); }
+.tab-move:focus-visible,
+.tab-close:focus-visible { outline: 2px solid #cba6f7; outline-offset: 1px; }
+
+/* 활성 탭 배경(#1e1e2e)과 칩 배경(#313244)이 가까워 대비가 약해진다. 지금 보고 있는
+   탭의 버튼이 가장 자주 눌리는 버튼이므로 그쪽을 한 단계 밝게 둔다. */
+.tab.active .tab-move,
+.tab.active .tab-close { background: #45475a; color: #cdd6f4; }
 
 .term-stack { position: relative; flex: 1; min-height: 0; }
 

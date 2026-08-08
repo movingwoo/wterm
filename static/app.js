@@ -477,10 +477,12 @@
     panesEl.style.setProperty("--split-ratio", String(splitRatio));
     for (const pane of panes) {
       const canSplit = panes.length < MAX_PANES;
-      pane.splitEl.textContent = canSplit ? "◧" : "✕";
+      // 기호가 아니라 글자다. ◧/✕는 뜻을 짐작해야 하고, 이 자리에는 글자가 들어갈
+      // 폭이 있다 — 좁아지면 창 버튼은 어차피 사라진다.
+      pane.splitEl.textContent = canSplit ? "분할" : "합치기";
       pane.splitEl.title = canSplit
-        ? "좌우로 분할"
-        : "이 창 닫기 (탭은 옆 창으로 옮겨집니다)";
+        ? "창을 좌우로 나눕니다"
+        : "이 창을 닫습니다 (탭은 옆 창으로 옮겨집니다)";
       pane.splitEl.setAttribute("aria-label", pane.splitEl.title);
       // 나눌 수 없는 폭에서는 버튼 자체를 감춘다. 눌러도 되지 않는 버튼을
       // 남겨두면 그게 고장으로 보인다.
@@ -557,7 +559,7 @@
   }
 
   function paintPanes() {
-    for (const pane of panes) {
+    panes.forEach((pane, paneIndex) => {
       pane.el.classList.toggle("focused", pane === focusedPane && panes.length > 1);
       pane.el.classList.toggle("empty", pane.tabs.length === 0);
       for (const t of pane.tabs) {
@@ -567,8 +569,16 @@
         t.el.tabIndex = on ? 0 : -1;
         t.hostEl.classList.toggle("active", on);
         t.moveEl.hidden = panes.length < 2;
+        // 화살표는 갈 방향을 가리켜야 한다. 오른쪽 창의 탭에 →가 붙어 있으면
+        // 화면 밖으로 보낸다는 뜻으로 읽힌다.
+        t.moveEl.textContent = paneIndex === 0 ? "→" : "←";
+        t.moveEl.title =
+          paneIndex === 0 ? "이 탭을 오른쪽 창으로" : "이 탭을 왼쪽 창으로";
+        t.moveEl.setAttribute(
+          "aria-label", `${t.name} ${AGENT_LABEL[t.agent]} 탭을 ${t.moveEl.title.slice(3)}`
+        );
       }
-    }
+    });
     document.body.classList.toggle("session-open", allTabs().length > 0);
   }
 
@@ -629,8 +639,8 @@
     const moveEl = document.createElement("button");
     moveEl.className = "tab-move";
     moveEl.type = "button";
-    moveEl.textContent = "⇥";
-    moveEl.title = "옆 창으로 옮기기";
+    moveEl.textContent = "→";
+    moveEl.title = "이 탭을 옆 창으로 옮깁니다";
     moveEl.setAttribute("aria-label", `${name} ${AGENT_LABEL[agent]} 탭을 옆 창으로`);
     moveEl.hidden = true;
 
