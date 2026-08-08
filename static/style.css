@@ -196,9 +196,102 @@ body.sidebar-collapsed #sidebar-toggle svg { transform: rotate(180deg); }
 
 #logout-btn:hover { background: #45475a; color: #cdd6f4; }
 
-#terminal-pane { flex: 1; position: relative; min-width: 0; }
+#terminal-pane {
+  flex: 1;
+  position: relative;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
 
-#terminal { position: absolute; inset: 0; padding: 4px; }
+#tab-bar {
+  display: none;
+  flex: 0 0 auto;
+  gap: 4px;
+  padding: 6px 6px 0;
+  background: #181825;
+  border-bottom: 1px solid #313244;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+
+body.session-open #tab-bar { display: flex; }
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  max-width: 220px;
+  padding: 5px 4px 5px 9px;
+  border: 1px solid #313244;
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  background: #11111b;
+  color: #a6adc8;
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.tab:hover { background: #181825; }
+.tab.active { background: #1e1e2e; color: #cdd6f4; border-color: #45475a; }
+.tab:focus-visible { outline: 2px solid #cba6f7; outline-offset: -2px; }
+
+.tab-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #f38ba8;
+}
+.tab-dot.connected { background: #a6e3a1; }
+.tab-dot.connecting { background: #f9e2af; }
+.tab-dot.disconnected { background: #f38ba8; }
+
+.tab-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 마지막으로 본 뒤 출력이 있었던 탭. 전환하지 않고도 어느 세션이 움직였는지 안다. */
+.tab.unread .tab-name { color: #cba6f7; font-weight: 600; }
+
+.tab-agent {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: #b4befe;
+  border: 1px solid currentcolor;
+  border-radius: 4px;
+  padding: 0 3px;
+}
+.tab-agent.codex { color: #f9e2af; }
+.tab-agent.shell { color: #89b4fa; }
+
+.tab-close {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  line-height: 1;
+  font-size: 14px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: #6c7086;
+  cursor: pointer;
+}
+.tab-close:hover { background: #45475a; color: #f38ba8; }
+
+#terminal-stack { position: relative; flex: 1; min-height: 0; }
+
+/* 비활성 탭은 display:none이 아니라 visibility로 숨긴다 — 레이아웃이 유지돼야
+   숨은 터미널도 크기를 알 수 있고, 그래야 PTY 크기가 창을 따라간다.
+   자세한 이유는 static/app.js의 "크기 맞추기" 주석 참고. */
+.term-host {
+  position: absolute;
+  inset: 0;
+  padding: 4px;
+  visibility: hidden;
+}
+.term-host.active { visibility: visible; }
 
 #placeholder {
   position: absolute;
@@ -260,6 +353,10 @@ body.session-open #placeholder { display: none; }
 
 @media (max-width: 640px) {
   :root { --sidebar-width: min(240px, calc(100vw - 44px)); }
+  /* 폰에서는 탭 줄이 화면을 다 먹지 않도록 좁히고, 손가락으로 밀어 넘긴다.
+     에이전트 태그는 남긴다 — 같은 프로젝트의 Claude/Codex/셸 탭을 구분하는
+     유일한 표시라, 이름을 줄이는 편이 낫다. */
+  .tab { max-width: 150px; padding-left: 7px; gap: 5px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

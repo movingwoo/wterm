@@ -19,7 +19,7 @@ This file contains the detailed architecture, protocol, operational assumptions,
 - `server/config.py`: loads and validates `projects.json`.
 - `server/session.py`: spawns PTYs and manages input, resize, replay, detach grace, and termination. Also answers "does this cwd have Claude/Codex history". The Codex answer walks the whole session tree, so it runs in a thread and its result is cached for `CODEX_CACHE_TTL`: `/api/projects` is polled every 10 seconds and those files only accumulate, so doing it inline stalls every live PTY session for longer as time passes.
 - `server/main.py`: FastAPI routes, authentication, project status, and the WebSocket protocol.
-- `static/app.js`: project actions, xterm.js integration, authentication UI, and reconnect behavior.
+- `static/app.js`: project actions, session tabs, xterm.js integration, authentication UI, and reconnect behavior.
 - `static/style.css`: application layout and visual states.
 - `static/vendor/`: vendored third-party files; do not edit.
 - `scripts/cert-setup.sh`: one-shot TLS certificate issuance via acme.sh; not invoked by the server.
@@ -55,6 +55,16 @@ Client-to-server messages are JSON text:
 Server-to-client terminal output is binary. Status and exit notifications are JSON text. When changing the protocol, update both `server/main.py` and `static/app.js` in the same change.
 
 Anything else a client sends is ignored silently, and the receive loop must stay that way: a malformed message that escapes as an exception closes that client's own socket, so a buggy client sees an unexplained disconnect and the log fills with tracebacks instead. That covers non-JSON text, JSON that is not an object, binary frames (`receive_text` raises `KeyError` on them), missing or non-numeric `cols`/`rows`, and non-string `data`. Sizes are clamped in `Session.resize` rather than validated at the route, because `struct.pack("HHHH", …)` raises above 65535 and that is a number the client chooses.
+
+## Frontend tabs
+
+The UI keeps one tab per session, and a tab owns everything about that session: its own `Terminal`, `FitAddon`, WebSocket, reconnect counter, and status. Nothing about this changes the protocol or the server — tabs work because session keys are already independent.
+
+- **A tab is identified by `<project>#<agent>`, and `openTab` reuses an existing tab for that key.** Opening a second socket on one key makes the server close the first with 4000, so letting two tabs share a key would have them killing each other. For the same reason the sidebar button for an already-connected session reads "보기" and only activates the tab; it must not reconnect.
+- **Inactive tabs are hidden with `visibility: hidden`, never `display: none`.** A hidden terminal must keep its layout box: the fit addon reads `clientWidth` and clamps the result to a two-column minimum, so a zero-size box would resize that session's PTY to 2 columns. Keeping the box means background sessions track the window size too. `fitTab` still guards against a zero box for the moment a tab is being created.
+- **Closing a tab detaches; it does not terminate.** The session stays live through its grace period, which is what makes reopening restore the screen. There is no client-side kill path (see TODO 4.3).
+- Only binary frames mark a background tab unread. Status/exit JSON is written by us and would light up tabs the user never touched.
+- The tab-switch shortcut is registered on `document` in the **capture** phase. xterm sends input from a `keydown` handler on its own textarea, so a bubble-phase listener would fire after the keystroke had already reached the session.
 
 ## Authentication
 
