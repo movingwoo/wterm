@@ -220,19 +220,82 @@ body.sidebar-collapsed #sidebar-toggle svg { transform: rotate(180deg); }
   flex-direction: column;
 }
 
-#tab-bar {
+/* ── 창(pane) ──────────────────────────────────────────────────────
+   최대 둘까지 좌우로 나뉜다. 세로 분할과 중첩은 없다 — 이유는 static/app.js의
+   "창(pane)" 주석 참고. 비율은 --split-ratio에 실려 스플리터 드래그로 바뀐다. */
+
+#panes {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+body.split #panes {
+  grid-template-columns:
+    minmax(0, calc(var(--split-ratio, 0.5) * 100%)) 6px minmax(0, 1fr);
+}
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* 나뉘어 있을 때만 어느 쪽이 포커스인지 표시한다. 창이 하나면 알려줄 것이 없다. */
+.pane.focused .pane-head { border-bottom-color: #cba6f7; }
+
+.splitter {
+  background: #313244;
+  cursor: col-resize;
+  touch-action: none; /* 드래그가 스크롤로 새지 않게 */
+}
+.splitter:hover { background: #cba6f7; }
+
+.pane-head {
   display: none;
   flex: 0 0 auto;
-  gap: 4px;
-  padding: 6px 6px 0;
   background: #181825;
   border-bottom: 1px solid #313244;
+}
+
+/* 세션이 하나도 없고 나뉘어 있지도 않으면 빈 줄을 띄우지 않는다. 나뉘어 있으면
+   빈 창에도 머리를 남긴다 — 창을 도로 합치는 ✕ 버튼이 거기 있다. */
+body.session-open .pane-head,
+body.split .pane-head { display: flex; }
+
+.tab-bar {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  gap: 4px;
+  padding: 6px 6px 0;
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: thin;
 }
 
-body.session-open #tab-bar { display: flex; }
+.pane-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  padding: 0 6px;
+}
+
+.pane-btn {
+  width: 26px;
+  height: 26px;
+  font-size: 13px;
+  line-height: 1;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: #6c7086;
+  cursor: pointer;
+}
+.pane-btn:hover { background: #313244; color: #cdd6f4; }
+.pane-btn:focus-visible { outline: 2px solid #cba6f7; outline-offset: -2px; }
 
 .tab {
   display: flex;
@@ -287,6 +350,21 @@ body.session-open #tab-bar { display: flex; }
 .tab-agent.codex { color: #f9e2af; }
 .tab-agent.shell { color: #89b4fa; }
 
+/* 옆 창으로 보내기. 나뉘어 있을 때만 app.js가 hidden을 푼다. */
+.tab-move {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  line-height: 1;
+  font-size: 12px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: #6c7086;
+  cursor: pointer;
+}
+.tab-move:hover { background: #45475a; color: #cba6f7; }
+
 .tab-close {
   flex: 0 0 auto;
   width: 18px;
@@ -301,7 +379,7 @@ body.session-open #tab-bar { display: flex; }
 }
 .tab-close:hover { background: #45475a; color: #f38ba8; }
 
-#terminal-stack { position: relative; flex: 1; min-height: 0; }
+.term-stack { position: relative; flex: 1; min-height: 0; }
 
 /* 비활성 탭은 display:none이 아니라 visibility로 숨긴다 — 레이아웃이 유지돼야
    숨은 터미널도 크기를 알 수 있고, 그래야 PTY 크기가 창을 따라간다.
@@ -357,18 +435,21 @@ body.session-open #tab-bar { display: flex; }
    한다 — 안 그러면 다음에 친 글자가 왜 사라졌는지 알 수 없다. */
 #key-bar .key.armed { background: #cba6f7; border-color: #cba6f7; color: #11111b; }
 
-#placeholder {
+/* 창마다 하나씩. 나뉜 채로 오른쪽을 비워두면 그쪽에도 안내가 필요하다. */
+.pane-placeholder {
   position: absolute;
   inset: 0;
-  display: flex;
+  display: none;
   align-items: center;
   justify-content: center;
+  padding: 0 12px;
+  text-align: center;
   color: #6c7086;
   font-size: 15px;
   pointer-events: none;
 }
 
-body.session-open #placeholder { display: none; }
+.pane.empty .pane-placeholder { display: flex; }
 
 #login-overlay {
   position: fixed;
@@ -421,6 +502,9 @@ body.session-open #placeholder { display: none; }
      에이전트 태그는 남긴다 — 같은 프로젝트의 Claude/Codex/셸 탭을 구분하는
      유일한 표시라, 이름을 줄이는 편이 낫다. */
   .tab { max-width: 150px; padding-left: 7px; gap: 5px; }
+  /* 좁은 화면에서는 분할 자체가 없다(app.js의 wideEnough). 창 버튼도 자리만
+     차지하므로 감춘다 — app.js가 hidden을 걸지만 CSS로도 못박아 둔다. */
+  .pane-actions { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {
