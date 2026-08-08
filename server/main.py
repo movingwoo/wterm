@@ -505,6 +505,44 @@ async def list_projects(request: Request):
 
 
 WS_MODES = ("attach", "new", "resume", "continue")
+AGENTS = ("claude", "codex", "shell")
+
+
+@app.post("/api/session/end")
+async def end_session(request: Request, project: str, agent: str = "claude"):
+    """라이브 세션을 지금 종료한다 (사이드바의 "종료" 버튼).
+
+    이전에는 세션을 끝낼 방법이 "새 세션"으로 덮어쓰거나 유예가 만료되기를
+    기다리는 것뿐이었다. 탭을 닫는 것은 종료가 아니다 — 그건 소켓만 떼는
+    것이고, 그래야 다시 열었을 때 화면이 복원된다.
+
+    POST이고 Origin 검사를 탄다(/api/logout과 같은 형태). GET이면 다른 사이트가
+    <img>만으로 남의 세션을 끊을 수 있고, Origin을 보지 않으면 그 페이지의
+    fetch 한 줄이면 된다.
+
+    검사 순서는 WS 라우트와 같다: 인증이 화이트리스트보다 먼저다. 반대로 두면
+    인증 없는 상대가 404/400 여부로 어떤 프로젝트가 있는지 떠볼 수 있다.
+    """
+    if not origin_allowed(request):
+        _audit(
+            "session-end-reject", reason="origin", client=_peer(request),
+            origin=request.headers.get("origin"), host=request.headers.get("host"),
+        )
+        return JSONResponse({"ok": False}, status_code=403)
+    if not is_authed(request.cookies):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if config.find_project(project) is None:
+        return JSONResponse({"ok": False}, status_code=404)
+    if agent not in AGENTS:
+        return JSONResponse({"ok": False}, status_code=400)
+    # 이미 없는 세션이어도 200이다. 종료 버튼을 누른 사람이 원한 상태가 곧
+    # 그것이고, 라이브 여부는 폴링과 어차피 어긋난다.
+    ended = await manager.end(f"{project}#{agent}")
+    _audit(
+        "session-end", client=_peer(request), project=project,
+        agent=agent, ended=ended,
+    )
+    return JSONResponse({"ok": True, "ended": ended})
 
 
 async def _notify_input_dropped(ws: WebSocket) -> None:
@@ -575,7 +613,7 @@ async def terminal_ws(
 
     if shell:
         agent = "shell"
-    if agent not in ("claude", "codex", "shell"):
+    if agent not in AGENTS:
         _audit("ws-reject", reason="bad-agent", client=client, agent=agent)
         await ws.close(code=4400, reason="지원하지 않는 에이전트")
         return

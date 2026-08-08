@@ -43,6 +43,10 @@ SIGTERM_WAIT = 10  # SIGTERM 후 SIGKILL까지 대기 초
 IDLE_CLOSE_CODE = 4408
 IDLE_MIN_SLEEP = 0.5  # 남은 시간이 0에 가까울 때 바쁜 루프가 되지 않도록
 
+# 사용자가 명시적으로 끝낸 세션. 4408과 같은 이유로 별도 코드다 — 평범한 단절로
+# 보이면 app.js의 자동 재연결이 방금 종료한 세션을 곧바로 새로 띄운다.
+ENDED_CLOSE_CODE = 4409
+
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
 
@@ -402,24 +406,39 @@ class Session:
         await self._expire_idle()
 
     async def _expire_idle(self) -> None:
-        # 알림이 먼저다. terminate는 대화형 셸처럼 SIGTERM을 무시하는 자식에게
-        # SIGTERM_WAIT초를 꽉 쓰는데, 그 뒤에 알리면 화면이 그동안 아무 이유 없이
-        # 멎어 있다. 소켓을 먼저 떼어 두면 라우트의 detach는 그대로 빠져나가고
-        # (유예 타이머도 걸리지 않는다) 종료는 이 태스크가 마저 끝낸다.
+        span = (
+            f"{self.idle_seconds // 60}분"
+            if self.idle_seconds >= 60
+            else f"{self.idle_seconds}초"
+        )
+        await self._notify_and_terminate(
+            f"{span} 동안 아무 움직임이 없어 세션을 종료했습니다.",
+            IDLE_CLOSE_CODE,
+            "유휴 상태로 종료됨",
+        )
+
+    # ── 명시적 종료 ──────────────────────────────────────────────────
+
+    async def end_now(self) -> None:
+        """사용자가 요청한 종료. 유예 없이 지금 끝낸다."""
+        await self._notify_and_terminate(
+            "사용자 요청으로 세션을 종료했습니다.", ENDED_CLOSE_CODE, "사용자가 종료함"
+        )
+
+    async def _notify_and_terminate(self, message: str, code: int, reason: str) -> None:
+        """붙어 있는 소켓에 사유를 알리고 닫은 뒤 프로세스를 종료한다.
+
+        알림이 먼저다. terminate는 대화형 셸처럼 SIGTERM을 무시하는 자식에게
+        SIGTERM_WAIT초를 꽉 쓰는데, 그 뒤에 알리면 화면이 그동안 아무 이유 없이
+        멎어 있다. 소켓을 먼저 떼어 두면 라우트의 detach는 그대로 빠져나가고
+        (유예 타이머도 걸리지 않는다) 종료는 이 호출이 마저 끝낸다.
+        """
         ws = self.websocket
         self.websocket = None
         if ws is not None:
-            span = (
-                f"{self.idle_seconds // 60}분"
-                if self.idle_seconds >= 60
-                else f"{self.idle_seconds}초"
-            )
             try:
-                await ws.send_text(json.dumps({
-                    "type": "status",
-                    "message": f"{span} 동안 아무 움직임이 없어 세션을 종료했습니다.",
-                }))
-                await ws.close(code=IDLE_CLOSE_CODE, reason="유휴 상태로 종료됨")
+                await ws.send_text(json.dumps({"type": "status", "message": message}))
+                await ws.close(code=code, reason=reason)
             except Exception:
                 pass  # 이미 끊긴 소켓. 라우트 쪽 finally가 정리한다
         await self.terminate()
@@ -531,6 +550,23 @@ class SessionManager:
         session.spawn(extra_args)
         self.sessions[project_name] = session
         return session
+
+    async def end(self, project_name: str) -> bool:
+        """라이브 세션을 즉시 종료한다. 끝낼 것이 있었으면 True.
+
+        유예 타이머를 먼저 끊는다 — 소켓이 이미 떨어진 세션이면 그쪽도 곧
+        terminate를 부르고, 둘이 겹치면 죽은 pid를 두 번 거두게 된다.
+        """
+        session = self.get_live(project_name)
+        if session is None:
+            return False
+        session.cancel_grace()
+        await session.end_now()
+        # terminate는 SIGTERM_WAIT까지 걸린다. 그 사이 같은 키로 새 세션이 떴다면
+        # 맵에 있는 것은 더 이상 우리가 끝낸 세션이 아니다.
+        if self.sessions.get(project_name) is session:
+            del self.sessions[project_name]
+        return True
 
     async def shutdown(self) -> None:
         # 세션마다 SIGTERM 후 최대 SIGTERM_WAIT초를 기다리므로 순차로 돌리면

@@ -7,6 +7,7 @@
   const terminalPaneEl = document.getElementById("terminal-pane");
   const tabBarEl = document.getElementById("tab-bar");
   const terminalStackEl = document.getElementById("terminal-stack");
+  const keyBarEl = document.getElementById("key-bar");
   const projectListEl = document.getElementById("project-list");
   const connStatusEl = document.getElementById("conn-status");
   const loginOverlayEl = document.getElementById("login-overlay");
@@ -14,8 +15,10 @@
   const loginPasswordEl = document.getElementById("login-password");
   const loginErrorEl = document.getElementById("login-error");
   const logoutBtnEl = document.getElementById("logout-btn");
+  const notifyBtnEl = document.getElementById("notify-btn");
 
   const AGENT_LABEL = { claude: "Claude", codex: "Codex", shell: "셸" };
+  const BASE_TITLE = document.title;
 
   // 탭 하나 = 세션 하나(`<project>#<agent>`) = WebSocket 하나.
   //
@@ -165,6 +168,152 @@
     setSidebarCollapsed(sidebarCollapsed, true);
   });
 
+  // ── 모바일 키 바 ───────────────────────────────────────────────────
+  //
+  // 폰 소프트 키보드에는 Esc·Tab·Ctrl·방향키가 없다. Claude Code TUI는 Esc(중단)와
+  // 방향키(메뉴 선택)가 있어야 쓸 수 있으므로, 그것들 없이는 폰에서 사실상 텍스트
+  // 입력만 가능하다 — "폰에서 다시 열면 이어집니다"라는 이 도구의 용도가 반쪽이 된다.
+  //
+  // 보내는 것은 term.paste가 아니라 입력 메시지 그대로다. paste는 괄호 붙여넣기
+  // 모드(bracketed paste)에서 \x1b[200~ ... \x1b[201~로 감싸여 나가고, 그 안의
+  // 바이트는 제어문자가 아니라 텍스트로 취급된다 — Esc가 Esc로 도착하지 않는다.
+
+  // 시퀀스가 null인 것은 보낼 것이 없는 고정 키(Ctrl)다.
+  const BAR_KEYS = [
+    ["Esc", "\x1b", "Esc (중단)"],
+    ["Tab", "\t", "Tab"],
+    ["Ctrl", null, "Ctrl (다음 한 글자에만 적용)"],
+    ["←", "\x1b[D", "왼쪽"],
+    ["↑", "\x1b[A", "위"],
+    ["↓", "\x1b[B", "아래"],
+    ["→", "\x1b[C", "오른쪽"],
+    ["^C", "\x03", "Ctrl-C (인터럽트)"],
+  ];
+
+  let ctrlArmed = false;
+  let ctrlKeyEl = null;
+
+  function setCtrlArmed(on) {
+    ctrlArmed = on;
+    if (ctrlKeyEl) {
+      ctrlKeyEl.classList.toggle("armed", on);
+      ctrlKeyEl.setAttribute("aria-pressed", String(on));
+    }
+  }
+
+  /** Ctrl이 걸려 있으면 다음 한 글자를 제어문자로 접는다. */
+  function applyCtrl(data) {
+    if (!ctrlArmed) return data;
+    // 소프트 키보드에는 동시 누르기가 없다. Ctrl은 누르면 다음 한 글자에만
+    // 걸리는 고정 키(sticky)여야 Ctrl-R 같은 조합을 낼 수 있다.
+    setCtrlArmed(false);
+    if (data.length !== 1) return data; // IME 조합 결과나 붙여넣기는 건드리지 않는다
+    const code = data.toUpperCase().charCodeAt(0);
+    // 0x40~0x5f(@A-Z[\]^_)만 접는다. 이 범위 밖에는 대응하는 제어문자가 없다.
+    return code >= 0x40 && code <= 0x5f ? String.fromCharCode(code & 0x1f) : data;
+  }
+
+  function sendKey(seq) {
+    if (!activeTab) return;
+    setCtrlArmed(false); // 바의 키들은 이미 완성된 시퀀스다
+    sendJson(activeTab, { type: "input", data: seq });
+    activeTab.term.focus();
+  }
+
+  function makeKeyButton(label, title) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "key";
+    btn.textContent = label;
+    btn.title = title;
+    // 버튼이 포커스를 가져가면 폰에서 소프트 키보드가 접힌다. pointerdown을
+    // 취소하면 포커스 이동만 막히고 click은 그대로 온다.
+    btn.addEventListener("pointerdown", (e) => e.preventDefault());
+    return btn;
+  }
+
+  for (const [label, seq, title] of BAR_KEYS) {
+    const btn = makeKeyButton(label, title);
+    if (seq === null) {
+      ctrlKeyEl = btn;
+      btn.setAttribute("aria-pressed", "false");
+      btn.addEventListener("click", () => {
+        setCtrlArmed(!ctrlArmed);
+        if (activeTab) activeTab.term.focus();
+      });
+    } else {
+      btn.addEventListener("click", () => sendKey(seq));
+    }
+    keyBarEl.appendChild(btn);
+  }
+
+  // ── 벨 알림 ────────────────────────────────────────────────────────
+  //
+  // "노트북 덮고 나갔다 돌아온다"가 이 도구의 용도인데, Claude가 질문을 띄우고
+  // 멈춘 것을 알 방법이 없어 결국 주기적으로 들여다보게 된다. TUI가 사람을 부를 때
+  // 내는 BEL을 잡아 탭과 문서 제목을 바꾸고, 권한이 있으면 알림까지 띄운다.
+  //
+  // 감지는 클라이언트에서 한다 — 서버는 터미널 내용을 들여다보지 않는다(AGENTS.md).
+  // 판정도 우리가 바이트를 뒤지는 대신 xterm 파서의 onBell에 맡긴다: 셸 프롬프트가
+  // 매번 내보내는 창 제목 시퀀스(OSC ... BEL)의 끝에도 BEL이 있어서, 직접 스캔하면
+  // 프롬프트가 뜰 때마다 오탐이 된다.
+  //
+  // 한계: 탭이 열려 있어야만 동작한다. 진짜 푸시는 서비스 워커와 푸시 서버가
+  // 필요하고, 그건 이 서버의 무상태 설계와 맞지 않는다.
+
+  function updateDocTitle() {
+    const waiting = tabs.filter((t) => t.bell).length;
+    document.title = waiting ? `(${waiting}) ${BASE_TITLE}` : BASE_TITLE;
+  }
+
+  function clearBell(tab) {
+    if (!tab.bell) return;
+    tab.bell = false;
+    tab.el.classList.remove("bell");
+    updateDocTitle();
+  }
+
+  function onBell(tab) {
+    // 지금 보고 있는 화면이면 알릴 것이 없다 — 부른 이유가 이미 눈앞에 있다.
+    if (tab === activeTab && !document.hidden) return;
+    if (!tab.bell) {
+      tab.bell = true;
+      tab.el.classList.add("bell");
+      updateDocTitle();
+    }
+    if (!("Notification" in window) || Notification.permission !== "granted") return;
+    try {
+      const note = new Notification(`${tab.name} (${AGENT_LABEL[tab.agent]})`, {
+        body: "세션이 입력을 기다리고 있습니다.",
+        tag: `${tab.name}#${tab.agent}`, // 같은 세션의 알림은 쌓이지 않고 덮인다
+      });
+      note.onclick = () => {
+        window.focus();
+        if (tabs.includes(tab)) activateTab(tab);
+        note.close();
+      };
+    } catch {
+      // 모바일 크롬/사파리는 이 생성자를 막고 서비스 워커를 요구한다. 탭과 문서
+      // 제목 표시는 그대로 남으므로 여기서 더 할 일은 없다.
+    }
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && activeTab) clearBell(activeTab);
+  });
+
+  if ("Notification" in window && Notification.permission === "default") {
+    notifyBtnEl.hidden = false;
+  }
+  notifyBtnEl.addEventListener("click", () => {
+    notifyBtnEl.hidden = true; // 허용이든 거부든 다시 물을 수 있는 상태가 아니다
+    try {
+      Notification.requestPermission();
+    } catch {
+      /* 지원하지 않는 브라우저 */
+    }
+  });
+
   // ── 탭 ─────────────────────────────────────────────────────────────
 
   function findTab(name, agent) {
@@ -194,7 +343,12 @@
     activeTab = tab;
     tab.unread = false;
     tab.el.classList.remove("unread");
+    clearBell(tab);
+    // 걸려 있던 Ctrl은 탭을 옮기면 푼다. 안 그러면 옆 세션의 첫 글자가 제어문자로
+    // 나가는데, 그건 여기서 누른 적이 없는 키다.
+    setCtrlArmed(false);
     paintActive();
+    syncHash();
     tab.el.scrollIntoView({ block: "nearest", inline: "nearest" });
     setStatus(tab.statusCls, tab.statusText);
     fitTab(tab);
@@ -255,6 +409,7 @@
       statusCls: "disconnected",
       statusText: "연결 안 됨",
       unread: false,
+      bell: false,
     };
 
     el.addEventListener("click", (e) => {
@@ -268,7 +423,9 @@
       }
     });
     closeEl.addEventListener("click", () => closeTab(tab));
-    term.onData((data) => sendJson(tab, { type: "input", data }));
+    term.onData((data) => sendJson(tab, { type: "input", data: applyCtrl(data) }));
+    // BEL 판정은 xterm 파서가 한다 — 위 "벨 알림" 주석 참고.
+    term.onBell(() => onBell(tab));
 
     tabs.push(tab);
     tabBarEl.appendChild(el);
@@ -293,6 +450,7 @@
     tab.el.remove();
     tab.hostEl.remove();
     tabs.splice(index, 1);
+    updateDocTitle(); // 닫힌 탭이 부르고 있었다면 제목의 대기 수도 줄어든다
 
     if (activeTab === tab) {
       activeTab = null;
@@ -301,12 +459,56 @@
         activateTab(next);
       } else {
         paintActive();
+        syncHash();
         setStatus("disconnected", "연결 안 됨");
       }
     } else {
       paintActive();
     }
     if (refresh) renderProjects();
+  }
+
+  // ── 주소창 해시 ────────────────────────────────────────────────────
+  //
+  // 새로고침하면 빈 화면이 되어 사이드바에서 다시 눌러야 했다. 활성 탭을
+  // `#<프로젝트>/<에이전트>`로 적어 두고 로드할 때 복원한다 — 링크 공유는 덤이다.
+  //
+  // 적는 것은 활성 탭 하나뿐이다. 열린 탭 전부를 담으면 공유할 수 없는 주소가 되고,
+  // 나머지 세션은 어차피 서버에 살아 있어 사이드바 배지로 보이고 한 번에 다시 연다.
+  //
+  // pushState가 아니라 replaceState인 이유: 탭을 옮길 때마다 히스토리가 쌓이면
+  // 뒤로 가기가 페이지를 못 벗어난다. 탭 이동은 탭 줄이 다룰 일이지 브라우저
+  // 히스토리가 다룰 일이 아니다. (replaceState는 hashchange도 쏘지 않는다.)
+
+  function syncHash() {
+    const hash = activeTab
+      ? `#${encodeURIComponent(activeTab.name)}/${activeTab.agent}`
+      : "";
+    if (location.hash === hash) return;
+    history.replaceState(null, "", hash || location.pathname + location.search);
+  }
+
+  let hashRestored = false;
+
+  function restoreFromHash() {
+    const raw = location.hash.slice(1);
+    const cut = raw.lastIndexOf("/");
+    if (cut < 0) return;
+    // 프로젝트 이름에는 /가 들어갈 수 있지만 에이전트 이름에는 없다.
+    let name;
+    try {
+      name = decodeURIComponent(raw.slice(0, cut));
+    } catch {
+      return; // 손으로 고친 주소
+    }
+    const agent = raw.slice(cut + 1);
+    const project = lastProjects.find((p) => p.name === name);
+    if (!project || !(agent in AGENT_LABEL)) return;
+    // 살아 있는 세션에만 다시 붙는다. 죽은 세션에 attach하면 새 세션이 뜨는데,
+    // 주소를 여는 것만으로 claude 프로세스가 새로 뜨는 것은 복원이 아니다.
+    const live = { claude: project.live, codex: project.codex_live, shell: project.shell_live };
+    if (!live[agent]) return;
+    openTab(name, agent, "attach");
   }
 
   // 탭 전환 단축키. xterm은 textarea에서 keydown을 받아 그 자리에서 입력을 보내므로
@@ -382,15 +584,15 @@
       // 경로를 타고 "재연결 실패"로 끝나며, 원인은 서버 로그에 남는다.
       if (
         tab.intentionalClose || ev.code === 4000 || ev.code === 4401 ||
-        ev.code === 4404 || ev.code === 4400 || ev.code === 4408
+        ev.code === 4404 || ev.code === 4400 || ev.code === 4408 || ev.code === 4409
       ) {
         setTabStatus(tab, "disconnected", "연결 종료");
         if (ev.code === 4000)
           tab.term.write("\r\n\x1b[38;5;210m[W-Term] 다른 클라이언트가 연결하여 종료되었습니다.\x1b[0m\r\n");
         if (ev.code === 4401) showLogin("인증이 만료되었습니다. 다시 로그인하세요.");
-        // 4408(유휴 종료)에서 재연결하면 방금 정리한 세션이 곧바로 다시 뜬다.
-        // 사유는 서버가 닫기 직전 보낸 status 메시지에 이미 찍혀 있다.
-        // 나머지는 재연결해봐야 같은 이유로 거절당하는 설정 문제다.
+        // 4408(유휴 종료)·4409(사용자 종료)에서 재연결하면 방금 정리한 세션이
+        // 곧바로 다시 뜬다. 사유는 서버가 닫기 직전 보낸 status 메시지에 이미
+        // 찍혀 있다. 나머지는 재연결해봐야 같은 이유로 거절당하는 설정 문제다.
         if (ev.code === 4404 || ev.code === 4400)
           tab.term.write(`\r\n\x1b[38;5;210m[W-Term] 연결이 거절되었습니다: ${ev.reason || ev.code}\x1b[0m\r\n`);
         return;
@@ -430,6 +632,13 @@
       return;
     }
     renderProjects();
+    // 복원은 목록을 받은 뒤에야 할 수 있다 — 그 세션이 아직 살아 있는지를
+    // 여기서만 알 수 있기 때문이다. 첫 목록에서 한 번만 시도한다(로그인이
+    // 필요한 상태였다면 위에서 빠져나가므로, 로그인 직후의 호출이 그 한 번이 된다).
+    if (!hashRestored) {
+      hashRestored = true;
+      restoreFromHash();
+    }
   }
 
   function renderProjects() {
@@ -468,6 +677,36 @@
       const actions = document.createElement("div");
       actions.className = "actions";
 
+      // 탭을 닫는 것은 종료가 아니라 분리다 — 세션은 유예 시간 동안 살아 있고,
+      // 그래서 다시 열면 화면이 복원된다. 실제로 끝내려면 이 경로가 필요하다.
+      // 라이브일 때만 나온다 (끝낼 것이 없으면 버튼도 없다).
+      function makeEndButton(agent, label, live) {
+        if (!live) return null;
+        const btn = document.createElement("button");
+        btn.className = "end";
+        btn.textContent = "종료";
+        btn.title = `실행 중인 ${label} 세션을 종료합니다`;
+        btn.onclick = async () => {
+          if (!confirm(`'${p.name}'의 실행 중인 ${label} 세션을 종료할까요?`)) return;
+          btn.disabled = true;
+          // 대화형 셸은 SIGTERM을 무시해서 SIGKILL까지 시간이 걸린다. 그동안
+          // 아무 표시가 없으면 버튼이 먹지 않은 것으로 보인다.
+          btn.textContent = "종료 중…";
+          try {
+            const res = await fetch(
+              `/api/session/end?project=${encodeURIComponent(p.name)}` +
+              `&agent=${encodeURIComponent(agent)}`,
+              { method: "POST" }
+            );
+            if (res.status === 401) showLogin();
+          } catch {
+            /* 아래 loadProjects가 실제 상태를 다시 가져온다 */
+          }
+          loadProjects();
+        };
+        return btn;
+      }
+
       function makeAgentRow(label, agent, live, hasHistory) {
         const row = document.createElement("div");
         row.className = "agent-row";
@@ -500,6 +739,8 @@
           openTab(p.name, agent, "new");
         };
         row.append(labelEl, resumeBtn, newBtn);
+        const endBtn = makeEndButton(agent, label, live);
+        if (endBtn) row.appendChild(endBtn);
         return row;
       }
       actions.append(
@@ -528,6 +769,8 @@
       shellLabel.className = "agent-label shell";
       shellLabel.textContent = "Shell";
       shellRow.append(shellLabel, shellBtn);
+      const endShellBtn = makeEndButton("shell", "셸", p.shell_live);
+      if (endShellBtn) shellRow.appendChild(endShellBtn);
       actions.append(shellRow);
       card.append(nameEl, pathEl, actions);
       projectListEl.appendChild(card);

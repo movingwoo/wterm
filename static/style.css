@@ -140,9 +140,11 @@ body.sidebar-collapsed #sidebar-toggle svg { transform: rotate(180deg); }
 
 .project .actions { display: flex; flex-direction: column; gap: 6px; }
 
+/* 마지막 auto 칸은 "종료" 버튼 자리다. 라이브가 아니면 버튼 자체가 없고,
+   그때 이 칸은 폭 0으로 접힌다. */
 .project .agent-row {
   display: grid;
-  grid-template-columns: 48px 1fr 1fr;
+  grid-template-columns: 48px 1fr 1fr auto;
   gap: 5px;
 }
 .project .agent-label {
@@ -153,7 +155,7 @@ body.sidebar-collapsed #sidebar-toggle svg { transform: rotate(180deg); }
 }
 .project .agent-label.codex { color: #f9e2af; }
 .project .agent-label.shell { color: #89b4fa; }
-.project .shell-row button { grid-column: 2 / 4; }
+.project .shell-row button:not(.end) { grid-column: 2 / 4; }
 
 .project button {
   flex: 1;
@@ -171,6 +173,14 @@ body.sidebar-collapsed #sidebar-toggle svg { transform: rotate(180deg); }
 .project button.primary:hover { background: #b4befe; }
 .project button:disabled { opacity: 0.4; cursor: default; }
 
+/* 되돌릴 수 없는 동작이라 다른 버튼과 색으로 구분한다. */
+.project button.end {
+  flex: 0 0 auto;
+  padding: 6px 7px;
+  color: #f38ba8;
+}
+.project button.end:hover:not(:disabled) { background: #45475a; color: #f38ba8; }
+
 #conn-status {
   font-size: 12px;
   padding: 6px 8px;
@@ -181,7 +191,8 @@ body.sidebar-collapsed #sidebar-toggle svg { transform: rotate(180deg); }
 #conn-status.disconnected { background: #2b1c1e; color: #f38ba8; }
 #conn-status.connecting { background: #2b271c; color: #f9e2af; }
 
-#logout-btn {
+#logout-btn,
+#notify-btn {
   margin-top: 8px;
   width: 100%;
   padding: 6px 8px;
@@ -194,7 +205,12 @@ body.sidebar-collapsed #sidebar-toggle svg { transform: rotate(180deg); }
   cursor: pointer;
 }
 
-#logout-btn:hover { background: #45475a; color: #cdd6f4; }
+#logout-btn:hover,
+#notify-btn:hover { background: #45475a; color: #cdd6f4; }
+
+/* 권한을 이미 정한 브라우저에서는 아예 나오지 않는다 (app.js가 hidden을 푼다).
+   display를 지정하지 않아야 hidden 속성이 그대로 먹는다. */
+#notify-btn { margin-top: 0; }
 
 #terminal-pane {
   flex: 1;
@@ -255,6 +271,11 @@ body.session-open #tab-bar { display: flex; }
 /* 마지막으로 본 뒤 출력이 있었던 탭. 전환하지 않고도 어느 세션이 움직였는지 안다. */
 .tab.unread .tab-name { color: #cba6f7; font-weight: 600; }
 
+/* 세션이 사람을 부른 탭(BEL). "출력이 있었다"(unread)보다 강한 신호라 배경까지
+   바꾼다 — 여러 탭이 unread인 상태에서 어느 쪽이 기다리는지 골라내야 한다. */
+.tab.bell { background: #2b271c; border-color: #f9e2af; }
+.tab.bell .tab-name { color: #f9e2af; font-weight: 600; }
+
 .tab-agent {
   flex: 0 0 auto;
   font-size: 10px;
@@ -292,6 +313,49 @@ body.session-open #tab-bar { display: flex; }
   visibility: hidden;
 }
 .term-host.active { visibility: visible; }
+
+/* ── 모바일 키 바 ──────────────────────────────────────────────────
+   폰 소프트 키보드에는 Esc·Tab·Ctrl·방향키가 없다. 물리 키보드가 있는 화면에서는
+   자리만 차지하므로 터치 기기에서만 띄운다. max-width도 함께 보는 이유는 데스크톱
+   브라우저에서 창을 좁혀 확인할 수 있어야 하기 때문이다(AGENTS.md "Verification"). */
+
+#key-bar { display: none; }
+
+@media (pointer: coarse), (max-width: 640px) {
+  body.session-open #key-bar {
+    display: flex;
+    flex: 0 0 auto;
+    gap: 4px;
+    padding: 5px 6px;
+    background: #181825;
+    border-top: 1px solid #313244;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+  }
+}
+
+#key-bar .key {
+  flex: 0 0 auto;
+  min-width: 44px;
+  padding: 10px 12px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  border: 1px solid #45475a;
+  border-radius: 7px;
+  background: #313244;
+  color: #cdd6f4;
+  cursor: pointer;
+  user-select: none;
+  touch-action: manipulation; /* 더블탭 확대 판정에 따른 클릭 지연 제거 */
+}
+
+#key-bar .key:active { background: #45475a; }
+
+/* Ctrl은 눌러 두면 다음 한 글자에 걸리는 고정 키다. 걸려 있는 동안 눈에 보여야
+   한다 — 안 그러면 다음에 친 글자가 왜 사라졌는지 알 수 없다. */
+#key-bar .key.armed { background: #cba6f7; border-color: #cba6f7; color: #11111b; }
 
 #placeholder {
   position: absolute;

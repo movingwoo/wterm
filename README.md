@@ -13,7 +13,9 @@
 
 - **세션이 끊겨도 살아남음.** 연결이 끊기면 grace 기간 동안 프로세스를 보존했다가 재접속하면 화면을 그대로 복원합니다.
 - **한 프로젝트에서 Claude, Codex, 셸을 동시에.** 세 세션이 서로 독립적으로 유지됩니다.
-- **탭.** 여러 세션을 탭으로 나란히 열어두고 화면 전환 없이 오갑니다. 백그라운드 탭에 출력이 생기면 탭에 표시됩니다.
+- **탭.** 여러 세션을 탭으로 나란히 열어두고 화면 전환 없이 오갑니다. 백그라운드 탭에 출력이 생기면 탭에 표시되고, 새로고침하면 보던 탭이 그대로 돌아옵니다(주소로 공유도 됩니다).
+- **폰에서도 제대로.** 소프트 키보드에 없는 Esc·Tab·Ctrl·방향키를 터미널 아래 키 바로 보냅니다.
+- **기다릴 때 알려줌.** 세션이 사람을 부르면(터미널 벨) 탭과 문서 제목에 표시하고, 허용했다면 브라우저 알림도 띄웁니다.
 - **이어하기 지원.** Claude의 `--resume`/`--continue`, Codex의 `resume`/`resume --last`.
 - **원격 프로젝트.** ssh로 닿는 호스트의 프로젝트도 같은 UI로 제어합니다.
 - **자체 HTTPS.** 앞단 웹서버 없이 직접 TLS를 종료하고, 인증서 갱신 시 세션을 죽이지 않고 무중단 리로드합니다.
@@ -120,7 +122,8 @@ start.sh / stop.sh    # 기동 / 정상 종료. pid는 서버가 logs/wterm.pid�
 server/
   config.py           # projects.json 로더
   session.py          # Claude/Codex/셸 PTY 세션 수명 주기
-  main.py             # FastAPI 앱: GET /, GET /api/projects, WS /ws/{project}
+  main.py             # FastAPI 앱: GET /, GET /api/projects,
+                      #             POST /api/session/end, WS /ws/{project}
 static/
   index.html, app.js, style.css   # Vanilla JS + xterm.js UI
   vendor/                         # xterm.js 로컬 사본 — 직접 수정 금지

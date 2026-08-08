@@ -363,6 +363,75 @@ def _read_pid(path, timeout: float = 20.0) -> int:
     raise AssertionError(f"셸이 {timeout}초 안에 {path}를 쓰지 않았다")
 
 
+# ── 명시적 종료 ──────────────────────────────────────────────────────
+
+
+def test_end_session_kills_the_child_and_closes_with_4409(start_server, project_dir):
+    """탭을 닫는 것은 종료가 아니라 분리다(그래야 다시 열 때 화면이 복원된다).
+    세션을 실제로 끝내는 경로는 이것뿐이므로, 소켓만 닫고 프로세스가 남으면
+    버튼이 거짓말을 하는 셈이 된다.
+
+    4409로 닫는 이유는 4408과 같다 — 평범한 단절로 보이면 app.js의 자동 재연결이
+    방금 끝낸 세션을 곧바로 새로 띄운다.
+    """
+    pid_marker = project_dir / "end-shell.pid"  # 셸의 cwd는 프로젝트 경로다
+    pid_marker.unlink(missing_ok=True)
+
+    h = start_server()
+    token = h.login()
+    c = h.client(headers={"Origin": h.origin, "Cookie": f"wterm_token={token}"})
+
+    with ws_connect(h, "/ws/demo?agent=shell", token=token) as ws:
+        status_message(ws)
+        send_line(ws, f"echo $$ > {pid_marker.name}")
+        recv_until(ws, pid_marker.name)
+        child_pid = _read_pid(pid_marker)
+
+        # 대화형 bash는 SIGTERM을 무시하므로 이 호출은 SIGKILL까지 기다린다.
+        r = c.post("/api/session/end?project=demo&agent=shell", timeout=40.0)
+        assert r.status_code == 200, r.text
+        assert r.json()["ended"] is True
+
+        with pytest.raises(ConnectionClosed) as exc:
+            while True:
+                ws.recv(timeout=RECV_TIMEOUT)
+    assert exc.value.rcvd.code == 4409
+
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+    (demo,) = c.get("/api/projects").json()
+    assert demo["shell_live"] is False
+
+    # 끝낼 것이 없어도 200이다 — 누른 사람이 원한 상태가 이미 그것이다.
+    assert c.post("/api/session/end?project=demo&agent=shell").json()["ended"] is False
+
+
+def test_end_session_checks_origin_before_auth_before_whitelist(start_server):
+    """상태를 바꾸는 POST라 /api/logout과 같은 검사를 받아야 한다.
+
+    Origin을 보지 않으면 사용자가 방문한 아무 페이지의 fetch 한 줄로 남의 세션이
+    끊긴다. 인증을 화이트리스트보다 먼저 보는 것도 WS 라우트와 같은 이유다 —
+    순서가 반대면 인증 없는 상대가 404/400 여부로 어떤 프로젝트가 있는지 떠본다.
+    """
+    h = start_server()
+    token = h.login()
+    url = "/api/session/end?project=demo&agent=shell"
+
+    cookie = f"wterm_token={token}"
+    evil = h.client(headers={"Origin": "https://evil.example", "Cookie": cookie})
+    assert evil.post(url).status_code == 403
+    no_origin = h.client(headers={"Cookie": cookie})  # 브라우저가 보낸 것이 아니다
+    assert no_origin.post(url).status_code == 403
+
+    anon = h.client()  # Origin은 맞지만 토큰이 없다
+    assert anon.post(url).status_code == 401
+    assert anon.post("/api/session/end?project=nope&agent=shell").status_code == 401
+
+    good = h.client(headers={"Origin": h.origin, "Cookie": cookie})
+    assert good.post("/api/session/end?project=nope&agent=shell").status_code == 404
+    assert good.post("/api/session/end?project=demo&agent=bogus").status_code == 400
+
+
 def test_agents_have_independent_sessions(start_server):
     """세션 키는 프로젝트#에이전트. claude와 셸이 서로를 밀어내지 않는다."""
     h = start_server(env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"})
