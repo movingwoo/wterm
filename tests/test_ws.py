@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import pwd
+import threading
 import time
 
 import pytest
@@ -404,6 +405,50 @@ def test_end_session_kills_the_child_and_closes_with_4409(start_server, project_
 
     # 끝낼 것이 없어도 200이다 — 누른 사람이 원한 상태가 이미 그것이다.
     assert c.post("/api/session/end?project=demo&agent=shell").json()["ended"] is False
+
+
+def test_a_terminating_session_is_not_live(start_server, project_dir):
+    """종료가 끝나기 전까지 그 세션은 라이브가 아니다.
+
+    대화형 bash는 SIGTERM을 무시해서 SIGKILL까지 SIGTERM_WAIT초가 걸린다. 그동안
+    `alive`는 아직 True인데, 그 상태를 라이브로 내주면 두 가지가 깨진다: 사이드바
+    배지가 곧 사라질 세션을 켜 두고, attach가 죽어가는 PTY에 화면을 물려준다
+    (fd가 정리되는 순간 아무 알림 없이 멎는다).
+
+    같은 창이 유예 만료 직후에도 열린다 — 그 경로는 재현이 비싸서 여기서는 명시적
+    종료로 같은 상태를 만든다.
+    """
+    h = start_server()
+    token = h.login()
+    c = h.client(headers={"Origin": h.origin, "Cookie": f"wterm_token={token}"})
+
+    with ws_connect(h, "/ws/demo?agent=shell", token=token) as ws:
+        status_message(ws)
+        send_line(ws, "true")
+        recv_until(ws, "true")
+
+    end = threading.Thread(
+        target=lambda: c.post("/api/session/end?project=demo&agent=shell", timeout=40.0)
+    )
+    end.start()
+    # 첫 조회가 POST보다 먼저 서버에 닿을 수 있으므로 "언제나 False"로는 못 쓴다.
+    # 판정은 **종료가 끝나기 전에** 라이브가 꺼지는가다: 고치기 전에는 SIGKILL로
+    # 자식이 거둬질 때까지 계속 True라 이 창 안에서 한 번도 False를 못 본다.
+    went_down_while_ending = False
+    try:
+        deadline = time.monotonic() + 30
+        while end.is_alive() and time.monotonic() < deadline:
+            (demo,) = c.get("/api/projects").json()
+            if demo["shell_live"] is False:
+                went_down_while_ending = True
+                break
+            time.sleep(0.1)
+    finally:
+        end.join(timeout=40)
+    assert went_down_while_ending, "종료가 끝날 때까지 세션이 라이브로 남아 있었다"
+
+    (demo,) = c.get("/api/projects").json()
+    assert demo["shell_live"] is False
 
 
 def test_end_session_checks_origin_before_auth_before_whitelist(start_server):

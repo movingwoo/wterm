@@ -230,6 +230,41 @@ def _audit(event: str, **fields) -> None:
     _audit_log.info("%s%s", event, f" {detail}" if detail else "")
 
 
+# 인증 **전에** 남는 기록은 인증 없는 상대가 마음대로 늘릴 수 있다. 감사 파일은
+# 크기 상한 없이 날짜로만 로테이션하므로(setup_logging), 거절 한 번에 한 줄이면
+# 로그인 제한이 막아둔 것과 같은 구멍이 라우트 앞단에 그대로 남는다 — 초당 수천 번
+# 거절당하는 것만으로 디스크가 찬다.
+#
+# 크기 상한을 거는 것은 답이 아니다. 상한을 넘겨 로테이션하면 backupCount가
+# "90일"이 아니라 "90개 파일"이 되어, 홍수 한 번에 90일치 기록이 밀려나간다 —
+# 이 파일이 존재하는 이유 자체가 사라진다. 그래서 파일을 자르는 대신 **줄을 접는다**:
+# 같은 (주소, 사유)는 창당 한 줄이고, 접힌 횟수는 다음 줄에 suppressed로 실린다.
+# 조사에 필요한 "언제 누가 무엇을 얼마나"는 남고, 양은 주소 수 × 창으로 묶인다.
+AUDIT_THROTTLE_WINDOW = 60.0
+AUDIT_THROTTLE_KEYS = 256  # 추적할 (주소, 사유) 상한. 넘으면 오래된 것부터 버린다
+
+_audit_throttle: OrderedDict[tuple[str, str], list] = OrderedDict()  # 키 -> [마지막 기록, 접힌 수]
+
+
+def _audit_throttled(event: str, client: str, reason: str, **fields) -> None:
+    """인증 전 거절 기록. 같은 (client, reason)은 창당 한 줄로 접는다."""
+    key = (client, reason)
+    now = time.monotonic()
+    entry = _audit_throttle.get(key)
+    if entry is not None and now - entry[0] < AUDIT_THROTTLE_WINDOW:
+        entry[1] += 1
+        return
+    suppressed = entry[1] if entry is not None else 0
+    _audit_throttle[key] = [now, 0]
+    _audit_throttle.move_to_end(key)
+    while len(_audit_throttle) > AUDIT_THROTTLE_KEYS:
+        _audit_throttle.popitem(last=False)
+    _audit(
+        event, reason=reason, client=client,
+        **fields, suppressed=suppressed or None,
+    )
+
+
 # ── 패스워드 인증 (projects.json에 password_hash가 있을 때만) ──────────
 #
 # 로그인 성공 시 발급한 토큰을 서버 메모리에만 보관한다 (무상태 철학 유지,
@@ -523,25 +558,30 @@ async def end_session(request: Request, project: str, agent: str = "claude"):
     검사 순서는 WS 라우트와 같다: 인증이 화이트리스트보다 먼저다. 반대로 두면
     인증 없는 상대가 404/400 여부로 어떤 프로젝트가 있는지 떠볼 수 있다.
     """
+    client = _peer(request)
+    # 인증 전 두 거절은 기록을 접는다 — _audit_throttled 주석 참고.
     if not origin_allowed(request):
-        _audit(
-            "session-end-reject", reason="origin", client=_peer(request),
+        _audit_throttled(
+            "session-end-reject", client, "origin",
             origin=request.headers.get("origin"), host=request.headers.get("host"),
         )
         return JSONResponse({"ok": False}, status_code=403)
     if not is_authed(request.cookies):
+        _audit_throttled("session-end-reject", client, "unauthorized", project=project)
         return JSONResponse({"error": "unauthorized"}, status_code=401)
+    # 여기부터는 인증된 호출자만 도달한다 — 접지 않고 그대로 남긴다. 세션을 끊는
+    # 경로라 "무엇을 끊으려 했는지"까지 조사에 필요하고, WS 라우트도 같은 거절을
+    # 전부 기록한다.
     if config.find_project(project) is None:
+        _audit("session-end-reject", reason="unknown-project", client=client, project=project)
         return JSONResponse({"ok": False}, status_code=404)
     if agent not in AGENTS:
+        _audit("session-end-reject", reason="bad-agent", client=client, agent=agent)
         return JSONResponse({"ok": False}, status_code=400)
     # 이미 없는 세션이어도 200이다. 종료 버튼을 누른 사람이 원한 상태가 곧
     # 그것이고, 라이브 여부는 폴링과 어차피 어긋난다.
     ended = await manager.end(f"{project}#{agent}")
-    _audit(
-        "session-end", client=_peer(request), project=project,
-        agent=agent, ended=ended,
-    )
+    _audit("session-end", client=client, project=project, agent=agent, ended=ended)
     return JSONResponse({"ok": True, "ended": ended})
 
 
@@ -587,8 +627,9 @@ async def terminal_ws(
     # 로그로 남긴다(정상 사용 중에는 찍힐 일이 없는 줄이다).
     client = _peer(ws)
     if not origin_allowed(ws):
-        _audit(
-            "ws-reject", reason="origin", client=client,
+        # 인증 전이라 기록을 접는다 — _audit_throttled 주석 참고.
+        _audit_throttled(
+            "ws-reject", client, "origin",
             origin=ws.headers.get("origin"), host=ws.headers.get("host"),
         )
         await ws.close(code=4403, reason="허용되지 않은 오리진")
@@ -601,7 +642,7 @@ async def terminal_ws(
     # 인증을 프로젝트/에이전트 검사보다 먼저 본다. 순서가 반대면 인증 없는 상대가
     # 4404/4400 여부로 화이트리스트에 무엇이 있는지 떠볼 수 있다.
     if not is_authed(ws.cookies):
-        _audit("ws-reject", reason="unauthorized", client=client, project=project_name)
+        _audit_throttled("ws-reject", client, "unauthorized", project=project_name)
         await ws.close(code=4401, reason="인증 필요")
         return
 

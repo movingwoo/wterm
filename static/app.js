@@ -4,7 +4,6 @@
 
   const sidebarEl = document.getElementById("sidebar");
   const sidebarToggleEl = document.getElementById("sidebar-toggle");
-  const terminalPaneEl = document.getElementById("terminal-pane");
   const tabBarEl = document.getElementById("tab-bar");
   const terminalStackEl = document.getElementById("terminal-stack");
   const keyBarEl = document.getElementById("key-bar");
@@ -29,6 +28,9 @@
   const tabs = [];
   let activeTab = null;
   let lastProjects = [];
+  // 종료 요청이 나가 있는 세션 키(`<project>#<agent>`). 셸은 SIGTERM을 무시해서
+  // 응답까지 10초 가까이 걸리는데, 그 사이 폴링이 목록을 다시 그린다.
+  const endingKeys = new Set();
 
   function setStatus(cls, text) {
     connStatusEl.className = cls;
@@ -127,10 +129,14 @@
     });
   }
 
+  // 관찰 대상은 pane이 아니라 stack이다. pane은 탭 줄·키 바·터미널을 세로로 쌓는
+  // flex 컨테이너라, 그 안에서 키 바가 나타나거나 탭 줄에 가로 스크롤바가 생기면
+  // 줄어드는 것은 stack뿐이고 pane의 크기는 그대로다 — pane을 보고 있으면 그 경우에
+  // 리핏이 걸리지 않는다. stack은 터미널이 실제로 차지하는 상자다.
   window.addEventListener("resize", scheduleFit);
   if ("ResizeObserver" in window) {
-    const paneResizeObserver = new ResizeObserver(scheduleFit);
-    paneResizeObserver.observe(terminalPaneEl);
+    const stackResizeObserver = new ResizeObserver(scheduleFit);
+    stackResizeObserver.observe(terminalStackEl);
   }
 
   // ── 사이드바 접기 ──────────────────────────────────────────────────
@@ -682,15 +688,21 @@
       // 라이브일 때만 나온다 (끝낼 것이 없으면 버튼도 없다).
       function makeEndButton(agent, label, live) {
         if (!live) return null;
+        const key = `${p.name}#${agent}`;
         const btn = document.createElement("button");
         btn.className = "end";
-        btn.textContent = "종료";
         btn.title = `실행 중인 ${label} 세션을 종료합니다`;
+        // 진행 중 상태는 버튼이 아니라 endingKeys가 들고 있다 — 목록은 10초마다
+        // 통째로 다시 그려지므로 버튼에만 담아두면 그때 지워진다.
+        const ending = endingKeys.has(key);
+        btn.textContent = ending ? "종료 중…" : "종료";
+        btn.disabled = ending;
         btn.onclick = async () => {
           if (!confirm(`'${p.name}'의 실행 중인 ${label} 세션을 종료할까요?`)) return;
-          btn.disabled = true;
           // 대화형 셸은 SIGTERM을 무시해서 SIGKILL까지 시간이 걸린다. 그동안
           // 아무 표시가 없으면 버튼이 먹지 않은 것으로 보인다.
+          endingKeys.add(key);
+          btn.disabled = true;
           btn.textContent = "종료 중…";
           try {
             const res = await fetch(
@@ -701,6 +713,8 @@
             if (res.status === 401) showLogin();
           } catch {
             /* 아래 loadProjects가 실제 상태를 다시 가져온다 */
+          } finally {
+            endingKeys.delete(key);
           }
           loadProjects();
         };
