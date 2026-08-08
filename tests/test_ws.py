@@ -29,9 +29,25 @@ def ws_connect(h, path: str, *, token: str | None = None, origin: str | None = "
     return connect(f"{h.ws_url}{path}", additional_headers=headers, open_timeout=15)
 
 
+# 재접속에서 replay 버퍼(바이너리)는 status 텍스트보다 **먼저** 도착한다 — 라우트가
+# attach()로 버퍼를 흘려보낸 뒤에 status를 보내기 때문이다. status_message가 그 사이의
+# 바이너리를 그냥 버리면 뒤따르는 recv_until은 이미 지나간 출력을 기다리다 타임아웃한다.
+# 재접속이 빠르면 버퍼가 거의 비어 있어 드러나지 않지만(그래서 오래 안 보였다), 로그아웃
+# 왕복처럼 시간이 걸리면 세션 출력 전체가 한 프레임에 실려 사라진다. 건너뛴 출력은
+# 소켓에 달아 두고 다음 recv_until이 먼저 소비한다.
+
+
+def _take_skipped(ws) -> str:
+    seen = getattr(ws, "_skipped_output", "")
+    ws._skipped_output = ""
+    return seen
+
+
 def recv_until(ws, marker: str, timeout: float = RECV_TIMEOUT) -> str:
     """마커가 나올 때까지 터미널 출력을 모은다. JSON 텍스트 메시지는 건너뛴다."""
-    seen = ""
+    seen = _take_skipped(ws)
+    if marker in seen:
+        return seen
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         msg = ws.recv(timeout=max(0.1, deadline - time.monotonic()))
@@ -76,7 +92,8 @@ def end_shell(ws, timeout: float = RECV_TIMEOUT) -> None:
 
 def status_message(ws) -> str:
     msg = ws.recv(timeout=RECV_TIMEOUT)
-    while isinstance(msg, bytes):  # 셸이 먼저 출력하는 경우가 있다
+    while isinstance(msg, bytes):  # 셸 출력이나 replay 버퍼가 먼저 오는 경우
+        ws._skipped_output = _take_skipped(ws) + msg.decode("utf-8", "replace")
         msg = ws.recv(timeout=RECV_TIMEOUT)
     payload = json.loads(msg)
     assert payload["type"] == "status"
