@@ -43,6 +43,10 @@ SIGTERM_WAIT = 10  # SIGTERM 후 SIGKILL까지 대기 초
 IDLE_CLOSE_CODE = 4408
 IDLE_MIN_SLEEP = 0.5  # 남은 시간이 0에 가까울 때 바쁜 루프가 되지 않도록
 
+# 사용자가 명시적으로 끝낸 세션. 4408과 같은 이유로 별도 코드다 — 평범한 단절로
+# 보이면 app.js의 자동 재연결이 방금 종료한 세션을 곧바로 새로 띄운다.
+ENDED_CLOSE_CODE = 4409
+
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
 
@@ -170,6 +174,11 @@ class Session:
         self.pid: int = -1
         self.master_fd: int = -1
         self.alive = False
+        # terminate()에 들어선 뒤로는 되돌릴 수 없다. alive는 자식이 실제로 거둬질
+        # 때까지 True로 남아 있어서(SIGTERM을 무시하는 셸이면 SIGTERM_WAIT초 내내)
+        # 그 사이 이 세션은 "살아 있지만 죽는 중"이다 — SessionManager.get_live가
+        # 그 상태를 라이브로 내주면 죽어가는 세션에 새 클라이언트가 붙는다.
+        self.terminating = False
         self.buffer = bytearray()
         self.websocket: WebSocket | None = None
         self._grace_task: asyncio.Task | None = None
@@ -305,9 +314,16 @@ class Session:
             pass
 
     async def terminate(self) -> None:
-        """SIGTERM → 대기 → SIGKILL 순으로 프로세스 그룹을 종료한다."""
+        """SIGTERM → 대기 → SIGKILL 순으로 프로세스 그룹을 종료한다.
+
+        두 경로가 겹쳐 들어와도 안전하다: SIGTERM이 한 번 더 가고, 자식을 거두는
+        것은 둘 중 하나만 성공하며(나머지는 ChildProcessError), _cleanup_fd는
+        여러 번 불러도 같다. 그래서 이른 return으로 막지 않는다 — 막으면 먼저
+        들어온 쪽이 끝나기 전에 shutdown이 빠져나갈 수 있다.
+        """
         if not self.alive:
             return
+        self.terminating = True
         self._cancel_idle()
         self._signal_group(signal.SIGTERM)
         for _ in range(SIGTERM_WAIT * 10):
@@ -369,6 +385,12 @@ class Session:
             await asyncio.sleep(self.grace_seconds)
         except asyncio.CancelledError:
             return
+        # 여기서부터는 취소받지 않는다. terminate()는 SIGTERM_WAIT초까지 await
+        # 하는데, 그 사이 cancel_grace()가 이 태스크를 취소하면 CancelledError가
+        # terminate() 한복판에서 튀어나와 alive=False도 _cleanup_fd()도 SIGKILL
+        # 후속도 건너뛴다 — SIGTERM만 맞고 살아남은 자식이 마스터 fd를 문 채
+        # "라이브"로 남는다. 참조를 먼저 비워 cancel_grace가 손댈 것을 없앤다.
+        self._grace_task = None
         await self.terminate()
 
     # ── 유휴 종료 ────────────────────────────────────────────────────
@@ -402,24 +424,39 @@ class Session:
         await self._expire_idle()
 
     async def _expire_idle(self) -> None:
-        # 알림이 먼저다. terminate는 대화형 셸처럼 SIGTERM을 무시하는 자식에게
-        # SIGTERM_WAIT초를 꽉 쓰는데, 그 뒤에 알리면 화면이 그동안 아무 이유 없이
-        # 멎어 있다. 소켓을 먼저 떼어 두면 라우트의 detach는 그대로 빠져나가고
-        # (유예 타이머도 걸리지 않는다) 종료는 이 태스크가 마저 끝낸다.
+        span = (
+            f"{self.idle_seconds // 60}분"
+            if self.idle_seconds >= 60
+            else f"{self.idle_seconds}초"
+        )
+        await self._notify_and_terminate(
+            f"{span} 동안 아무 움직임이 없어 세션을 종료했습니다.",
+            IDLE_CLOSE_CODE,
+            "유휴 상태로 종료됨",
+        )
+
+    # ── 명시적 종료 ──────────────────────────────────────────────────
+
+    async def end_now(self) -> None:
+        """사용자가 요청한 종료. 유예 없이 지금 끝낸다."""
+        await self._notify_and_terminate(
+            "사용자 요청으로 세션을 종료했습니다.", ENDED_CLOSE_CODE, "사용자가 종료함"
+        )
+
+    async def _notify_and_terminate(self, message: str, code: int, reason: str) -> None:
+        """붙어 있는 소켓에 사유를 알리고 닫은 뒤 프로세스를 종료한다.
+
+        알림이 먼저다. terminate는 대화형 셸처럼 SIGTERM을 무시하는 자식에게
+        SIGTERM_WAIT초를 꽉 쓰는데, 그 뒤에 알리면 화면이 그동안 아무 이유 없이
+        멎어 있다. 소켓을 먼저 떼어 두면 라우트의 detach는 그대로 빠져나가고
+        (유예 타이머도 걸리지 않는다) 종료는 이 호출이 마저 끝낸다.
+        """
         ws = self.websocket
         self.websocket = None
         if ws is not None:
-            span = (
-                f"{self.idle_seconds // 60}분"
-                if self.idle_seconds >= 60
-                else f"{self.idle_seconds}초"
-            )
             try:
-                await ws.send_text(json.dumps({
-                    "type": "status",
-                    "message": f"{span} 동안 아무 움직임이 없어 세션을 종료했습니다.",
-                }))
-                await ws.close(code=IDLE_CLOSE_CODE, reason="유휴 상태로 종료됨")
+                await ws.send_text(json.dumps({"type": "status", "message": message}))
+                await ws.close(code=code, reason=reason)
             except Exception:
                 pass  # 이미 끊긴 소켓. 라우트 쪽 finally가 정리한다
         await self.terminate()
@@ -508,6 +545,14 @@ class SessionManager:
         if s is not None and not s.alive:
             del self.sessions[project_name]
             return None
+        # 종료 중인 세션은 라이브가 아니다. 유예가 만료된 뒤 SIGTERM_WAIT초 동안은
+        # alive가 아직 True인데, 그때 재접속을 붙여주면 곧 죽을 PTY에 화면을
+        # 물려주게 된다 (fd가 정리되는 순간 아무 알림 없이 멎는다). 여기서 없는
+        # 것으로 답하면 라우트는 새 세션을 띄우고, 이는 "유예가 지났으면 그 세션은
+        # 끝난 것"이라는 규칙과도 맞는다. 맵에서 지우지는 않는다 — 종료를 시작한
+        # 쪽이 자기가 넣은 항목인지 확인하고 지운다.
+        if s is not None and s.terminating:
+            return None
         return s
 
     async def start(
@@ -531,6 +576,23 @@ class SessionManager:
         session.spawn(extra_args)
         self.sessions[project_name] = session
         return session
+
+    async def end(self, project_name: str) -> bool:
+        """라이브 세션을 즉시 종료한다. 끝낼 것이 있었으면 True.
+
+        유예 타이머를 먼저 끊는다 — 소켓이 이미 떨어진 세션이면 그쪽도 곧
+        terminate를 부르고, 둘이 겹치면 죽은 pid를 두 번 거두게 된다.
+        """
+        session = self.get_live(project_name)
+        if session is None:
+            return False
+        session.cancel_grace()
+        await session.end_now()
+        # terminate는 SIGTERM_WAIT까지 걸린다. 그 사이 같은 키로 새 세션이 떴다면
+        # 맵에 있는 것은 더 이상 우리가 끝낸 세션이 아니다.
+        if self.sessions.get(project_name) is session:
+            del self.sessions[project_name]
+        return True
 
     async def shutdown(self) -> None:
         # 세션마다 SIGTERM 후 최대 SIGTERM_WAIT초를 기다리므로 순차로 돌리면

@@ -199,6 +199,27 @@ def test_audit_records_rejected_websocket(start_server):
         assert f"ws-reject reason={reason}" in audit_log(h), reason
 
 
+def test_audit_folds_repeated_pre_auth_rejections(start_server):
+    """인증 전 거절은 인증 없는 상대가 마음대로 늘릴 수 있다.
+
+    감사 파일은 크기 상한 없이 날짜로만 로테이션하므로(setup_logging), 거절 한 번에
+    한 줄이면 초당 수천 번 거절당하는 것만으로 디스크가 찬다 — 로그인 시도 제한이
+    막아둔 것과 같은 구멍이 라우트 앞단에 남는 셈이다. 같은 (주소, 사유)는 창당 한
+    줄로 접되, 첫 줄은 반드시 남아야 한다(접는 것이 지우는 것이 되면 안 된다).
+    """
+    h = start_server()
+    anon = h.client(headers={"Origin": h.origin})  # 토큰 없음 = 인증 전 거절
+    before = len(audit_log(h).splitlines())
+    for _ in range(20):
+        assert anon.post("/api/session/end?project=demo&agent=shell").status_code == 401
+
+    added = [
+        line for line in audit_log(h).splitlines()[before:]
+        if "session-end-reject reason=unauthorized" in line
+    ]
+    assert len(added) == 1, f"20번 거절에 {len(added)}줄이 남았다"
+
+
 def test_audit_rejects_forged_lines_from_query(start_server):
     """감사 기록에 줄을 심을 수 있으면 이 파일의 존재 이유가 무너진다.
 

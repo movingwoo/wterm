@@ -12,6 +12,10 @@
     <h1>W-Term</h1>
     <div id="project-list"></div>
     <div id="conn-status" class="disconnected">연결 안 됨</div>
+    <!-- 권한 요청은 클릭에서만 띄운다. Safari는 사용자 제스처 없는
+         Notification.requestPermission()을 아예 거부하고, 다른 브라우저도
+         묻지 않은 요청은 조용히 차단하는 쪽으로 기운다. -->
+    <button id="notify-btn" type="button" hidden>알림 켜기</button>
     <button id="logout-btn" type="button">로그아웃</button>
   </aside>
   <button id="sidebar-toggle" type="button" aria-controls="sidebar"
@@ -21,8 +25,11 @@
     </svg>
   </button>
   <main id="terminal-pane">
-    <div id="terminal"></div>
-    <div id="placeholder">좌측에서 프로젝트를 선택하세요.</div>
+    <!-- 창(pane)은 app.js가 만든다. 큰 화면에서는 최대 둘까지 좌우로 나뉘고,
+         창마다 자기 탭 줄과 터미널 더미를 가진다. -->
+    <div id="panes"></div>
+    <!-- 폰 소프트 키보드에 없는 키들. 버튼은 app.js가 채운다. -->
+    <div id="key-bar" role="toolbar" aria-label="터미널 특수키"></div>
   </main>
   <div id="login-overlay">
     <form id="login-form">

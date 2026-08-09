@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import pwd
+import threading
 import time
 
 import pytest
@@ -29,9 +30,25 @@ def ws_connect(h, path: str, *, token: str | None = None, origin: str | None = "
     return connect(f"{h.ws_url}{path}", additional_headers=headers, open_timeout=15)
 
 
+# 재접속에서 replay 버퍼(바이너리)는 status 텍스트보다 **먼저** 도착한다 — 라우트가
+# attach()로 버퍼를 흘려보낸 뒤에 status를 보내기 때문이다. status_message가 그 사이의
+# 바이너리를 그냥 버리면 뒤따르는 recv_until은 이미 지나간 출력을 기다리다 타임아웃한다.
+# 재접속이 빠르면 버퍼가 거의 비어 있어 드러나지 않지만(그래서 오래 안 보였다), 로그아웃
+# 왕복처럼 시간이 걸리면 세션 출력 전체가 한 프레임에 실려 사라진다. 건너뛴 출력은
+# 소켓에 달아 두고 다음 recv_until이 먼저 소비한다.
+
+
+def _take_skipped(ws) -> str:
+    seen = getattr(ws, "_skipped_output", "")
+    ws._skipped_output = ""
+    return seen
+
+
 def recv_until(ws, marker: str, timeout: float = RECV_TIMEOUT) -> str:
     """마커가 나올 때까지 터미널 출력을 모은다. JSON 텍스트 메시지는 건너뛴다."""
-    seen = ""
+    seen = _take_skipped(ws)
+    if marker in seen:
+        return seen
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         msg = ws.recv(timeout=max(0.1, deadline - time.monotonic()))
@@ -76,7 +93,8 @@ def end_shell(ws, timeout: float = RECV_TIMEOUT) -> None:
 
 def status_message(ws) -> str:
     msg = ws.recv(timeout=RECV_TIMEOUT)
-    while isinstance(msg, bytes):  # 셸이 먼저 출력하는 경우가 있다
+    while isinstance(msg, bytes):  # 셸 출력이나 replay 버퍼가 먼저 오는 경우
+        ws._skipped_output = _take_skipped(ws) + msg.decode("utf-8", "replace")
         msg = ws.recv(timeout=RECV_TIMEOUT)
     payload = json.loads(msg)
     assert payload["type"] == "status"
@@ -344,6 +362,119 @@ def _read_pid(path, timeout: float = 20.0) -> int:
         except (OSError, ValueError):
             time.sleep(0.1)
     raise AssertionError(f"셸이 {timeout}초 안에 {path}를 쓰지 않았다")
+
+
+# ── 명시적 종료 ──────────────────────────────────────────────────────
+
+
+def test_end_session_kills_the_child_and_closes_with_4409(start_server, project_dir):
+    """탭을 닫는 것은 종료가 아니라 분리다(그래야 다시 열 때 화면이 복원된다).
+    세션을 실제로 끝내는 경로는 이것뿐이므로, 소켓만 닫고 프로세스가 남으면
+    버튼이 거짓말을 하는 셈이 된다.
+
+    4409로 닫는 이유는 4408과 같다 — 평범한 단절로 보이면 app.js의 자동 재연결이
+    방금 끝낸 세션을 곧바로 새로 띄운다.
+    """
+    pid_marker = project_dir / "end-shell.pid"  # 셸의 cwd는 프로젝트 경로다
+    pid_marker.unlink(missing_ok=True)
+
+    h = start_server()
+    token = h.login()
+    c = h.client(headers={"Origin": h.origin, "Cookie": f"wterm_token={token}"})
+
+    with ws_connect(h, "/ws/demo?agent=shell", token=token) as ws:
+        status_message(ws)
+        send_line(ws, f"echo $$ > {pid_marker.name}")
+        recv_until(ws, pid_marker.name)
+        child_pid = _read_pid(pid_marker)
+
+        # 대화형 bash는 SIGTERM을 무시하므로 이 호출은 SIGKILL까지 기다린다.
+        r = c.post("/api/session/end?project=demo&agent=shell", timeout=40.0)
+        assert r.status_code == 200, r.text
+        assert r.json()["ended"] is True
+
+        with pytest.raises(ConnectionClosed) as exc:
+            while True:
+                ws.recv(timeout=RECV_TIMEOUT)
+    assert exc.value.rcvd.code == 4409
+
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+    (demo,) = c.get("/api/projects").json()
+    assert demo["shell_live"] is False
+
+    # 끝낼 것이 없어도 200이다 — 누른 사람이 원한 상태가 이미 그것이다.
+    assert c.post("/api/session/end?project=demo&agent=shell").json()["ended"] is False
+
+
+def test_a_terminating_session_is_not_live(start_server, project_dir):
+    """종료가 끝나기 전까지 그 세션은 라이브가 아니다.
+
+    대화형 bash는 SIGTERM을 무시해서 SIGKILL까지 SIGTERM_WAIT초가 걸린다. 그동안
+    `alive`는 아직 True인데, 그 상태를 라이브로 내주면 두 가지가 깨진다: 사이드바
+    배지가 곧 사라질 세션을 켜 두고, attach가 죽어가는 PTY에 화면을 물려준다
+    (fd가 정리되는 순간 아무 알림 없이 멎는다).
+
+    같은 창이 유예 만료 직후에도 열린다 — 그 경로는 재현이 비싸서 여기서는 명시적
+    종료로 같은 상태를 만든다.
+    """
+    h = start_server()
+    token = h.login()
+    c = h.client(headers={"Origin": h.origin, "Cookie": f"wterm_token={token}"})
+
+    with ws_connect(h, "/ws/demo?agent=shell", token=token) as ws:
+        status_message(ws)
+        send_line(ws, "true")
+        recv_until(ws, "true")
+
+    end = threading.Thread(
+        target=lambda: c.post("/api/session/end?project=demo&agent=shell", timeout=40.0)
+    )
+    end.start()
+    # 첫 조회가 POST보다 먼저 서버에 닿을 수 있으므로 "언제나 False"로는 못 쓴다.
+    # 판정은 **종료가 끝나기 전에** 라이브가 꺼지는가다: 고치기 전에는 SIGKILL로
+    # 자식이 거둬질 때까지 계속 True라 이 창 안에서 한 번도 False를 못 본다.
+    went_down_while_ending = False
+    try:
+        deadline = time.monotonic() + 30
+        while end.is_alive() and time.monotonic() < deadline:
+            (demo,) = c.get("/api/projects").json()
+            if demo["shell_live"] is False:
+                went_down_while_ending = True
+                break
+            time.sleep(0.1)
+    finally:
+        end.join(timeout=40)
+    assert went_down_while_ending, "종료가 끝날 때까지 세션이 라이브로 남아 있었다"
+
+    (demo,) = c.get("/api/projects").json()
+    assert demo["shell_live"] is False
+
+
+def test_end_session_checks_origin_before_auth_before_whitelist(start_server):
+    """상태를 바꾸는 POST라 /api/logout과 같은 검사를 받아야 한다.
+
+    Origin을 보지 않으면 사용자가 방문한 아무 페이지의 fetch 한 줄로 남의 세션이
+    끊긴다. 인증을 화이트리스트보다 먼저 보는 것도 WS 라우트와 같은 이유다 —
+    순서가 반대면 인증 없는 상대가 404/400 여부로 어떤 프로젝트가 있는지 떠본다.
+    """
+    h = start_server()
+    token = h.login()
+    url = "/api/session/end?project=demo&agent=shell"
+
+    cookie = f"wterm_token={token}"
+    evil = h.client(headers={"Origin": "https://evil.example", "Cookie": cookie})
+    assert evil.post(url).status_code == 403
+    no_origin = h.client(headers={"Cookie": cookie})  # 브라우저가 보낸 것이 아니다
+    assert no_origin.post(url).status_code == 403
+
+    anon = h.client()  # Origin은 맞지만 토큰이 없다
+    assert anon.post(url).status_code == 401
+    assert anon.post("/api/session/end?project=nope&agent=shell").status_code == 401
+
+    good = h.client(headers={"Origin": h.origin, "Cookie": cookie})
+    assert good.post("/api/session/end?project=nope&agent=shell").status_code == 404
+    assert good.post("/api/session/end?project=demo&agent=bogus").status_code == 400
 
 
 def test_agents_have_independent_sessions(start_server):
