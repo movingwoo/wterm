@@ -10,6 +10,8 @@
 
 ## [미출시]
 
+## [1.1.0] — 2026-08-09
+
 - 세션 탭. 여러 세션을 동시에 열어두고 전환한다 (프론트엔드 전용, 프로토콜 변경 없음).
 - 좌우 2분할. 넓은 화면에서 두 세션을 동시에 본다. 좁아지면 자동으로 합쳐진다.
 - 모바일 키 바. 폰 소프트 키보드에 없는 Esc·Tab·Ctrl·방향키를 터미널 아래에서 보낸다.
@@ -29,5 +31,6 @@ ssh 원격 프로젝트, 자체 HTTPS(무중단 인증서 리로드), 부팅 자
 서버가 판정하는 토큰 만료와 즉시 로그아웃, CSP를 포함한 응답 헤더, 90일 감사 로그
 (터미널 내용은 남기지 않음), 선택적 유휴 세션 종료.
 
-[미출시]: https://github.com/movingwoo/wterm/compare/v1.0.0...main
+[미출시]: https://github.com/movingwoo/wterm/compare/v1.1.0...main
+[1.1.0]: https://github.com/movingwoo/wterm/releases/tag/v1.1.0
 [1.0.0]: https://github.com/movingwoo/wterm/releases/tag/v1.0.0
