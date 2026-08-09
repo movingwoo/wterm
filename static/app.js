@@ -14,6 +14,7 @@
   const loginErrorEl = document.getElementById("login-error");
   const logoutBtnEl = document.getElementById("logout-btn");
   const notifyBtnEl = document.getElementById("notify-btn");
+  const themePickerEl = document.getElementById("theme-picker");
 
   const AGENT_LABEL = { claude: "Claude", codex: "Codex", shell: "셸" };
   const BASE_TITLE = document.title;
@@ -182,6 +183,97 @@
     setSidebarCollapsed(sidebarCollapsed, true);
   });
 
+  // ── 테마 ───────────────────────────────────────────────────────────
+  //
+  // 셋 중 하나다: "system"(기본) · "light" · "dark". 색은 전부 style.css의 토큰이
+  // 들고 있고 여기서 하는 일은 html의 data-theme를 바꾸는 것뿐이다 — system이면
+  // 속성을 아예 지워 prefers-color-scheme이 정하게 둔다.
+  //
+  // 예외가 하나 있다: xterm은 CSS를 읽지 않으므로 터미널 안쪽 색만은 JS가 넣어야
+  // 한다. 팔레트를 여기에 한 벌 더 적으면 두 곳이 어긋나므로, 같은 토큰
+  // (--term-*)을 계산된 스타일에서 읽어 쓴다.
+
+  const themeStorageKey = "wterm.theme";
+  const THEMES = [["system", "시스템"], ["light", "라이트"], ["dark", "다크"]];
+  const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
+
+  let theme = "system";
+  try {
+    const saved = localStorage.getItem(themeStorageKey);
+    if (THEMES.some(([v]) => v === saved)) theme = saved;
+  } catch {
+    // 저장소가 막혀 있으면 이번 세션 동안만 유지된다.
+  }
+
+  // xterm ITheme 키 ← CSS 토큰 이름. ANSI 16색까지 넘기는 이유는 라이트에서
+  // xterm 기본 팔레트를 그대로 쓰면 밝은 바탕에 밝은 글자가 되기 때문이다.
+  const TERM_COLORS = [
+    ["background", "bg"], ["foreground", "fg"], ["cursor", "cursor"],
+    ["black", "black"], ["red", "red"], ["green", "green"], ["yellow", "yellow"],
+    ["blue", "blue"], ["magenta", "magenta"], ["cyan", "cyan"], ["white", "white"],
+    ["brightBlack", "bright-black"], ["brightRed", "bright-red"],
+    ["brightGreen", "bright-green"], ["brightYellow", "bright-yellow"],
+    ["brightBlue", "bright-blue"], ["brightMagenta", "bright-magenta"],
+    ["brightCyan", "bright-cyan"], ["brightWhite", "bright-white"],
+  ];
+
+  function xtermTheme() {
+    const css = getComputedStyle(document.documentElement);
+    const out = {};
+    for (const [key, token] of TERM_COLORS) {
+      out[key] = css.getPropertyValue(`--term-${token}`).trim();
+    }
+    return out;
+  }
+
+  /** 지금 실제로 적용된 테마 ("system"을 풀어서). */
+  function resolvedTheme() {
+    if (theme !== "system") return theme;
+    return darkQuery.matches ? "dark" : "light";
+  }
+
+  // [W-Term] 안내 줄 색. 밝은 바탕에서 파스텔 256색은 거의 보이지 않는다.
+  function noticeSgr(kind) {
+    const light = resolvedTheme() === "light";
+    if (kind === "alert") return light ? "\x1b[38;5;125m" : "\x1b[38;5;210m";
+    return light ? "\x1b[38;5;92m" : "\x1b[38;5;183m";
+  }
+
+  function applyTheme() {
+    if (theme === "system") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", theme);
+    for (const btn of themePickerEl.children) {
+      btn.setAttribute("aria-pressed", String(btn.dataset.theme === theme));
+    }
+    // 열려 있는 터미널 전부. 배경색이 바뀌면 xterm은 스스로 다시 그린다.
+    const colors = xtermTheme();
+    for (const tab of allTabs()) tab.term.options.theme = colors;
+  }
+
+  for (const [value, label] of THEMES) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.dataset.theme = value;
+    btn.textContent = label;
+    btn.addEventListener("click", () => {
+      theme = value;
+      try {
+        localStorage.setItem(themeStorageKey, value);
+      } catch {
+        /* 저장소가 막혀 있어도 이번 세션 동안은 바뀐 채로 남는다 */
+      }
+      applyTheme();
+    });
+    themePickerEl.appendChild(btn);
+  }
+
+  // 시스템 모드일 때만 OS 설정 변화를 따라간다. 못박아 둔 쪽은 그대로 둬야 한다.
+  darkQuery.addEventListener("change", () => {
+    if (theme === "system") applyTheme();
+  });
+
+  applyTheme();
+
   // ── 모바일 키 바 ───────────────────────────────────────────────────
   //
   // 폰 소프트 키보드에는 Esc·Tab·Ctrl·방향키가 없다. Claude Code TUI는 Esc(중단)와
@@ -263,16 +355,24 @@
     keyBarEl.appendChild(btn);
   }
 
-  // ── 벨 알림 ────────────────────────────────────────────────────────
+  // ── 대기 알림 ──────────────────────────────────────────────────────
   //
   // "노트북 덮고 나갔다 돌아온다"가 이 도구의 용도인데, Claude가 질문을 띄우고
   // 멈춘 것을 알 방법이 없어 결국 주기적으로 들여다보게 된다. TUI가 사람을 부를 때
   // 내는 BEL을 잡아 탭과 문서 제목을 바꾸고, 권한이 있으면 알림까지 띄운다.
   //
   // 감지는 클라이언트에서 한다 — 서버는 터미널 내용을 들여다보지 않는다(AGENTS.md).
-  // 판정도 우리가 바이트를 뒤지는 대신 xterm 파서의 onBell에 맡긴다: 셸 프롬프트가
-  // 매번 내보내는 창 제목 시퀀스(OSC ... BEL)의 끝에도 BEL이 있어서, 직접 스캔하면
+  // 판정도 우리가 바이트를 뒤지는 대신 xterm 파서에 맡긴다: 셸 프롬프트가 매번
+  // 내보내는 창 제목 시퀀스(OSC ... BEL)의 끝에도 BEL이 있어서, 직접 스캔하면
   // 프롬프트가 뜰 때마다 오탐이 된다.
+  //
+  // 받는 경로는 둘이다. CLI마다 사람을 부르는 방식이 다르기 때문이다:
+  //   - BEL(`\a`) → term.onBell. Claude Code의 terminal_bell 채널.
+  //   - OSC 9 → 아래 registerOscHandler(9). Codex의 tui.notifications와
+  //     Claude Code의 iterm2 채널이 쓰는 형식이다. 끝이 BEL이라 겉보기에는
+  //     비슷하지만 파서는 이것을 OSC 문자열로 먹으므로 onBell이 뜨지 않는다 —
+  //     바로 위에서 "직접 스캔하면 오탐"이라고 한 그 시퀀스다.
+  // 채널을 켜는 것은 server/session.py의 _agent_cmd가 세션마다 해 준다.
   //
   // 한계: 탭이 열려 있어야만 동작한다. 진짜 푸시는 서비스 워커와 푸시 서버가
   // 필요하고, 그건 이 서버의 무상태 설계와 맞지 않는다.
@@ -607,11 +707,7 @@
       fontSize: 14,
       cursorBlink: true,
       scrollback: 5000,
-      theme: {
-        background: "#1e1e2e",
-        foreground: "#cdd6f4",
-        cursor: "#cba6f7",
-      },
+      theme: xtermTheme(),
     });
     const fitAddon = new FitAddon.FitAddon();
     term.loadAddon(fitAddon);
@@ -684,8 +780,14 @@
     });
     closeEl.addEventListener("click", () => closeTab(tab));
     term.onData((data) => sendJson(tab, { type: "input", data: applyCtrl(data) }));
-    // BEL 판정은 xterm 파서가 한다 — 위 "벨 알림" 주석 참고.
+    // 부름 판정은 xterm 파서가 한다 — 위 "대기 알림" 주석 참고.
     term.onBell(() => onBell(tab));
+    // OSC 9은 데스크톱 알림 문자열이다. false를 돌려주면 xterm이 원래 하던
+    // 처리(모르는 시퀀스는 무시)를 마저 하므로 화면에는 아무 영향이 없다.
+    term.parser.registerOscHandler(9, () => {
+      onBell(tab);
+      return false;
+    });
 
     tab.pane = pane;
     pane.tabs.push(tab);
@@ -822,11 +924,11 @@
       if (typeof ev.data === "string") {
         const msg = JSON.parse(ev.data);
         if (msg.type === "status") {
-          tab.term.write(`\r\n\x1b[38;5;183m[W-Term] ${msg.message}\x1b[0m\r\n`);
+          tab.term.write(`\r\n${noticeSgr("info")}[W-Term] ${msg.message}\x1b[0m\r\n`);
         } else if (msg.type === "exit") {
           tab.intentionalClose = true;
           tab.term.write(
-            `\r\n\x1b[38;5;210m[W-Term] 세션이 종료되었습니다 (exit=${msg.code}).\x1b[0m\r\n`
+            `\r\n${noticeSgr("alert")}[W-Term] 세션이 종료되었습니다 (exit=${msg.code}).\x1b[0m\r\n`
           );
         }
       } else {
@@ -853,13 +955,13 @@
       ) {
         setTabStatus(tab, "disconnected", "연결 종료");
         if (ev.code === 4000)
-          tab.term.write("\r\n\x1b[38;5;210m[W-Term] 다른 클라이언트가 연결하여 종료되었습니다.\x1b[0m\r\n");
+          tab.term.write(`\r\n${noticeSgr("alert")}[W-Term] 다른 클라이언트가 연결하여 종료되었습니다.\x1b[0m\r\n`);
         if (ev.code === 4401) showLogin("인증이 만료되었습니다. 다시 로그인하세요.");
         // 4408(유휴 종료)·4409(사용자 종료)에서 재연결하면 방금 정리한 세션이
         // 곧바로 다시 뜬다. 사유는 서버가 닫기 직전 보낸 status 메시지에 이미
         // 찍혀 있다. 나머지는 재연결해봐야 같은 이유로 거절당하는 설정 문제다.
         if (ev.code === 4404 || ev.code === 4400)
-          tab.term.write(`\r\n\x1b[38;5;210m[W-Term] 연결이 거절되었습니다: ${ev.reason || ev.code}\x1b[0m\r\n`);
+          tab.term.write(`\r\n${noticeSgr("alert")}[W-Term] 연결이 거절되었습니다: ${ev.reason || ev.code}\x1b[0m\r\n`);
         return;
       }
       // 비정상 단절: 자동 재연결 (라이브 세션이면 재접속, 아니면 claude -c로 최근 세션 이어하기)
@@ -1009,6 +1111,7 @@
         }
 
         const newBtn = document.createElement("button");
+        newBtn.className = "new"; // 카드 그리드에서 3번 칸을 잡는 표식
         newBtn.textContent = "새 세션";
         newBtn.onclick = () => {
           if (live && !confirm(`'${p.name}'의 실행 중인 ${label} 세션을 종료하고 새로 시작할까요?`)) return;
