@@ -38,8 +38,8 @@
   const panes = [];
   let focusedPane = null;
   let lastProjects = [];
-  // 종료 요청이 나가 있는 세션 키(`<project>#<agent>`). 셸은 SIGTERM을 무시해서
-  // 응답까지 10초 가까이 걸리는데, 그 사이 폴링이 목록을 다시 그린다.
+  // 종료 요청이 나가 있는 세션 키(`<project>#<agent>`). 응답이 오기 전에 10초
+  // 폴링이 목록을 통째로 다시 그리므로, 진행 중 상태를 버튼에 두면 지워진다.
   const endingKeys = new Set();
 
   function setStatus(cls, text) {
@@ -205,8 +205,8 @@
     // 저장소가 막혀 있으면 이번 세션 동안만 유지된다.
   }
 
-  // xterm ITheme 키 ← CSS 토큰 이름. ANSI 16색까지 넘기는 이유는 라이트에서
-  // xterm 기본 팔레트를 그대로 쓰면 밝은 바탕에 밝은 글자가 되기 때문이다.
+  // xterm ITheme 키 ← CSS 토큰 이름. ANSI 16색은 라이트에만 정의돼 있고 다크에서는
+  // 비어 있다 — 비면 아래에서 키째 빠져 xterm 기본 팔레트가 쓰인다.
   const TERM_COLORS = [
     ["background", "bg"], ["foreground", "fg"], ["cursor", "cursor"],
     ["black", "black"], ["red", "red"], ["green", "green"], ["yellow", "yellow"],
@@ -221,7 +221,10 @@
     const css = getComputedStyle(document.documentElement);
     const out = {};
     for (const [key, token] of TERM_COLORS) {
-      out[key] = css.getPropertyValue(`--term-${token}`).trim();
+      // 정의되지 않은 토큰은 키째 뺀다. 그러면 xterm이 자기 기본값을 쓴다 —
+      // 다크의 ANSI 16색이 그 경우다(style.css의 --term-* 주석 참고).
+      const value = css.getPropertyValue(`--term-${token}`).trim();
+      if (value) out[key] = value;
     }
     return out;
   }
@@ -1055,19 +1058,25 @@
         const key = `${p.name}#${agent}`;
         const btn = document.createElement("button");
         btn.className = "end";
-        btn.title = `실행 중인 ${label} 세션을 종료합니다`;
+        btn.title = endingKeys.has(key)
+          ? `${label} 세션을 종료하는 중입니다`
+          : `실행 중인 ${label} 세션을 종료합니다`;
         // 진행 중 상태는 버튼이 아니라 endingKeys가 들고 있다 — 목록은 10초마다
         // 통째로 다시 그려지므로 버튼에만 담아두면 그때 지워진다.
+        // 진행 중 표시는 "종료"와 **같은 폭**이어야 한다. 더 긴 글자를 넣으면
+        // 그 순간 줄 전체가 다시 배분되어 옆 버튼들이 두 줄로 접힌다.
         const ending = endingKeys.has(key);
-        btn.textContent = ending ? "종료 중…" : "종료";
+        btn.textContent = ending ? "…" : "종료";
         btn.disabled = ending;
+        btn.setAttribute("aria-busy", String(ending));
         btn.onclick = async () => {
           if (!confirm(`'${p.name}'의 실행 중인 ${label} 세션을 종료할까요?`)) return;
           // 대화형 셸은 SIGTERM을 무시해서 SIGKILL까지 시간이 걸린다. 그동안
           // 아무 표시가 없으면 버튼이 먹지 않은 것으로 보인다.
           endingKeys.add(key);
           btn.disabled = true;
-          btn.textContent = "종료 중…";
+          btn.textContent = "…";
+          btn.setAttribute("aria-busy", "true");
           try {
             const res = await fetch(
               `/api/session/end?project=${encodeURIComponent(p.name)}` +
@@ -1111,7 +1120,6 @@
         }
 
         const newBtn = document.createElement("button");
-        newBtn.className = "new"; // 카드 그리드에서 3번 칸을 잡는 표식
         newBtn.textContent = "새 세션";
         newBtn.onclick = () => {
           if (live && !confirm(`'${p.name}'의 실행 중인 ${label} 세션을 종료하고 새로 시작할까요?`)) return;
@@ -1119,7 +1127,12 @@
         };
         row.append(labelEl, resumeBtn, newBtn);
         const endBtn = makeEndButton(agent, label, live);
-        if (endBtn) row.appendChild(endBtn);
+        // has-end는 네 번째 칸을 여는 표식이다. 종료 버튼이 없는 줄에까지 칸을
+        // 열어두면 그 앞의 간격만큼 오른쪽 끝이 어긋난다 (style.css 주석 참고).
+        if (endBtn) {
+          row.appendChild(endBtn);
+          row.classList.add("has-end");
+        }
         return row;
       }
       actions.append(
@@ -1149,7 +1162,10 @@
       shellLabel.textContent = "Shell";
       shellRow.append(shellLabel, shellBtn);
       const endShellBtn = makeEndButton("shell", "셸", p.shell_live);
-      if (endShellBtn) shellRow.appendChild(endShellBtn);
+      if (endShellBtn) {
+        shellRow.appendChild(endShellBtn);
+        shellRow.classList.add("has-end");
+      }
       actions.append(shellRow);
       card.append(nameEl, pathEl, actions);
       projectListEl.appendChild(card);

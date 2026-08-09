@@ -43,27 +43,16 @@
   --shadow: rgba(17, 17, 27, 0.35);
 
   /* xterm은 CSS를 읽지 않는다. app.js가 이 토큰들을 읽어 term.options.theme에
-     넣는다. ANSI 16색까지 두는 이유는 라이트에서 xterm 기본 팔레트를 그대로
-     쓰면 밝은 바탕에 밝은 글자가 되어 TUI가 읽히지 않기 때문이다. */
+     넣는다.
+
+     다크에서 ANSI 16색은 **일부러 비워 둔다.** 비어 있으면 app.js가 그 키를
+     빼고 넘기고, xterm은 자기 기본 팔레트를 쓴다 — 이 앱이 처음부터 쓰던 색이다.
+     여기에 Mocha 팔레트를 깔면 터미널 안 색이 통째로 바뀐다(그렇게 해 봤고,
+     기존 쪽이 낫다). 라이트에만 채워 넣는 이유는 xterm 기본값이 어두운 바탕을
+     전제해서, 밝은 바탕에서는 밝은 글자가 되어 TUI가 안 읽히기 때문이다. */
   --term-bg: #1e1e2e;
   --term-fg: #cdd6f4;
   --term-cursor: #cba6f7;
-  --term-black: #45475a;
-  --term-red: #f38ba8;
-  --term-green: #a6e3a1;
-  --term-yellow: #f9e2af;
-  --term-blue: #89b4fa;
-  --term-magenta: #f5c2e7;
-  --term-cyan: #94e2d5;
-  --term-white: #bac2de;
-  --term-bright-black: #585b70;
-  --term-bright-red: #f38ba8;
-  --term-bright-green: #a6e3a1;
-  --term-bright-yellow: #f9e2af;
-  --term-bright-blue: #89b4fa;
-  --term-bright-magenta: #f5c2e7;
-  --term-bright-cyan: #94e2d5;
-  --term-bright-white: #a6adc8;
 }
 
 /* 시스템 설정이 라이트일 때. 다크로 못박아 둔 경우는 건드리지 않는다. */
@@ -302,29 +291,33 @@ body.sidebar-collapsed #sidebar-toggle svg { transform: rotate(180deg); }
   border-color: var(--warn);
 }
 
-/* 열은 카드 전체가 공유한다 — 줄마다 그리드를 따로 두면 같은 열이 줄마다 다른
-   폭으로 풀린다. 마지막 auto 칸("종료")은 라이브인 줄에만 버튼이 생기므로,
-   줄이 각자 그리드였을 때는 Claude만 살아 있으면 그 줄만 종료 버튼 폭만큼
-   좁아지고 셸 줄의 버튼은 그만큼 더 늘어났다. 지금은 세 줄이 한 열 세트를
-   쓰므로 어느 줄이 라이브든 버튼 오른쪽 끝이 맞는다. 종료 버튼이 하나도
-   없으면 그 칸은 폭 0으로 접힌다. */
-.project .actions {
+/* 맞춰야 하는 것은 **줄의 오른쪽 끝**이다. 줄마다 자기 그리드를 갖고 저마다
+   카드 폭을 꽉 채우므로, 어느 줄이 라이브든 버튼의 오른쪽 끝은 늘 같은 자리다.
+
+   한 벌의 열을 세 줄이 나눠 쓰게 해 봤다가 되돌린 것이다. 그러면 열 경계까지
+   맞지만, 마지막 칸("종료")은 라이브인 줄에만 버튼이 생기는 자리라 라이브인 줄이
+   하나라도 있으면 **모든** 줄이 그 폭을 내준다 — Claude만 살아 있을 때 셸 줄까지
+   덩달아 좁아지고, "이어하기"가 두 줄로 접혔다. 열 경계보다 오른쪽 끝이 맞는
+   쪽이 눈에 띄고, 이쪽은 줄바꿈도 나지 않는다.
+
+   `has-end`는 종료 버튼이 있는 줄에만 붙는다(app.js). 네 번째 칸을 늘 선언해
+   두면 버튼이 없는 줄에서도 그 앞의 간격 5px이 남아 오른쪽 끝이 그만큼 어긋난다.
+   `:has()` 대신 클래스를 쓰는 이유는 지원 여부에 기대지 않기 위해서다. */
+.project .actions { display: flex; flex-direction: column; gap: 6px; }
+
+.project .agent-row {
   display: grid;
-  grid-template-columns: 48px 1fr 1fr auto;
-  gap: 6px 5px;
+  grid-template-columns: 48px minmax(0, 1fr) minmax(0, 1fr);
+  gap: 5px;
 }
 
-/* 줄은 묶음 역할만 하고 열 배치는 카드의 그리드가 맡는다. 자동 배치에 맡기지
-   않고 칸을 못박는 이유는 종료 버튼이 있는 줄과 없는 줄이 섞이기 때문이다 —
-   자동 배치면 버튼 셋짜리 줄 뒤로 다음 줄이 한 칸씩 밀려 들어간다.
-   (subgrid가 더 깔끔하지만, 지원하지 않는 브라우저에서 규칙이 통째로 버려져
-   버튼이 세로로 쌓이는 쪽으로 무너진다.) */
-.project .agent-row { display: contents; }
-.project .agent-row > button.primary { grid-column: 2; }
-.project .agent-row > button.new { grid-column: 3; }
-.project .agent-row > button.end { grid-column: 4; }
+/* minmax(0, …)은 버튼이 최소 콘텐츠 폭 아래로도 줄어들 수 있게 한다. 기본값인
+   1fr(= minmax(auto, 1fr))이면 줄이 카드를 넘쳐 종료 버튼이 밖으로 삐져나온다. */
+.project .agent-row.has-end {
+  grid-template-columns: 48px minmax(0, 1fr) minmax(0, 1fr) auto;
+}
+
 .project .agent-label {
-  grid-column: 1;
   align-self: center;
   font-size: 10px;
   font-weight: 600;
@@ -352,6 +345,8 @@ body.sidebar-collapsed #sidebar-toggle svg { transform: rotate(180deg); }
 /* 되돌릴 수 없는 동작이라 다른 버튼과 색으로 구분한다. */
 .project button.end {
   padding: 6px 7px;
+  /* 진행 중에는 "…" 한 글자가 되므로 폭을 고정한다 — 안 그러면 줄이 다시 배분된다. */
+  min-width: 3em;
   color: var(--danger);
 }
 .project button.end:hover:not(:disabled) { background: var(--surface-hover); color: var(--danger); }
