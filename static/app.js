@@ -19,6 +19,13 @@
   const AGENT_LABEL = { claude: "Claude", codex: "Codex", shell: "셸" };
   const BASE_TITLE = document.title;
 
+  // 맥에서는 복붙 수식키가 ⌘라 Ctrl이 통째로 터미널 몫이지만, 윈도우·리눅스에는 ⌘가
+  // 없어 브라우저 복붙과 터미널 제어문자가 같은 Ctrl을 두고 부딪친다 — createTab의
+  // 키 핸들러 주석 참고. userAgentData는 아직 없는 브라우저가 있어 platform으로 뒤를 받친다.
+  const IS_MAC = /mac|iphone|ipad/i.test(
+    navigator.userAgentData?.platform || navigator.platform || ""
+  );
+
   // 탭 하나 = 세션 하나(`<project>#<agent>`) = WebSocket 하나.
   //
   // 서버는 세션 키가 다르면 서로 완전히 독립이므로 탭 여러 개가 동시에 붙어 있어도
@@ -498,7 +505,21 @@
     const pane = { el, tabBarEl, actionsEl, splitEl, stackEl, tabs: [], activeTab: null };
     // 창 안 어디를 눌러도 그 창이 포커스를 가져간다. 키 바와 상태줄, 주소 해시가
     // 따라오므로 "지금 어느 창을 쓰고 있나"가 클릭 한 번으로 정해져야 한다.
-    el.addEventListener("pointerdown", () => focusPane(pane), true);
+    //
+    // 창의 포커스와 별개로 키보드 포커스도 터미널에 넘긴다. xterm은 자기 화면을
+    // 눌렀을 때만 textarea에 포커스를 주므로, term-host의 여백이나 마지막 행 아래
+    // 빈자리를 누르면 포커스가 직전 버튼이나 body에 남는다. 그 상태에서도 드래그
+    // 선택은 되지만(선택은 마우스 이벤트만 보고 포커스와 무관하다) 복사·붙여넣기는
+    // 조용히 안 된다 — copy/paste 이벤트가 포커스된 요소에서 올라오는데 그게
+    // 터미널 밖이면 xterm의 리스너에 닿지 않는다. 선택 하이라이트는 멀쩡히 보이니
+    // 원인을 짐작할 단서도 없다. 탭 줄의 버튼까지 뺏지 않도록 대상이 터미널 더미
+    // 안일 때만 옮긴다. 터치는 제외한다 — 스크롤하려고 짚은 손가락에 소프트
+    // 키보드가 올라온다.
+    el.addEventListener("pointerdown", (e) => {
+      focusPane(pane);
+      if (e.pointerType === "touch") return;
+      if (pane.activeTab && stackEl.contains(e.target)) pane.activeTab.term.focus();
+    }, true);
 
     panes.push(pane);
     panesEl.appendChild(el);
@@ -714,6 +735,41 @@
     });
     const fitAddon = new FitAddon.FitAddon();
     term.loadAddon(fitAddon);
+
+    // 윈도우·리눅스의 복사·붙여넣기.
+    //
+    // 터미널에서 Ctrl+C/Ctrl+V는 제어문자(\x03, \x16)이고 xterm은 기본값 그대로
+    // 그렇게 보낸다. 맥은 ⌘가 따로 있어 문제가 없지만, ⌘가 없는 쪽에서는 그 결과가
+    // "복붙이 아예 안 되는 터미널"이다.
+    //
+    // false를 돌려주면 xterm은 그 키를 처리하지도, preventDefault를 걸지도 않는다.
+    // 그래서 브라우저의 기본 복사/붙여넣기가 그대로 돌고, 붙여넣은 텍스트는 xterm이
+    // textarea에 걸어둔 paste 리스너로 되돌아온다 — 즉 bracketed paste 처리도
+    // 그대로다. 클립보드를 직접 읽지 않는 이유는 그래야 해서가 아니라 읽으면 안
+    // 돼서다. navigator.clipboard.readText()는 클립보드 읽기 권한을 이 페이지에
+    // 여는 것이고, 스크립트 주입이 곧 임의 명령 실행인 이 서버에서 주입된 코드에게
+    // 사용자의 클립보드까지 얹어줄 이유가 없다. 여기서 클립보드에 닿는 것은 브라우저
+    // 자신뿐이고, 이 코드가 하는 일은 키를 가로채지 않겠다고 말하는 것뿐이다.
+    //
+    // 잃는 것은 Ctrl+V의 원래 뜻인 readline quoted-insert(\x16)다. 이 도구를 쓰는
+    // 자리에서 복붙보다 그쪽이 급한 경우는 없다. Ctrl+Shift+V는 원래도 브라우저가
+    // 처리하던 경로라 그대로 남는다.
+    term.attachCustomKeyEventHandler((e) => {
+      if (IS_MAC || e.type !== "keydown") return true;
+      if (!e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return true;
+      const key = e.key.toLowerCase();
+      if (key === "v") return false;
+      // 선택이 없을 때의 Ctrl+C는 여전히 인터럽트다. 선택이 있을 때만 복사로
+      // 넘기고, 복사한 뒤에는 선택을 지운다 — 남겨두면 다음 Ctrl+C도 복사로
+      // 먹혀서 "인터럽트가 안 걸린다". 지우는 것을 미루는 것은 이 핸들러가
+      // 끝난 뒤에야 브라우저가 copy 이벤트를 띄우고, xterm이 그때 선택 내용을
+      // 읽어가기 때문이다.
+      if (key === "c" && term.hasSelection()) {
+        setTimeout(() => term.clearSelection(), 0);
+        return false;
+      }
+      return true;
+    });
 
     const hostEl = document.createElement("div");
     hostEl.className = "term-host";
