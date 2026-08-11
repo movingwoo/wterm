@@ -10,6 +10,8 @@
 
 ## [미출시]
 
+## [1.2.0] — 2026-08-11
+
 - 종료가 셸의 백그라운드 잡까지 정리한다. SIGHUP을 먼저 보내 `exit`과 같은 결과를 만든다 — 전에는 고아 프로세스가 남았고, 종료마다 10초가 걸렸다.
 - 대기 알림이 실제로 온다. Claude·Codex의 알림 채널을 세션마다 켜고, Codex가 쓰는 OSC 9도 받는다 (전에는 두 CLI 모두 wterm 안에서 조용했다).
 - 테마 (시스템·라이트·다크). 기본은 시스템 설정을 따라간다. 라이트는 작은 UI 글자와 ANSI 전경을 짙게 조정했고, 다크는 기존 색 그대로다.
@@ -39,6 +41,7 @@ ssh 원격 프로젝트, 자체 HTTPS(무중단 인증서 리로드), 부팅 자
 서버가 판정하는 토큰 만료와 즉시 로그아웃, CSP를 포함한 응답 헤더, 90일 감사 로그
 (터미널 내용은 남기지 않음), 선택적 유휴 세션 종료.
 
-[미출시]: https://github.com/movingwoo/wterm/compare/v1.1.0...main
+[미출시]: https://github.com/movingwoo/wterm/compare/v1.2.0...main
+[1.2.0]: https://github.com/movingwoo/wterm/releases/tag/v1.2.0
 [1.1.0]: https://github.com/movingwoo/wterm/releases/tag/v1.1.0
 [1.0.0]: https://github.com/movingwoo/wterm/releases/tag/v1.0.0
