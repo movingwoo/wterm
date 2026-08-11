@@ -9,7 +9,9 @@
    블록은 두 번 쓴다. 하나는 시스템이 라이트일 때(다크로 못박은 경우는 제외),
    하나는 사용자가 라이트로 못박았을 때. 어느 쪽이든 같은 토큰만 덮는다.
 
-   팔레트는 Catppuccin Mocha(다크) / Latte(라이트). */
+   다크는 기존 Catppuccin Mocha를 그대로 두고, 라이트는 Latte의 눈부심이
+   적은 배경을 유지하되 GitHub Light처럼 전경을 짙게 잡았다. 라이트의 작은
+   글자와 터미널 ANSI 16색은 배경과 4.5:1 이상 대비를 낸다. */
 
 :root {
   --sidebar-width: 240px;
@@ -67,16 +69,16 @@
     --surface-hover: #bcc0cc;
     --surface-active: #acb0be;
 
-    --text: #4c4f69;
-    --text-dim: #5c5f77;
-    --text-faint: #8c8fa1;
+    --text: #252a34;
+    --text-dim: #464d5c;
+    --text-faint: #626a78;
 
-    --accent: #8839ef;
-    --accent-alt: #7287fd;
-    --ok: #40a02b;
-    --warn: #b06e00;
-    --danger: #d20f39;
-    --info: #1e66f5;
+    --accent: #6f2dbd;
+    --accent-alt: #4356b3;
+    --ok: #2f741f;
+    --warn: #7a5200;
+    --danger: #b4233f;
+    --info: #1759b0;
 
     --ok-bg: #e0eeda;
     --warn-bg: #f6ebd8;
@@ -86,24 +88,25 @@
     --shadow: rgba(76, 79, 105, 0.2);
 
     --term-bg: #eff1f5;
-    --term-fg: #4c4f69;
-    --term-cursor: #8839ef;
-    --term-black: #5c5f77;
-    --term-red: #d20f39;
-    --term-green: #40a02b;
-    --term-yellow: #df8e1d;
-    --term-blue: #1e66f5;
-    --term-magenta: #ea76cb;
-    --term-cyan: #179299;
-    --term-white: #acb0be;
-    --term-bright-black: #6c6f85;
-    --term-bright-red: #d20f39;
-    --term-bright-green: #40a02b;
-    --term-bright-yellow: #df8e1d;
-    --term-bright-blue: #1e66f5;
-    --term-bright-magenta: #ea76cb;
-    --term-bright-cyan: #179299;
-    --term-bright-white: #bcc0cc;
+    --term-fg: #252a34;
+    --term-cursor: #6f2dbd;
+    --term-black: #252a34;
+    --term-red: #b4233f;
+    --term-green: #2f741f;
+    --term-yellow: #7a5200;
+    --term-blue: #1759b0;
+    --term-magenta: #73368f;
+    --term-cyan: #006b73;
+    /* 밝은 바탕에서 ANSI white는 흰색이 아니라 읽히는 회색 전경이다. */
+    --term-white: #515969;
+    --term-bright-black: #626a78;
+    --term-bright-red: #c1284b;
+    --term-bright-green: #357d26;
+    --term-bright-yellow: #8a5e00;
+    --term-bright-blue: #2465bd;
+    --term-bright-magenta: #8a439e;
+    --term-bright-cyan: #087780;
+    --term-bright-white: #252a34;
   }
 }
 
@@ -119,16 +122,16 @@
   --surface-hover: #bcc0cc;
   --surface-active: #acb0be;
 
-  --text: #4c4f69;
-  --text-dim: #5c5f77;
-  --text-faint: #8c8fa1;
+  --text: #252a34;
+  --text-dim: #464d5c;
+  --text-faint: #626a78;
 
-  --accent: #8839ef;
-  --accent-alt: #7287fd;
-  --ok: #40a02b;
-  --warn: #b06e00;
-  --danger: #d20f39;
-  --info: #1e66f5;
+  --accent: #6f2dbd;
+  --accent-alt: #4356b3;
+  --ok: #2f741f;
+  --warn: #7a5200;
+  --danger: #b4233f;
+  --info: #1759b0;
 
   --ok-bg: #e0eeda;
   --warn-bg: #f6ebd8;
@@ -138,24 +141,25 @@
   --shadow: rgba(76, 79, 105, 0.2);
 
   --term-bg: #eff1f5;
-  --term-fg: #4c4f69;
-  --term-cursor: #8839ef;
-  --term-black: #5c5f77;
-  --term-red: #d20f39;
-  --term-green: #40a02b;
-  --term-yellow: #df8e1d;
-  --term-blue: #1e66f5;
-  --term-magenta: #ea76cb;
-  --term-cyan: #179299;
-  --term-white: #acb0be;
-  --term-bright-black: #6c6f85;
-  --term-bright-red: #d20f39;
-  --term-bright-green: #40a02b;
-  --term-bright-yellow: #df8e1d;
-  --term-bright-blue: #1e66f5;
-  --term-bright-magenta: #ea76cb;
-  --term-bright-cyan: #179299;
-  --term-bright-white: #bcc0cc;
+  --term-fg: #252a34;
+  --term-cursor: #6f2dbd;
+  --term-black: #252a34;
+  --term-red: #b4233f;
+  --term-green: #2f741f;
+  --term-yellow: #7a5200;
+  --term-blue: #1759b0;
+  --term-magenta: #73368f;
+  --term-cyan: #006b73;
+  /* 밝은 바탕에서 ANSI white는 흰색이 아니라 읽히는 회색 전경이다. */
+  --term-white: #515969;
+  --term-bright-black: #626a78;
+  --term-bright-red: #c1284b;
+  --term-bright-green: #357d26;
+  --term-bright-yellow: #8a5e00;
+  --term-bright-blue: #2465bd;
+  --term-bright-magenta: #8a439e;
+  --term-bright-cyan: #087780;
+  --term-bright-white: #252a34;
 }
 
 html, body {
@@ -462,7 +466,7 @@ body.split #panes {
 }
 
 /* 세션이 하나도 없고 나뉘어 있지도 않으면 빈 줄을 띄우지 않는다. 나뉘어 있으면
-   빈 창에도 머리를 남긴다 — 창을 도로 합치는 ✕ 버튼이 거기 있다. */
+   빈 창에도 머리를 남긴다 — 창을 도로 합치는 버튼이 거기 있다. */
 body.session-open .pane-head,
 body.split .pane-head { display: flex; }
 
@@ -544,7 +548,7 @@ body.split .pane-head { display: flex; }
 /* 마지막으로 본 뒤 출력이 있었던 탭. 전환하지 않고도 어느 세션이 움직였는지 안다. */
 .tab.unread .tab-name { color: var(--accent); font-weight: 600; }
 
-/* 세션이 사람을 부른 탭(BEL). "출력이 있었다"(unread)보다 강한 신호라 배경까지
+/* 세션이 사람을 부른 탭(BEL 또는 OSC 9). "출력이 있었다"(unread)보다 강한 신호라 배경까지
    바꾼다 — 여러 탭이 unread인 상태에서 어느 쪽이 기다리는지 골라내야 한다. */
 .tab.bell { background: var(--warn-bg); border-color: var(--warn); }
 .tab.bell .tab-name { color: var(--warn); font-weight: 600; }

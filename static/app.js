@@ -754,10 +754,17 @@
     // 잃는 것은 Ctrl+V의 원래 뜻인 readline quoted-insert(\x16)다. 이 도구를 쓰는
     // 자리에서 복붙보다 그쪽이 급한 경우는 없다. Ctrl+Shift+V는 원래도 브라우저가
     // 처리하던 경로라 그대로 남는다.
+    //
+    // `key`는 현재 키보드 배열과 IME가 해석한 문자라 한글 입력 상태에서는 "c"/"v"가
+    // 아닐 수 있다. 데스크톱 단축키는 물리 키 위치인 `code`로 먼저 판별하고, code를
+    // 주지 않는 오래된 브라우저만 key로 받친다. 이 분기가 빠지면 xterm이 Ctrl+C/V를
+    // 다시 \x03/\x16으로 보내서 우클릭만 되고 키보드 복붙은 조용히 실패한다.
     term.attachCustomKeyEventHandler((e) => {
       if (IS_MAC || e.type !== "keydown") return true;
       if (!e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return true;
-      const key = e.key.toLowerCase();
+      const key = e.code === "KeyC" ? "c"
+        : e.code === "KeyV" ? "v"
+          : e.key.toLowerCase();
       if (key === "v") return false;
       // 선택이 없을 때의 Ctrl+C는 여전히 인터럽트다. 선택이 있을 때만 복사로
       // 넘기고, 복사한 뒤에는 선택을 지운다 — 남겨두면 다음 Ctrl+C도 복사로
@@ -1127,8 +1134,8 @@
         btn.setAttribute("aria-busy", String(ending));
         btn.onclick = async () => {
           if (!confirm(`'${p.name}'의 실행 중인 ${label} 세션을 종료할까요?`)) return;
-          // 대화형 셸은 SIGTERM을 무시해서 SIGKILL까지 시간이 걸린다. 그동안
-          // 아무 표시가 없으면 버튼이 먹지 않은 것으로 보인다.
+          // SIGHUP과 SIGTERM을 모두 무시하는 자식은 SIGKILL까지 시간이 걸린다.
+          // 그동안 아무 표시가 없으면 버튼이 먹지 않은 것으로 보인다.
           endingKeys.add(key);
           btn.disabled = true;
           btn.textContent = "…";

@@ -13,10 +13,43 @@ import threading
 import time
 
 import pytest
+from server.session import Session
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 from websockets.sync.client import connect
 
 RECV_TIMEOUT = 20.0
+
+
+@pytest.mark.parametrize(
+    ("agent", "extra_args", "expected"),
+    [
+        (
+            "claude",
+            ["--resume"],
+            [
+                "claude",
+                "--settings",
+                '{"preferredNotifChannel":"terminal_bell"}',
+                "--resume",
+            ],
+        ),
+        (
+            "codex",
+            ["resume", "--last"],
+            ["codex", "-c", "tui.notifications=true", "resume", "--last"],
+        ),
+    ],
+)
+def test_agent_commands_pin_notification_channel(agent, extra_args, expected):
+    """알림 플래그는 사용자 설정이 아니라 이 세션의 프로세스에만 붙는다.
+
+    둘 다 기본값으로는 wterm의 PTY 안에서 조용하므로 플래그 하나가 빠져도 기능
+    전체가 아무 표시 없이 사라진다. 새 세션뿐 아니라 resume 인자가 그 뒤에 그대로
+    보존되는지도 함께 고정한다.
+    """
+    session = object.__new__(Session)
+    session.agent = agent
+    assert session._agent_cmd(extra_args) == expected
 
 
 def ws_connect(h, path: str, *, token: str | None = None, origin: str | None = ""):
@@ -78,8 +111,8 @@ def send_line(ws, line: str) -> None:
 def end_shell(ws, timeout: float = RECV_TIMEOUT) -> None:
     """`exit`로 셸을 정상 종료시키고 exit 알림까지 확인한다.
 
-    정리 시간도 같이 줄어든다 — 대화형 bash는 SIGTERM을 무시하므로, 세션을
-    살려둔 채 서버를 내리면 종료 경로가 SIGKILL까지 SIGTERM_WAIT(10초)를 꽉 채운다.
+    테스트가 연 세션을 스스로 닫아 teardown을 일정하게 만들고, 시그널 종료가 아닌
+    정상 exit 알림 경로도 이곳에서 확인한다.
 
     `true`를 먼저 보내는 이유: 인자 없는 `exit`는 `$?`를 그대로 반환하는데, 그
     시점의 `$?`는 셸 시작 파일이 남긴 값이다. macOS `/etc/bashrc`의 마지막 줄이
@@ -341,7 +374,7 @@ def test_idle_session_is_closed_and_reaped(start_server, project_dir):
                     assert "종료" in payload["message"]
     assert exc.value.rcvd.code == 4408
 
-    # 대화형 bash는 SIGTERM을 무시하므로 SIGKILL까지 SIGTERM_WAIT(10초)가 걸린다.
+    # 기본 대화형 셸은 첫 SIGHUP에 끝나지만 전체 에스컬레이션 예산 안에서 회수돼야 한다.
     deadline = time.monotonic() + 25
     while time.monotonic() < deadline:
         try:
@@ -400,7 +433,7 @@ def test_end_session_kills_the_child_and_closes_with_4409(start_server, project_
         recv_until(ws, pid_marker.name)
         child_pid = _read_pid(pid_marker)
 
-        # 대화형 bash는 SIGTERM을 무시하므로 이 호출은 SIGKILL까지 기다린다.
+        # 응답은 프로세스 회수가 끝난 뒤에 온다. 기본 셸은 첫 SIGHUP에 끝난다.
         r = c.post("/api/session/end?project=demo&agent=shell", timeout=40.0)
         assert r.status_code == 200, r.text
         assert r.json()["ended"] is True

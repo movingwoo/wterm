@@ -58,11 +58,13 @@ def test_security_headers_cover_static_too(start_server):
         assert "camera=()" in r.headers["permissions-policy"], path
 
 
-def test_api_responses_are_not_stored(start_server):
+def test_cache_policy_separates_api_and_static(start_server):
     """/api/projects에는 프로젝트 이름과 로컬 경로가, /api/login에는 토큰 발급이
     실린다. 공유 기기의 브라우저 캐시에 남을 이유가 없다.
 
-    정적 자원까지 덮으면 xterm.js 사본을 매번 다시 받게 되므로 /api 아래만이다.
+    정적 자원은 사본을 버리는 no-store가 아니라, 쓰기 전에 서버에 재검증하는
+    no-cache다. 그래야 오래 열린 탭이 묵은 app.js를 계속 쓰지 않으면서 ETag가
+    맞을 때 290KB xterm.js 본문을 다시 받지도 않는다.
     """
     h = start_server()
     c = h.client()
@@ -70,7 +72,8 @@ def test_api_responses_are_not_stored(start_server):
         "cache-control"
     ] == "no-store"
     assert c.get("/api/projects").headers["cache-control"] == "no-store"
-    assert "no-store" not in c.get("/static/app.js").headers.get("cache-control", "")
+    assert c.get("/").headers["cache-control"] == "no-cache"
+    assert c.get("/static/app.js").headers["cache-control"] == "no-cache"
 
 
 def test_logout_clears_client_side_state(start_server):
