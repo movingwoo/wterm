@@ -14,9 +14,17 @@
   const loginErrorEl = document.getElementById("login-error");
   const logoutBtnEl = document.getElementById("logout-btn");
   const notifyBtnEl = document.getElementById("notify-btn");
+  const themePickerEl = document.getElementById("theme-picker");
 
   const AGENT_LABEL = { claude: "Claude", codex: "Codex", shell: "셸" };
   const BASE_TITLE = document.title;
+
+  // 맥에서는 복붙 수식키가 ⌘라 Ctrl이 통째로 터미널 몫이지만, 윈도우·리눅스에는 ⌘가
+  // 없어 브라우저 복붙과 터미널 제어문자가 같은 Ctrl을 두고 부딪친다 — createTab의
+  // 키 핸들러 주석 참고. userAgentData는 아직 없는 브라우저가 있어 platform으로 뒤를 받친다.
+  const IS_MAC = /mac|iphone|ipad/i.test(
+    navigator.userAgentData?.platform || navigator.platform || ""
+  );
 
   // 탭 하나 = 세션 하나(`<project>#<agent>`) = WebSocket 하나.
   //
@@ -37,8 +45,8 @@
   const panes = [];
   let focusedPane = null;
   let lastProjects = [];
-  // 종료 요청이 나가 있는 세션 키(`<project>#<agent>`). 셸은 SIGTERM을 무시해서
-  // 응답까지 10초 가까이 걸리는데, 그 사이 폴링이 목록을 다시 그린다.
+  // 종료 요청이 나가 있는 세션 키(`<project>#<agent>`). 응답이 오기 전에 10초
+  // 폴링이 목록을 통째로 다시 그리므로, 진행 중 상태를 버튼에 두면 지워진다.
   const endingKeys = new Set();
 
   function setStatus(cls, text) {
@@ -182,6 +190,100 @@
     setSidebarCollapsed(sidebarCollapsed, true);
   });
 
+  // ── 테마 ───────────────────────────────────────────────────────────
+  //
+  // 셋 중 하나다: "system"(기본) · "light" · "dark". 색은 전부 style.css의 토큰이
+  // 들고 있고 여기서 하는 일은 html의 data-theme를 바꾸는 것뿐이다 — system이면
+  // 속성을 아예 지워 prefers-color-scheme이 정하게 둔다.
+  //
+  // 예외가 하나 있다: xterm은 CSS를 읽지 않으므로 터미널 안쪽 색만은 JS가 넣어야
+  // 한다. 팔레트를 여기에 한 벌 더 적으면 두 곳이 어긋나므로, 같은 토큰
+  // (--term-*)을 계산된 스타일에서 읽어 쓴다.
+
+  const themeStorageKey = "wterm.theme";
+  const THEMES = [["system", "시스템"], ["light", "라이트"], ["dark", "다크"]];
+  const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
+
+  let theme = "system";
+  try {
+    const saved = localStorage.getItem(themeStorageKey);
+    if (THEMES.some(([v]) => v === saved)) theme = saved;
+  } catch {
+    // 저장소가 막혀 있으면 이번 세션 동안만 유지된다.
+  }
+
+  // xterm ITheme 키 ← CSS 토큰 이름. ANSI 16색은 라이트에만 정의돼 있고 다크에서는
+  // 비어 있다 — 비면 아래에서 키째 빠져 xterm 기본 팔레트가 쓰인다.
+  const TERM_COLORS = [
+    ["background", "bg"], ["foreground", "fg"], ["cursor", "cursor"],
+    ["black", "black"], ["red", "red"], ["green", "green"], ["yellow", "yellow"],
+    ["blue", "blue"], ["magenta", "magenta"], ["cyan", "cyan"], ["white", "white"],
+    ["brightBlack", "bright-black"], ["brightRed", "bright-red"],
+    ["brightGreen", "bright-green"], ["brightYellow", "bright-yellow"],
+    ["brightBlue", "bright-blue"], ["brightMagenta", "bright-magenta"],
+    ["brightCyan", "bright-cyan"], ["brightWhite", "bright-white"],
+  ];
+
+  function xtermTheme() {
+    const css = getComputedStyle(document.documentElement);
+    const out = {};
+    for (const [key, token] of TERM_COLORS) {
+      // 정의되지 않은 토큰은 키째 뺀다. 그러면 xterm이 자기 기본값을 쓴다 —
+      // 다크의 ANSI 16색이 그 경우다(style.css의 --term-* 주석 참고).
+      const value = css.getPropertyValue(`--term-${token}`).trim();
+      if (value) out[key] = value;
+    }
+    return out;
+  }
+
+  /** 지금 실제로 적용된 테마 ("system"을 풀어서). */
+  function resolvedTheme() {
+    if (theme !== "system") return theme;
+    return darkQuery.matches ? "dark" : "light";
+  }
+
+  // [W-Term] 안내 줄 색. 밝은 바탕에서 파스텔 256색은 거의 보이지 않는다.
+  function noticeSgr(kind) {
+    const light = resolvedTheme() === "light";
+    if (kind === "alert") return light ? "\x1b[38;5;125m" : "\x1b[38;5;210m";
+    return light ? "\x1b[38;5;92m" : "\x1b[38;5;183m";
+  }
+
+  function applyTheme() {
+    if (theme === "system") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", theme);
+    for (const btn of themePickerEl.children) {
+      btn.setAttribute("aria-pressed", String(btn.dataset.theme === theme));
+    }
+    // 열려 있는 터미널 전부. 배경색이 바뀌면 xterm은 스스로 다시 그린다.
+    const colors = xtermTheme();
+    for (const tab of allTabs()) tab.term.options.theme = colors;
+  }
+
+  for (const [value, label] of THEMES) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.dataset.theme = value;
+    btn.textContent = label;
+    btn.addEventListener("click", () => {
+      theme = value;
+      try {
+        localStorage.setItem(themeStorageKey, value);
+      } catch {
+        /* 저장소가 막혀 있어도 이번 세션 동안은 바뀐 채로 남는다 */
+      }
+      applyTheme();
+    });
+    themePickerEl.appendChild(btn);
+  }
+
+  // 시스템 모드일 때만 OS 설정 변화를 따라간다. 못박아 둔 쪽은 그대로 둬야 한다.
+  darkQuery.addEventListener("change", () => {
+    if (theme === "system") applyTheme();
+  });
+
+  applyTheme();
+
   // ── 모바일 키 바 ───────────────────────────────────────────────────
   //
   // 폰 소프트 키보드에는 Esc·Tab·Ctrl·방향키가 없다. Claude Code TUI는 Esc(중단)와
@@ -263,16 +365,24 @@
     keyBarEl.appendChild(btn);
   }
 
-  // ── 벨 알림 ────────────────────────────────────────────────────────
+  // ── 대기 알림 ──────────────────────────────────────────────────────
   //
   // "노트북 덮고 나갔다 돌아온다"가 이 도구의 용도인데, Claude가 질문을 띄우고
   // 멈춘 것을 알 방법이 없어 결국 주기적으로 들여다보게 된다. TUI가 사람을 부를 때
   // 내는 BEL을 잡아 탭과 문서 제목을 바꾸고, 권한이 있으면 알림까지 띄운다.
   //
   // 감지는 클라이언트에서 한다 — 서버는 터미널 내용을 들여다보지 않는다(AGENTS.md).
-  // 판정도 우리가 바이트를 뒤지는 대신 xterm 파서의 onBell에 맡긴다: 셸 프롬프트가
-  // 매번 내보내는 창 제목 시퀀스(OSC ... BEL)의 끝에도 BEL이 있어서, 직접 스캔하면
+  // 판정도 우리가 바이트를 뒤지는 대신 xterm 파서에 맡긴다: 셸 프롬프트가 매번
+  // 내보내는 창 제목 시퀀스(OSC ... BEL)의 끝에도 BEL이 있어서, 직접 스캔하면
   // 프롬프트가 뜰 때마다 오탐이 된다.
+  //
+  // 받는 경로는 둘이다. CLI마다 사람을 부르는 방식이 다르기 때문이다:
+  //   - BEL(`\a`) → term.onBell. Claude Code의 terminal_bell 채널.
+  //   - OSC 9 → 아래 registerOscHandler(9). Codex의 tui.notifications와
+  //     Claude Code의 iterm2 채널이 쓰는 형식이다. 끝이 BEL이라 겉보기에는
+  //     비슷하지만 파서는 이것을 OSC 문자열로 먹으므로 onBell이 뜨지 않는다 —
+  //     바로 위에서 "직접 스캔하면 오탐"이라고 한 그 시퀀스다.
+  // 채널을 켜는 것은 server/session.py의 _agent_cmd가 세션마다 해 준다.
   //
   // 한계: 탭이 열려 있어야만 동작한다. 진짜 푸시는 서비스 워커와 푸시 서버가
   // 필요하고, 그건 이 서버의 무상태 설계와 맞지 않는다.
@@ -395,7 +505,21 @@
     const pane = { el, tabBarEl, actionsEl, splitEl, stackEl, tabs: [], activeTab: null };
     // 창 안 어디를 눌러도 그 창이 포커스를 가져간다. 키 바와 상태줄, 주소 해시가
     // 따라오므로 "지금 어느 창을 쓰고 있나"가 클릭 한 번으로 정해져야 한다.
-    el.addEventListener("pointerdown", () => focusPane(pane), true);
+    //
+    // 창의 포커스와 별개로 키보드 포커스도 터미널에 넘긴다. xterm은 자기 화면을
+    // 눌렀을 때만 textarea에 포커스를 주므로, term-host의 여백이나 마지막 행 아래
+    // 빈자리를 누르면 포커스가 직전 버튼이나 body에 남는다. 그 상태에서도 드래그
+    // 선택은 되지만(선택은 마우스 이벤트만 보고 포커스와 무관하다) 복사·붙여넣기는
+    // 조용히 안 된다 — copy/paste 이벤트가 포커스된 요소에서 올라오는데 그게
+    // 터미널 밖이면 xterm의 리스너에 닿지 않는다. 선택 하이라이트는 멀쩡히 보이니
+    // 원인을 짐작할 단서도 없다. 탭 줄의 버튼까지 뺏지 않도록 대상이 터미널 더미
+    // 안일 때만 옮긴다. 터치는 제외한다 — 스크롤하려고 짚은 손가락에 소프트
+    // 키보드가 올라온다.
+    el.addEventListener("pointerdown", (e) => {
+      focusPane(pane);
+      if (e.pointerType === "touch") return;
+      if (pane.activeTab && stackEl.contains(e.target)) pane.activeTab.term.focus();
+    }, true);
 
     panes.push(pane);
     panesEl.appendChild(el);
@@ -607,14 +731,52 @@
       fontSize: 14,
       cursorBlink: true,
       scrollback: 5000,
-      theme: {
-        background: "#1e1e2e",
-        foreground: "#cdd6f4",
-        cursor: "#cba6f7",
-      },
+      theme: xtermTheme(),
     });
     const fitAddon = new FitAddon.FitAddon();
     term.loadAddon(fitAddon);
+
+    // 윈도우·리눅스의 복사·붙여넣기.
+    //
+    // 터미널에서 Ctrl+C/Ctrl+V는 제어문자(\x03, \x16)이고 xterm은 기본값 그대로
+    // 그렇게 보낸다. 맥은 ⌘가 따로 있어 문제가 없지만, ⌘가 없는 쪽에서는 그 결과가
+    // "복붙이 아예 안 되는 터미널"이다.
+    //
+    // false를 돌려주면 xterm은 그 키를 처리하지도, preventDefault를 걸지도 않는다.
+    // 그래서 브라우저의 기본 복사/붙여넣기가 그대로 돌고, 붙여넣은 텍스트는 xterm이
+    // textarea에 걸어둔 paste 리스너로 되돌아온다 — 즉 bracketed paste 처리도
+    // 그대로다. 클립보드를 직접 읽지 않는 이유는 그래야 해서가 아니라 읽으면 안
+    // 돼서다. navigator.clipboard.readText()는 클립보드 읽기 권한을 이 페이지에
+    // 여는 것이고, 스크립트 주입이 곧 임의 명령 실행인 이 서버에서 주입된 코드에게
+    // 사용자의 클립보드까지 얹어줄 이유가 없다. 여기서 클립보드에 닿는 것은 브라우저
+    // 자신뿐이고, 이 코드가 하는 일은 키를 가로채지 않겠다고 말하는 것뿐이다.
+    //
+    // 잃는 것은 Ctrl+V의 원래 뜻인 readline quoted-insert(\x16)다. 이 도구를 쓰는
+    // 자리에서 복붙보다 그쪽이 급한 경우는 없다. Ctrl+Shift+V는 원래도 브라우저가
+    // 처리하던 경로라 그대로 남는다.
+    //
+    // `key`는 현재 키보드 배열과 IME가 해석한 문자라 한글 입력 상태에서는 "c"/"v"가
+    // 아닐 수 있다. 데스크톱 단축키는 물리 키 위치인 `code`로 먼저 판별하고, code를
+    // 주지 않는 오래된 브라우저만 key로 받친다. 이 분기가 빠지면 xterm이 Ctrl+C/V를
+    // 다시 \x03/\x16으로 보내서 우클릭만 되고 키보드 복붙은 조용히 실패한다.
+    term.attachCustomKeyEventHandler((e) => {
+      if (IS_MAC || e.type !== "keydown") return true;
+      if (!e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return true;
+      const key = e.code === "KeyC" ? "c"
+        : e.code === "KeyV" ? "v"
+          : e.key.toLowerCase();
+      if (key === "v") return false;
+      // 선택이 없을 때의 Ctrl+C는 여전히 인터럽트다. 선택이 있을 때만 복사로
+      // 넘기고, 복사한 뒤에는 선택을 지운다 — 남겨두면 다음 Ctrl+C도 복사로
+      // 먹혀서 "인터럽트가 안 걸린다". 지우는 것을 미루는 것은 이 핸들러가
+      // 끝난 뒤에야 브라우저가 copy 이벤트를 띄우고, xterm이 그때 선택 내용을
+      // 읽어가기 때문이다.
+      if (key === "c" && term.hasSelection()) {
+        setTimeout(() => term.clearSelection(), 0);
+        return false;
+      }
+      return true;
+    });
 
     const hostEl = document.createElement("div");
     hostEl.className = "term-host";
@@ -684,8 +846,14 @@
     });
     closeEl.addEventListener("click", () => closeTab(tab));
     term.onData((data) => sendJson(tab, { type: "input", data: applyCtrl(data) }));
-    // BEL 판정은 xterm 파서가 한다 — 위 "벨 알림" 주석 참고.
+    // 부름 판정은 xterm 파서가 한다 — 위 "대기 알림" 주석 참고.
     term.onBell(() => onBell(tab));
+    // OSC 9은 데스크톱 알림 문자열이다. false를 돌려주면 xterm이 원래 하던
+    // 처리(모르는 시퀀스는 무시)를 마저 하므로 화면에는 아무 영향이 없다.
+    term.parser.registerOscHandler(9, () => {
+      onBell(tab);
+      return false;
+    });
 
     tab.pane = pane;
     pane.tabs.push(tab);
@@ -822,11 +990,11 @@
       if (typeof ev.data === "string") {
         const msg = JSON.parse(ev.data);
         if (msg.type === "status") {
-          tab.term.write(`\r\n\x1b[38;5;183m[W-Term] ${msg.message}\x1b[0m\r\n`);
+          tab.term.write(`\r\n${noticeSgr("info")}[W-Term] ${msg.message}\x1b[0m\r\n`);
         } else if (msg.type === "exit") {
           tab.intentionalClose = true;
           tab.term.write(
-            `\r\n\x1b[38;5;210m[W-Term] 세션이 종료되었습니다 (exit=${msg.code}).\x1b[0m\r\n`
+            `\r\n${noticeSgr("alert")}[W-Term] 세션이 종료되었습니다 (exit=${msg.code}).\x1b[0m\r\n`
           );
         }
       } else {
@@ -853,13 +1021,13 @@
       ) {
         setTabStatus(tab, "disconnected", "연결 종료");
         if (ev.code === 4000)
-          tab.term.write("\r\n\x1b[38;5;210m[W-Term] 다른 클라이언트가 연결하여 종료되었습니다.\x1b[0m\r\n");
+          tab.term.write(`\r\n${noticeSgr("alert")}[W-Term] 다른 클라이언트가 연결하여 종료되었습니다.\x1b[0m\r\n`);
         if (ev.code === 4401) showLogin("인증이 만료되었습니다. 다시 로그인하세요.");
         // 4408(유휴 종료)·4409(사용자 종료)에서 재연결하면 방금 정리한 세션이
         // 곧바로 다시 뜬다. 사유는 서버가 닫기 직전 보낸 status 메시지에 이미
         // 찍혀 있다. 나머지는 재연결해봐야 같은 이유로 거절당하는 설정 문제다.
         if (ev.code === 4404 || ev.code === 4400)
-          tab.term.write(`\r\n\x1b[38;5;210m[W-Term] 연결이 거절되었습니다: ${ev.reason || ev.code}\x1b[0m\r\n`);
+          tab.term.write(`\r\n${noticeSgr("alert")}[W-Term] 연결이 거절되었습니다: ${ev.reason || ev.code}\x1b[0m\r\n`);
         return;
       }
       // 비정상 단절: 자동 재연결 (라이브 세션이면 재접속, 아니면 claude -c로 최근 세션 이어하기)
@@ -953,19 +1121,25 @@
         const key = `${p.name}#${agent}`;
         const btn = document.createElement("button");
         btn.className = "end";
-        btn.title = `실행 중인 ${label} 세션을 종료합니다`;
+        btn.title = endingKeys.has(key)
+          ? `${label} 세션을 종료하는 중입니다`
+          : `실행 중인 ${label} 세션을 종료합니다`;
         // 진행 중 상태는 버튼이 아니라 endingKeys가 들고 있다 — 목록은 10초마다
         // 통째로 다시 그려지므로 버튼에만 담아두면 그때 지워진다.
+        // 진행 중 표시는 "종료"와 **같은 폭**이어야 한다. 더 긴 글자를 넣으면
+        // 그 순간 줄 전체가 다시 배분되어 옆 버튼들이 두 줄로 접힌다.
         const ending = endingKeys.has(key);
-        btn.textContent = ending ? "종료 중…" : "종료";
+        btn.textContent = ending ? "…" : "종료";
         btn.disabled = ending;
+        btn.setAttribute("aria-busy", String(ending));
         btn.onclick = async () => {
           if (!confirm(`'${p.name}'의 실행 중인 ${label} 세션을 종료할까요?`)) return;
-          // 대화형 셸은 SIGTERM을 무시해서 SIGKILL까지 시간이 걸린다. 그동안
-          // 아무 표시가 없으면 버튼이 먹지 않은 것으로 보인다.
+          // SIGHUP과 SIGTERM을 모두 무시하는 자식은 SIGKILL까지 시간이 걸린다.
+          // 그동안 아무 표시가 없으면 버튼이 먹지 않은 것으로 보인다.
           endingKeys.add(key);
           btn.disabled = true;
-          btn.textContent = "종료 중…";
+          btn.textContent = "…";
+          btn.setAttribute("aria-busy", "true");
           try {
             const res = await fetch(
               `/api/session/end?project=${encodeURIComponent(p.name)}` +
@@ -1016,7 +1190,12 @@
         };
         row.append(labelEl, resumeBtn, newBtn);
         const endBtn = makeEndButton(agent, label, live);
-        if (endBtn) row.appendChild(endBtn);
+        // has-end는 네 번째 칸을 여는 표식이다. 종료 버튼이 없는 줄에까지 칸을
+        // 열어두면 그 앞의 간격만큼 오른쪽 끝이 어긋난다 (style.css 주석 참고).
+        if (endBtn) {
+          row.appendChild(endBtn);
+          row.classList.add("has-end");
+        }
         return row;
       }
       actions.append(
@@ -1046,7 +1225,10 @@
       shellLabel.textContent = "Shell";
       shellRow.append(shellLabel, shellBtn);
       const endShellBtn = makeEndButton("shell", "셸", p.shell_live);
-      if (endShellBtn) shellRow.appendChild(endShellBtn);
+      if (endShellBtn) {
+        shellRow.appendChild(endShellBtn);
+        shellRow.classList.add("has-end");
+      }
       actions.append(shellRow);
       card.append(nameEl, pathEl, actions);
       projectListEl.appendChild(card);

@@ -1,15 +1,172 @@
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
+/* ── 테마 ───────────────────────────────────────────────────────────
+   색은 전부 여기 토큰으로만 적는다. 규칙 안에 색 리터럴을 직접 쓰면 그 자리만
+   테마를 안 따라가고, 그건 화면을 보기 전에는 드러나지 않는다.
+
+   상태는 셋이다: 다크(기본), 라이트, 그리고 "시스템". 시스템일 때는 html에
+   아무 표시도 하지 않고 prefers-color-scheme이 정하게 둔다 — 그래서 라이트
+   블록은 두 번 쓴다. 하나는 시스템이 라이트일 때(다크로 못박은 경우는 제외),
+   하나는 사용자가 라이트로 못박았을 때. 어느 쪽이든 같은 토큰만 덮는다.
+
+   다크는 기존 Catppuccin Mocha를 그대로 두고, 라이트는 Latte의 눈부심이
+   적은 배경을 유지하되 GitHub Light처럼 전경을 짙게 잡았다. 라이트의 작은
+   글자와 터미널 ANSI 16색은 배경과 4.5:1 이상 대비를 낸다. */
+
 :root {
   --sidebar-width: 240px;
   --sidebar-transition: 180ms;
+
+  color-scheme: dark;
+
+  --bg: #1e1e2e;          /* 본문·터미널 바탕 */
+  --bg-sunken: #181825;   /* 사이드바, 탭 줄, 키 바 */
+  --bg-deep: #11111b;     /* 비활성 탭, 강조 버튼 위의 글자 */
+  --surface: #313244;     /* 버튼·칩 바탕 */
+  --surface-hover: #45475a;
+  --surface-active: #585b70;
+
+  --text: #cdd6f4;
+  --text-dim: #a6adc8;
+  --text-faint: #6c7086;
+
+  --accent: #cba6f7;      /* mauve */
+  --accent-alt: #b4befe;  /* lavender */
+  --ok: #a6e3a1;
+  --warn: #f9e2af;
+  --danger: #f38ba8;
+  --info: #89b4fa;
+
+  --ok-bg: #1c2b1e;
+  --warn-bg: #2b271c;
+  --danger-bg: #2b1c1e;
+
+  --scrim: rgba(17, 17, 27, 0.88);
+  --shadow: rgba(17, 17, 27, 0.35);
+
+  /* xterm은 CSS를 읽지 않는다. app.js가 이 토큰들을 읽어 term.options.theme에
+     넣는다.
+
+     다크에서 ANSI 16색은 **일부러 비워 둔다.** 비어 있으면 app.js가 그 키를
+     빼고 넘기고, xterm은 자기 기본 팔레트를 쓴다 — 이 앱이 처음부터 쓰던 색이다.
+     여기에 Mocha 팔레트를 깔면 터미널 안 색이 통째로 바뀐다(그렇게 해 봤고,
+     기존 쪽이 낫다). 라이트에만 채워 넣는 이유는 xterm 기본값이 어두운 바탕을
+     전제해서, 밝은 바탕에서는 밝은 글자가 되어 TUI가 안 읽히기 때문이다. */
+  --term-bg: #1e1e2e;
+  --term-fg: #cdd6f4;
+  --term-cursor: #cba6f7;
+}
+
+/* 시스템 설정이 라이트일 때. 다크로 못박아 둔 경우는 건드리지 않는다. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+
+    --bg: #eff1f5;
+    --bg-sunken: #e6e9ef;
+    --bg-deep: #dce0e8;
+    --surface: #ccd0da;
+    --surface-hover: #bcc0cc;
+    --surface-active: #acb0be;
+
+    --text: #252a34;
+    --text-dim: #464d5c;
+    --text-faint: #626a78;
+
+    --accent: #6f2dbd;
+    --accent-alt: #4356b3;
+    --ok: #2f741f;
+    --warn: #7a5200;
+    --danger: #b4233f;
+    --info: #1759b0;
+
+    --ok-bg: #e0eeda;
+    --warn-bg: #f6ebd8;
+    --danger-bg: #f7dce2;
+
+    --scrim: rgba(76, 79, 105, 0.45);
+    --shadow: rgba(76, 79, 105, 0.2);
+
+    --term-bg: #eff1f5;
+    --term-fg: #252a34;
+    --term-cursor: #6f2dbd;
+    --term-black: #252a34;
+    --term-red: #b4233f;
+    --term-green: #2f741f;
+    --term-yellow: #7a5200;
+    --term-blue: #1759b0;
+    --term-magenta: #73368f;
+    --term-cyan: #006b73;
+    /* 밝은 바탕에서 ANSI white는 흰색이 아니라 읽히는 회색 전경이다. */
+    --term-white: #515969;
+    --term-bright-black: #626a78;
+    --term-bright-red: #c1284b;
+    --term-bright-green: #357d26;
+    --term-bright-yellow: #8a5e00;
+    --term-bright-blue: #2465bd;
+    --term-bright-magenta: #8a439e;
+    --term-bright-cyan: #087780;
+    --term-bright-white: #252a34;
+  }
+}
+
+/* 사용자가 라이트로 못박은 경우. 위 블록과 같은 값이지만 미디어 쿼리 밖이라
+   시스템이 다크여도 이긴다. */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #eff1f5;
+  --bg-sunken: #e6e9ef;
+  --bg-deep: #dce0e8;
+  --surface: #ccd0da;
+  --surface-hover: #bcc0cc;
+  --surface-active: #acb0be;
+
+  --text: #252a34;
+  --text-dim: #464d5c;
+  --text-faint: #626a78;
+
+  --accent: #6f2dbd;
+  --accent-alt: #4356b3;
+  --ok: #2f741f;
+  --warn: #7a5200;
+  --danger: #b4233f;
+  --info: #1759b0;
+
+  --ok-bg: #e0eeda;
+  --warn-bg: #f6ebd8;
+  --danger-bg: #f7dce2;
+
+  --scrim: rgba(76, 79, 105, 0.45);
+  --shadow: rgba(76, 79, 105, 0.2);
+
+  --term-bg: #eff1f5;
+  --term-fg: #252a34;
+  --term-cursor: #6f2dbd;
+  --term-black: #252a34;
+  --term-red: #b4233f;
+  --term-green: #2f741f;
+  --term-yellow: #7a5200;
+  --term-blue: #1759b0;
+  --term-magenta: #73368f;
+  --term-cyan: #006b73;
+  /* 밝은 바탕에서 ANSI white는 흰색이 아니라 읽히는 회색 전경이다. */
+  --term-white: #515969;
+  --term-bright-black: #626a78;
+  --term-bright-red: #c1284b;
+  --term-bright-green: #357d26;
+  --term-bright-yellow: #8a5e00;
+  --term-bright-blue: #2465bd;
+  --term-bright-magenta: #8a439e;
+  --term-bright-cyan: #087780;
+  --term-bright-white: #252a34;
 }
 
 html, body {
   height: 100%;
   font-family: -apple-system, "Segoe UI", "Noto Sans KR", sans-serif;
-  background: #1e1e2e;
-  color: #cdd6f4;
+  background: var(--bg);
+  color: var(--text);
 }
 
 body { display: flex; }
@@ -17,8 +174,8 @@ body { display: flex; }
 #sidebar {
   width: var(--sidebar-width);
   flex-shrink: 0;
-  background: #181825;
-  border-right: 1px solid #313244;
+  background: var(--bg-sunken);
+  border-right: 1px solid var(--surface);
   padding: 16px 12px;
   display: flex;
   flex-direction: column;
@@ -32,9 +189,9 @@ body { display: flex; }
 
 #sidebar h1 {
   font-size: 18px;
-  color: #cba6f7;
+  color: var(--accent);
   padding-bottom: 8px;
-  border-bottom: 1px solid #313244;
+  border-bottom: 1px solid var(--surface);
 }
 
 body.sidebar-collapsed #sidebar {
@@ -56,12 +213,12 @@ body.sidebar-collapsed #sidebar {
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid #45475a;
+  border: 1px solid var(--surface-hover);
   border-radius: 7px;
-  background: #313244;
-  color: #cdd6f4;
+  background: var(--surface);
+  color: var(--text);
   cursor: pointer;
-  box-shadow: 0 2px 8px rgba(17, 17, 27, 0.35);
+  box-shadow: 0 2px 8px var(--shadow);
   transition:
     left var(--sidebar-transition) ease,
     background-color 120ms ease,
@@ -69,12 +226,12 @@ body.sidebar-collapsed #sidebar {
 }
 
 #sidebar-toggle:hover {
-  background: #45475a;
-  color: #cba6f7;
+  background: var(--surface-hover);
+  color: var(--accent);
 }
 
 #sidebar-toggle:focus-visible {
-  outline: 2px solid #cba6f7;
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
@@ -100,19 +257,19 @@ body.sidebar-collapsed #sidebar-toggle svg { transform: rotate(180deg); }
 #project-list { display: flex; flex-direction: column; gap: 10px; flex: 1; }
 
 .project {
-  background: #1e1e2e;
-  border: 1px solid #313244;
+  background: var(--bg);
+  border: 1px solid var(--surface);
   border-radius: 8px;
   padding: 10px;
 }
 
-.project.active { border-color: #cba6f7; }
+.project.active { border-color: var(--accent); }
 
 .project .name { font-weight: 600; font-size: 14px; }
 
 .project .path {
   font-size: 11px;
-  color: #6c7086;
+  color: var(--text-faint);
   margin: 2px 0 8px;
   word-break: break-all;
 }
@@ -120,8 +277,8 @@ body.sidebar-collapsed #sidebar-toggle svg { transform: rotate(180deg); }
 .project .badge {
   display: inline-block;
   font-size: 10px;
-  color: #a6e3a1;
-  border: 1px solid #a6e3a1;
+  color: var(--ok);
+  border: 1px solid var(--ok);
   border-radius: 4px;
   padding: 0 4px;
   margin-left: 6px;
@@ -129,57 +286,74 @@ body.sidebar-collapsed #sidebar-toggle svg { transform: rotate(180deg); }
 }
 
 .project .badge.shell {
-  color: #89b4fa;
-  border-color: #89b4fa;
+  color: var(--info);
+  border-color: var(--info);
 }
 
 .project .badge.codex {
-  color: #f9e2af;
-  border-color: #f9e2af;
+  color: var(--warn);
+  border-color: var(--warn);
 }
 
+/* 맞춰야 하는 것은 **줄의 오른쪽 끝**이다. 줄마다 자기 그리드를 갖고 저마다
+   카드 폭을 꽉 채우므로, 어느 줄이 라이브든 버튼의 오른쪽 끝은 늘 같은 자리다.
+
+   한 벌의 열을 세 줄이 나눠 쓰게 해 봤다가 되돌린 것이다. 그러면 열 경계까지
+   맞지만, 마지막 칸("종료")은 라이브인 줄에만 버튼이 생기는 자리라 라이브인 줄이
+   하나라도 있으면 **모든** 줄이 그 폭을 내준다 — Claude만 살아 있을 때 셸 줄까지
+   덩달아 좁아지고, "이어하기"가 두 줄로 접혔다. 열 경계보다 오른쪽 끝이 맞는
+   쪽이 눈에 띄고, 이쪽은 줄바꿈도 나지 않는다.
+
+   `has-end`는 종료 버튼이 있는 줄에만 붙는다(app.js). 네 번째 칸을 늘 선언해
+   두면 버튼이 없는 줄에서도 그 앞의 간격 5px이 남아 오른쪽 끝이 그만큼 어긋난다.
+   `:has()` 대신 클래스를 쓰는 이유는 지원 여부에 기대지 않기 위해서다. */
 .project .actions { display: flex; flex-direction: column; gap: 6px; }
 
-/* 마지막 auto 칸은 "종료" 버튼 자리다. 라이브가 아니면 버튼 자체가 없고,
-   그때 이 칸은 폭 0으로 접힌다. */
 .project .agent-row {
   display: grid;
-  grid-template-columns: 48px 1fr 1fr auto;
+  grid-template-columns: 48px minmax(0, 1fr) minmax(0, 1fr);
   gap: 5px;
 }
+
+/* minmax(0, …)은 버튼이 최소 콘텐츠 폭 아래로도 줄어들 수 있게 한다. 기본값인
+   1fr(= minmax(auto, 1fr))이면 줄이 카드를 넘쳐 종료 버튼이 밖으로 삐져나온다. */
+.project .agent-row.has-end {
+  grid-template-columns: 48px minmax(0, 1fr) minmax(0, 1fr) auto;
+}
+
 .project .agent-label {
   align-self: center;
   font-size: 10px;
   font-weight: 600;
-  color: #b4befe;
+  color: var(--accent-alt);
 }
-.project .agent-label.codex { color: #f9e2af; }
-.project .agent-label.shell { color: #89b4fa; }
-.project .shell-row button:not(.end) { grid-column: 2 / 4; }
+.project .agent-label.codex { color: var(--warn); }
+.project .agent-label.shell { color: var(--info); }
+.project .shell-row > button:not(.end) { grid-column: 2 / 4; }
 
 .project button {
-  flex: 1;
   font-size: 12px;
   padding: 6px 4px;
   border: none;
   border-radius: 6px;
   cursor: pointer;
-  background: #313244;
-  color: #cdd6f4;
+  background: var(--surface);
+  color: var(--text);
 }
 
-.project button:hover:not(:disabled) { background: #45475a; }
-.project button.primary { background: #cba6f7; color: #11111b; font-weight: 600; }
-.project button.primary:hover { background: #b4befe; }
+.project button:hover:not(:disabled) { background: var(--surface-hover); }
+.project button.primary { background: var(--accent); color: var(--bg-deep); font-weight: 600; }
+.project button.primary:hover { background: var(--accent-alt); }
 .project button:disabled { opacity: 0.4; cursor: default; }
 
 /* 되돌릴 수 없는 동작이라 다른 버튼과 색으로 구분한다. */
 .project button.end {
-  flex: 0 0 auto;
   padding: 6px 7px;
-  color: #f38ba8;
+  /* 진행 중에는 "…" 한 글자가 되므로 폭을 고정한다 — 안 그러면 줄이 다시 배분된다. */
+  min-width: 3em;
+  color: var(--danger);
 }
-.project button.end:hover:not(:disabled) { background: #45475a; color: #f38ba8; }
+.project button.end:hover:not(:disabled) { background: var(--surface-hover); color: var(--danger); }
 
 #conn-status {
   font-size: 12px;
@@ -187,9 +361,40 @@ body.sidebar-collapsed #sidebar-toggle svg { transform: rotate(180deg); }
   border-radius: 6px;
   text-align: center;
 }
-#conn-status.connected { background: #1c2b1e; color: #a6e3a1; }
-#conn-status.disconnected { background: #2b1c1e; color: #f38ba8; }
-#conn-status.connecting { background: #2b271c; color: #f9e2af; }
+#conn-status.connected { background: var(--ok-bg); color: var(--ok); }
+#conn-status.disconnected { background: var(--danger-bg); color: var(--danger); }
+#conn-status.connecting { background: var(--warn-bg); color: var(--warn); }
+
+/* 셋을 나란히 둔다. 순환 버튼("테마: 시스템")이면 폭은 아끼지만 무엇이 있는지
+   눌러 봐야 알고, 이 자리에는 셋을 늘어놓을 폭이 있다. */
+#theme-picker {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+}
+
+#theme-picker button {
+  padding: 5px 2px;
+  font: inherit;
+  font-size: 11px;
+  border: 1px solid var(--surface-hover);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+#theme-picker button:hover { background: var(--surface-hover); color: var(--text); }
+#theme-picker button:active { transform: translateY(1px); }
+#theme-picker button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* 고른 것. aria-pressed와 같은 것을 보여주므로 스크린리더와 눈이 어긋나지 않는다. */
+#theme-picker button[aria-pressed="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg-deep);
+  font-weight: 600;
+}
 
 #logout-btn,
 #notify-btn {
@@ -198,15 +403,15 @@ body.sidebar-collapsed #sidebar-toggle svg { transform: rotate(180deg); }
   padding: 6px 8px;
   font: inherit;
   font-size: 12px;
-  color: #a6adc8;
-  background: #313244;
+  color: var(--text-dim);
+  background: var(--surface);
   border: none;
   border-radius: 6px;
   cursor: pointer;
 }
 
 #logout-btn:hover,
-#notify-btn:hover { background: #45475a; color: #cdd6f4; }
+#notify-btn:hover { background: var(--surface-hover); color: var(--text); }
 
 /* 권한을 이미 정한 브라우저에서는 아예 나오지 않는다 (app.js가 hidden을 푼다).
    display를 지정하지 않아야 hidden 속성이 그대로 먹는다. */
@@ -244,24 +449,24 @@ body.split #panes {
 }
 
 /* 나뉘어 있을 때만 어느 쪽이 포커스인지 표시한다. 창이 하나면 알려줄 것이 없다. */
-.pane.focused .pane-head { border-bottom-color: #cba6f7; }
+.pane.focused .pane-head { border-bottom-color: var(--accent); }
 
 .splitter {
-  background: #313244;
+  background: var(--surface);
   cursor: col-resize;
   touch-action: none; /* 드래그가 스크롤로 새지 않게 */
 }
-.splitter:hover { background: #cba6f7; }
+.splitter:hover { background: var(--accent); }
 
 .pane-head {
   display: none;
   flex: 0 0 auto;
-  background: #181825;
-  border-bottom: 1px solid #313244;
+  background: var(--bg-sunken);
+  border-bottom: 1px solid var(--surface);
 }
 
 /* 세션이 하나도 없고 나뉘어 있지도 않으면 빈 줄을 띄우지 않는다. 나뉘어 있으면
-   빈 창에도 머리를 남긴다 — 창을 도로 합치는 ✕ 버튼이 거기 있다. */
+   빈 창에도 머리를 남긴다 — 창을 도로 합치는 버튼이 거기 있다. */
 body.session-open .pane-head,
 body.split .pane-head { display: flex; }
 
@@ -293,18 +498,18 @@ body.split .pane-head { display: flex; }
   font: inherit;
   font-size: 12px;
   line-height: 1;
-  border: 1px solid #45475a;
+  border: 1px solid var(--surface-hover);
   border-radius: 7px;
-  background: #313244;
-  color: #cdd6f4;
+  background: var(--surface);
+  color: var(--text);
   cursor: pointer;
   white-space: nowrap;
   transition: background-color 90ms ease, border-color 90ms ease;
 }
-.pane-btn:hover { background: #45475a; border-color: #585b70; }
+.pane-btn:hover { background: var(--surface-hover); border-color: var(--surface-active); }
 /* 누른 순간의 반응. 이게 없으면 클릭이 먹었는지 화면 변화로만 알아야 한다. */
-.pane-btn:active { background: #585b70; transform: translateY(1px); }
-.pane-btn:focus-visible { outline: 2px solid #cba6f7; outline-offset: 1px; }
+.pane-btn:active { background: var(--surface-active); transform: translateY(1px); }
+.pane-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 .tab {
   display: flex;
@@ -313,51 +518,51 @@ body.split .pane-head { display: flex; }
   flex: 0 0 auto;
   max-width: 220px;
   padding: 5px 4px 5px 9px;
-  border: 1px solid #313244;
+  border: 1px solid var(--surface);
   border-bottom: none;
   border-radius: 8px 8px 0 0;
-  background: #11111b;
-  color: #a6adc8;
+  background: var(--bg-deep);
+  color: var(--text-dim);
   font-size: 12px;
   cursor: pointer;
   user-select: none;
 }
 
-.tab:hover { background: #181825; }
-.tab.active { background: #1e1e2e; color: #cdd6f4; border-color: #45475a; }
-.tab:focus-visible { outline: 2px solid #cba6f7; outline-offset: -2px; }
+.tab:hover { background: var(--bg-sunken); }
+.tab.active { background: var(--bg); color: var(--text); border-color: var(--surface-hover); }
+.tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
 .tab-dot {
   flex: 0 0 auto;
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: #f38ba8;
+  background: var(--danger);
 }
-.tab-dot.connected { background: #a6e3a1; }
-.tab-dot.connecting { background: #f9e2af; }
-.tab-dot.disconnected { background: #f38ba8; }
+.tab-dot.connected { background: var(--ok); }
+.tab-dot.connecting { background: var(--warn); }
+.tab-dot.disconnected { background: var(--danger); }
 
 .tab-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* 마지막으로 본 뒤 출력이 있었던 탭. 전환하지 않고도 어느 세션이 움직였는지 안다. */
-.tab.unread .tab-name { color: #cba6f7; font-weight: 600; }
+.tab.unread .tab-name { color: var(--accent); font-weight: 600; }
 
-/* 세션이 사람을 부른 탭(BEL). "출력이 있었다"(unread)보다 강한 신호라 배경까지
+/* 세션이 사람을 부른 탭(BEL 또는 OSC 9). "출력이 있었다"(unread)보다 강한 신호라 배경까지
    바꾼다 — 여러 탭이 unread인 상태에서 어느 쪽이 기다리는지 골라내야 한다. */
-.tab.bell { background: #2b271c; border-color: #f9e2af; }
-.tab.bell .tab-name { color: #f9e2af; font-weight: 600; }
+.tab.bell { background: var(--warn-bg); border-color: var(--warn); }
+.tab.bell .tab-name { color: var(--warn); font-weight: 600; }
 
 .tab-agent {
   flex: 0 0 auto;
   font-size: 10px;
-  color: #b4befe;
+  color: var(--accent-alt);
   border: 1px solid currentcolor;
   border-radius: 4px;
   padding: 0 3px;
 }
-.tab-agent.codex { color: #f9e2af; }
-.tab-agent.shell { color: #89b4fa; }
+.tab-agent.codex { color: var(--warn); }
+.tab-agent.shell { color: var(--info); }
 
 /* 옆 창으로 보내기. 나뉘어 있을 때만 app.js가 hidden을 푼다. */
 /* 탭 안의 버튼은 창 버튼만큼 크게 만들 수 없다(탭이 몇 개만 열려도 줄이 어지럽다).
@@ -371,8 +576,8 @@ body.split .pane-head { display: flex; }
   line-height: 1;
   border: none;
   border-radius: 5px;
-  background: #313244;
-  color: #a6adc8;
+  background: var(--surface);
+  color: var(--text-dim);
   cursor: pointer;
   transition: background-color 90ms ease, color 90ms ease;
 }
@@ -380,17 +585,17 @@ body.split .pane-head { display: flex; }
 .tab-move { font-size: 12px; }
 .tab-close { font-size: 14px; }
 
-.tab-move:hover { background: #585b70; color: #cba6f7; }
-.tab-close:hover { background: #585b70; color: #f38ba8; }
+.tab-move:hover { background: var(--surface-active); color: var(--accent); }
+.tab-close:hover { background: var(--surface-active); color: var(--danger); }
 .tab-move:active,
 .tab-close:active { transform: translateY(1px); }
 .tab-move:focus-visible,
-.tab-close:focus-visible { outline: 2px solid #cba6f7; outline-offset: 1px; }
+.tab-close:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
-/* 활성 탭 배경(#1e1e2e)과 칩 배경(#313244)이 가까워 대비가 약해진다. 지금 보고 있는
+/* 활성 탭 배경(var(--bg))과 칩 배경(var(--surface))이 가까워 대비가 약해진다. 지금 보고 있는
    탭의 버튼이 가장 자주 눌리는 버튼이므로 그쪽을 한 단계 밝게 둔다. */
 .tab.active .tab-move,
-.tab.active .tab-close { background: #45475a; color: #cdd6f4; }
+.tab.active .tab-close { background: var(--surface-hover); color: var(--text); }
 
 .term-stack { position: relative; flex: 1; min-height: 0; }
 
@@ -418,8 +623,8 @@ body.split .pane-head { display: flex; }
     flex: 0 0 auto;
     gap: 4px;
     padding: 5px 6px;
-    background: #181825;
-    border-top: 1px solid #313244;
+    background: var(--bg-sunken);
+    border-top: 1px solid var(--surface);
     overflow-x: auto;
     overflow-y: hidden;
     scrollbar-width: none;
@@ -433,20 +638,20 @@ body.split .pane-head { display: flex; }
   font: inherit;
   font-size: 13px;
   line-height: 1;
-  border: 1px solid #45475a;
+  border: 1px solid var(--surface-hover);
   border-radius: 7px;
-  background: #313244;
-  color: #cdd6f4;
+  background: var(--surface);
+  color: var(--text);
   cursor: pointer;
   user-select: none;
   touch-action: manipulation; /* 더블탭 확대 판정에 따른 클릭 지연 제거 */
 }
 
-#key-bar .key:active { background: #45475a; }
+#key-bar .key:active { background: var(--surface-hover); }
 
 /* Ctrl은 눌러 두면 다음 한 글자에 걸리는 고정 키다. 걸려 있는 동안 눈에 보여야
    한다 — 안 그러면 다음에 친 글자가 왜 사라졌는지 알 수 없다. */
-#key-bar .key.armed { background: #cba6f7; border-color: #cba6f7; color: #11111b; }
+#key-bar .key.armed { background: var(--accent); border-color: var(--accent); color: var(--bg-deep); }
 
 /* 창마다 하나씩. 나뉜 채로 오른쪽을 비워두면 그쪽에도 안내가 필요하다. */
 .pane-placeholder {
@@ -457,7 +662,7 @@ body.split .pane-head { display: flex; }
   justify-content: center;
   padding: 0 12px;
   text-align: center;
-  color: #6c7086;
+  color: var(--text-faint);
   font-size: 15px;
   pointer-events: none;
 }
@@ -467,7 +672,7 @@ body.split .pane-head { display: flex; }
 #login-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(17, 17, 27, 0.88);
+  background: var(--scrim);
   display: none;
   align-items: center;
   justify-content: center;
@@ -477,25 +682,25 @@ body.split .pane-head { display: flex; }
 
 #login-form {
   width: 280px;
-  background: #181825;
-  border: 1px solid #313244;
+  background: var(--bg-sunken);
+  border: 1px solid var(--surface);
   border-radius: 10px;
   padding: 24px;
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
-#login-form h2 { font-size: 16px; color: #cba6f7; text-align: center; }
+#login-form h2 { font-size: 16px; color: var(--accent); text-align: center; }
 #login-form input {
   font-size: 14px;
   padding: 8px 10px;
-  border: 1px solid #313244;
+  border: 1px solid var(--surface);
   border-radius: 6px;
-  background: #1e1e2e;
-  color: #cdd6f4;
+  background: var(--bg);
+  color: var(--text);
   outline: none;
 }
-#login-form input:focus { border-color: #cba6f7; }
+#login-form input:focus { border-color: var(--accent); }
 #login-form button {
   font-size: 13px;
   font-weight: 600;
@@ -503,11 +708,11 @@ body.split .pane-head { display: flex; }
   border: none;
   border-radius: 6px;
   cursor: pointer;
-  background: #cba6f7;
-  color: #11111b;
+  background: var(--accent);
+  color: var(--bg-deep);
 }
-#login-form button:hover { background: #b4befe; }
-#login-error { min-height: 15px; font-size: 12px; color: #f38ba8; text-align: center; }
+#login-form button:hover { background: var(--accent-alt); }
+#login-error { min-height: 15px; font-size: 12px; color: var(--danger); text-align: center; }
 
 @media (max-width: 640px) {
   :root { --sidebar-width: min(240px, calc(100vw - 44px)); }

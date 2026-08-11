@@ -105,9 +105,28 @@ SECURITY_HEADERS = {
 
 # /api 응답은 캐시하지 않는다. /api/projects에는 프로젝트 이름과 **로컬 경로**가
 # 실리고 /api/login은 토큰 쿠키를 발급하는 자리라, 공유 기기의 브라우저 캐시나
-# 중간 캐시에 남을 이유가 없다. 정적 자원은 그대로 캐시된다 — 헤더를 전역으로
-# 붙이면 xterm.js 사본까지 매번 다시 받는다.
+# 중간 캐시에 남을 이유가 없다.
 NO_STORE_PREFIX = "/api/"
+
+# 정적 자원은 캐시하되 **매번 확인하고** 쓴다.
+#
+# StaticFiles는 Cache-Control을 붙이지 않는데, 그 헤더가 없으면 브라우저는 캐시를
+# 버리는 게 아니라 반대로 휴리스틱 캐싱을 한다 — 마지막 수정 이후 경과 시간의 10%
+# 동안 서버에 묻지도 않고 사본을 쓴다. 며칠 묵은 app.js를 받아둔 탭은 그만큼
+# 오래 옛 코드를 돌린다. 프론트를 고쳐도 반영이 안 되고, 하필 이 앱은 탭을 계속
+# 열어두는 물건이라 그 창이 제일 오래 산다.
+#
+# no-store가 아니라 no-cache인 것은 "캐시하지 마라"가 아니라 "쓰기 전에 물어봐라"가
+# 필요해서다. 조건부 요청이 ETag로 304를 받으면 본문은 오지 않으므로, 290KB짜리
+# xterm.js 사본을 매번 다시 받는 일도 없다.
+#
+# "/"도 같이 본다. index.html은 StaticFiles가 아니라 FileResponse로 나가지만
+# Cache-Control이 없기는 마찬가지고, 그것이 나머지를 부르는 문서다.
+NO_CACHE_PREFIX = "/static/"
+
+
+def _no_cache_path(path: str) -> bool:
+    return path == "/" or path.startswith(NO_CACHE_PREFIX)
 
 
 @app.middleware("http")
@@ -117,6 +136,8 @@ async def add_security_headers(request: Request, call_next):
         response.headers.setdefault(name, value)
     if request.url.path.startswith(NO_STORE_PREFIX):
         response.headers.setdefault("Cache-Control", "no-store")
+    elif _no_cache_path(request.url.path):
+        response.headers.setdefault("Cache-Control", "no-cache")
     return response
 
 # ── Origin 검증 ─────────────────────────────────────────────────────

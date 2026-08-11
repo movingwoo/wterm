@@ -105,9 +105,9 @@ Restart=on-failure
 # 프로세스와 겹쳤을 때 10초 뒤 다시 붙으라는 뜻이고, 그것이 원하는 동작이다.
 # 간격이 10초라 systemd 기본 시작 제한(10초에 5회)에도 걸리지 않는다.
 RestartSec=10
-# 서버는 SIGTERM을 받으면 PTY 세션을 SIGTERM→(최대 10초)→SIGKILL로 회수한 뒤
-# 종료한다. 그 시간을 못 기다리고 systemd가 SIGKILL을 보내면 비정상 종료가 되어
-# Restart=on-failure에 걸린다. 세션 회수 상한보다 넉넉히 잡는다.
+# 서버는 SIGTERM을 받으면 PTY 세션을 SIGHUP→SIGTERM→SIGKILL 순서로, 합계 최대
+# 10초 안에 회수한 뒤 종료한다. 그 시간을 못 기다리고 systemd가 SIGKILL을 보내면
+# 비정상 종료가 되어 Restart=on-failure에 걸린다. 세션 회수 상한보다 넉넉히 잡는다.
 TimeoutStopSec=60
 StandardOutput=$SERVER_LOG_OUT
 StandardError=$SERVER_LOG_OUT

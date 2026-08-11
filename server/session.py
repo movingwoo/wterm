@@ -2,8 +2,8 @@
 
 - 프로젝트(cwd)당 최대 1개의 라이브 세션을 유지한다 (온디맨드).
 - WebSocket이 끊겨도 유예 시간(grace_seconds) 동안 프로세스를 유지하고,
-  재연결되면 그대로 이어붙인다. 유예 시간이 지나면 SIGTERM → SIGKILL 순으로
-  프로세스 그룹 전체를 종료한다.
+  재연결되면 그대로 이어붙인다. 유예 시간이 지나면 SIGHUP → SIGTERM → SIGKILL
+  순으로 프로세스 그룹 전체를 종료한다.
 - 재연결 시 화면 복원을 위해 최근 출력(최대 BUFFER_LIMIT 바이트)을 버퍼링한다.
 - idle_seconds가 켜져 있으면 양방향 트래픽이 그 시간 동안 없는 세션을 종료한다
   (기본값 0 = 끔). grace는 **연결이 끊겨야** 도는 타이머라 탭을 열어둔 채 잊은
@@ -36,7 +36,9 @@ BUFFER_LIMIT = 256 * 1024  # 재연결 replay 버퍼 상한
 WRITE_BUFFER_LIMIT = 1024 * 1024
 READ_CHUNK = 65536
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
-SIGTERM_WAIT = 10  # SIGTERM 후 SIGKILL까지 대기 초
+SIGTERM_WAIT = 10  # 종료 시그널 에스컬레이션 전체 예산(초). stop.sh의 20초 대기가
+                   # 이 값 + SIGKILL 회수를 감안한 것이라 늘리면 그쪽도 같이 봐야 한다.
+SIGHUP_WAIT = 2    # 그 예산 중 SIGHUP에 주는 몫. 나머지가 SIGTERM 몫이 된다.
 
 # 유휴 종료 close code. 4404/4400과 같은 취급을 받아야 한다 — 클라이언트가 사유를
 # 보여주고 재연결을 멈춰야지, 자동 재연결이 돌면 방금 정리한 세션이 곧바로 다시 뜬다.
@@ -191,14 +193,39 @@ class Session:
 
     # ── 프로세스 수명 주기 ────────────────────────────────────────────
 
+    def _agent_cmd(self, extra_args: list[str] | None) -> list[str]:
+        """에이전트 실행 인자. 알림 채널을 이 세션에 한해 못박는다.
+
+        두 CLI 모두 기본 설정으로는 wterm 안에서 알림을 **아무것도** 내보내지
+        않는다. 알림이 없으면 다른 탭을 보는 동안 세션이 권한 프롬프트에서
+        멈춘 것을 알 방법이 없고, 그건 이 도구의 용도("덮고 나갔다 돌아온다")가
+        걸린 문제다.
+
+        - Claude: 기본값 `auto`는 TERM_PROGRAM으로 채널을 고른다 —
+          Apple_Terminal/iTerm/kitty/ghostty가 아니면 "방법 없음"이 되어 조용하다.
+          PTY에는 TERM_PROGRAM이 없으니 항상 그쪽이다. xterm.js가 벨로 알아듣는
+          것은 terminal_bell(`\\a`) 하나뿐이라 그것으로 고정한다.
+        - Codex: `tui.notifications`가 꺼져 있는 것이 기본이다. 켜면 OSC 9로
+          내보내는데, 그건 벨이 아니라 OSC 문자열이라 app.js가 따로 받는다.
+
+        사용자의 전역 설정을 건드리지 않고 이 프로세스에만 준다 — 다른 터미널에서
+        쓰는 claude/codex의 동작은 그대로여야 한다. 이 플래그가 만들어내는 것은
+        wterm의 PTY로 나가는 바이트 하나뿐이고, 그것을 알림으로 띄울지는 이미
+        브라우저 쪽 권한과 사이드바의 "알림 켜기"가 정하고 있다.
+        """
+        notify: list[str] = []
+        if self.agent == "claude":
+            notify = ["--settings", '{"preferredNotifChannel":"terminal_bell"}']
+        elif self.agent == "codex":
+            notify = ["-c", "tui.notifications=true"]
+        return [self.agent, *notify, *(extra_args or [])]
+
     def spawn(self, extra_args: list[str] | None = None) -> None:
         if self.ssh is not None:
             # 원격 셸은 로컬 $SHELL 경로가 원격 머신에 존재한다는 보장이 없으므로
             # bash로 고정한다.
             base_cmd = (
-                ["bash", "-l"]
-                if self.agent == "shell"
-                else [self.agent, *(extra_args or [])]
+                ["bash", "-l"] if self.agent == "shell" else self._agent_cmd(extra_args)
             )
             # -t: 원격에 TTY 강제 할당. resize(SIGWINCH)·시그널은 ssh가 중계하고,
             # ssh가 끊기면(grace 만료 포함) 원격 프로세스는 SIGHUP으로 정리된다.
@@ -216,7 +243,7 @@ class Session:
             cmd = (
                 [login_shell(), "-l"]
                 if self.agent == "shell"
-                else [self.agent, *(extra_args or [])]
+                else self._agent_cmd(extra_args)
             )
 
         pid, master_fd = pty.fork()  # 자식은 setsid + PTY를 제어 터미널로 가짐
@@ -313,10 +340,41 @@ class Session:
         except ProcessLookupError:
             pass
 
-    async def terminate(self) -> None:
-        """SIGTERM → 대기 → SIGKILL 순으로 프로세스 그룹을 종료한다.
+    async def _wait_reaped(self, seconds: float) -> bool:
+        """자식이 거둬질 때까지 최대 seconds초 기다린다. 끝났으면 True."""
+        for _ in range(int(seconds * 10)):
+            # _handle_exit이 먼저 EOF를 보고 거둬갔을 수 있다. 그쪽이 alive와
+            # fd 정리를 이미 끝냈으므로 여기서는 끝난 것으로 본다.
+            if not self.alive:
+                return True
+            try:
+                pid, _ = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                return True  # 겹쳐 들어온 다른 terminate가 거둬갔다
+            if pid != 0:
+                return True
+            await asyncio.sleep(0.1)
+        return False
 
-        두 경로가 겹쳐 들어와도 안전하다: SIGTERM이 한 번 더 가고, 자식을 거두는
+    async def terminate(self) -> None:
+        """SIGHUP → SIGTERM → SIGKILL 순으로 프로세스 그룹을 종료한다.
+
+        SIGTERM이 아니라 SIGHUP이 먼저인 이유는 잡 컨트롤이다. 대화형 셸은 자기가
+        띄운 잡마다 **별도 프로세스 그룹**을 만드는데, killpg가 때리는 것은 셸의
+        그룹뿐이라 잡에는 아무것도 닿지 않는다. 포그라운드 잡은 세션 리더인 셸이
+        죽을 때 커널이 보내는 SIGHUP에 걸려 같이 죽지만, 백그라운드 잡은 그것도
+        아니어서 고아로 남는다 — SIGKILL을 맞은 셸은 자기 종료 경로(잡 전체에
+        HUP 보내기)를 돌 기회가 없기 때문이다. 그래서 사용자가 종료 버튼을 누른
+        세션이 `exit`을 친 세션과 달리 프로세스를 남겼다.
+        SIGHUP을 받은 셸은 그 종료 경로를 정상적으로 돌므로 잡까지 정리된다.
+        덤으로, 대화형 셸은 SIGTERM을 무시해서 종료가 매번 SIGTERM_WAIT초를 꽉
+        채웠는데 SIGHUP은 즉시 먹는다.
+
+        세 단계를 합친 대기는 SIGTERM_WAIT을 넘지 않는다. shutdown은 세션을 모두
+        동시에 종료하므로 이 상한이 곧 서버 종료 시간의 상한이고, 그 위에 stop.sh와
+        감시자의 대기 시간이 잡혀 있다.
+
+        두 경로가 겹쳐 들어와도 안전하다: 시그널이 한 번 더 가고, 자식을 거두는
         것은 둘 중 하나만 성공하며(나머지는 ChildProcessError), _cleanup_fd는
         여러 번 불러도 같다. 그래서 이른 return으로 막지 않는다 — 막으면 먼저
         들어온 쪽이 끝나기 전에 shutdown이 빠져나갈 수 있다.
@@ -325,29 +383,15 @@ class Session:
             return
         self.terminating = True
         self._cancel_idle()
-        self._signal_group(signal.SIGTERM)
-        for _ in range(SIGTERM_WAIT * 10):
-            if not self.alive:
-                return
-            try:
-                pid, _ = os.waitpid(self.pid, os.WNOHANG)
-            except ChildProcessError:
-                break
-            if pid != 0:
-                break
-            await asyncio.sleep(0.1)
-        else:
-            self._signal_group(signal.SIGKILL)
-            # SIGKILL 뒤에도 거둬가지 않으면 좀비가 남는다. 서버는 오래 사는
-            # 프로세스라 유예 만료로 강제 종료된 세션마다 하나씩 쌓인다.
-            # SIGKILL은 즉시 반영되므로 짧게만 기다린다.
-            for _ in range(10):
-                try:
-                    if os.waitpid(self.pid, os.WNOHANG)[0] != 0:
-                        break
-                except ChildProcessError:
-                    break
-                await asyncio.sleep(0.1)
+        self._signal_group(signal.SIGHUP)
+        if not await self._wait_reaped(SIGHUP_WAIT):
+            self._signal_group(signal.SIGTERM)
+            if not await self._wait_reaped(SIGTERM_WAIT - SIGHUP_WAIT):
+                self._signal_group(signal.SIGKILL)
+                # SIGKILL 뒤에도 거둬가지 않으면 좀비가 남는다. 서버는 오래 사는
+                # 프로세스라 강제 종료된 세션마다 하나씩 쌓인다. SIGKILL은 즉시
+                # 반영되므로 짧게만 기다린다.
+                await self._wait_reaped(1)
         self.alive = False
         self._cleanup_fd()
 

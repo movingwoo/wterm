@@ -8,14 +8,48 @@ from __future__ import annotations
 import json
 import os
 import pwd
+import re
 import threading
 import time
 
 import pytest
+from server.session import Session
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 from websockets.sync.client import connect
 
 RECV_TIMEOUT = 20.0
+
+
+@pytest.mark.parametrize(
+    ("agent", "extra_args", "expected"),
+    [
+        (
+            "claude",
+            ["--resume"],
+            [
+                "claude",
+                "--settings",
+                '{"preferredNotifChannel":"terminal_bell"}',
+                "--resume",
+            ],
+        ),
+        (
+            "codex",
+            ["resume", "--last"],
+            ["codex", "-c", "tui.notifications=true", "resume", "--last"],
+        ),
+    ],
+)
+def test_agent_commands_pin_notification_channel(agent, extra_args, expected):
+    """알림 플래그는 사용자 설정이 아니라 이 세션의 프로세스에만 붙는다.
+
+    둘 다 기본값으로는 wterm의 PTY 안에서 조용하므로 플래그 하나가 빠져도 기능
+    전체가 아무 표시 없이 사라진다. 새 세션뿐 아니라 resume 인자가 그 뒤에 그대로
+    보존되는지도 함께 고정한다.
+    """
+    session = object.__new__(Session)
+    session.agent = agent
+    assert session._agent_cmd(extra_args) == expected
 
 
 def ws_connect(h, path: str, *, token: str | None = None, origin: str | None = ""):
@@ -59,6 +93,17 @@ def recv_until(ws, marker: str, timeout: float = RECV_TIMEOUT) -> str:
     raise AssertionError(f"{timeout}초 안에 {marker!r}를 보지 못함. 받은 출력:\n{seen}")
 
 
+def pid_alive(pid: int) -> bool:
+    """이 pid가 아직 살아 있는가. 서버가 같은 기계의 진짜 프로세스라 이렇게 본다."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # 남의 소유지만 존재는 한다
+    return True
+
+
 def send_line(ws, line: str) -> None:
     ws.send(json.dumps({"type": "input", "data": line + "\n"}))
 
@@ -66,8 +111,8 @@ def send_line(ws, line: str) -> None:
 def end_shell(ws, timeout: float = RECV_TIMEOUT) -> None:
     """`exit`로 셸을 정상 종료시키고 exit 알림까지 확인한다.
 
-    정리 시간도 같이 줄어든다 — 대화형 bash는 SIGTERM을 무시하므로, 세션을
-    살려둔 채 서버를 내리면 종료 경로가 SIGKILL까지 SIGTERM_WAIT(10초)를 꽉 채운다.
+    테스트가 연 세션을 스스로 닫아 teardown을 일정하게 만들고, 시그널 종료가 아닌
+    정상 exit 알림 경로도 이곳에서 확인한다.
 
     `true`를 먼저 보내는 이유: 인자 없는 `exit`는 `$?`를 그대로 반환하는데, 그
     시점의 `$?`는 셸 시작 파일이 남긴 값이다. macOS `/etc/bashrc`의 마지막 줄이
@@ -329,7 +374,7 @@ def test_idle_session_is_closed_and_reaped(start_server, project_dir):
                     assert "종료" in payload["message"]
     assert exc.value.rcvd.code == 4408
 
-    # 대화형 bash는 SIGTERM을 무시하므로 SIGKILL까지 SIGTERM_WAIT(10초)가 걸린다.
+    # 기본 대화형 셸은 첫 SIGHUP에 끝나지만 전체 에스컬레이션 예산 안에서 회수돼야 한다.
     deadline = time.monotonic() + 25
     while time.monotonic() < deadline:
         try:
@@ -388,7 +433,7 @@ def test_end_session_kills_the_child_and_closes_with_4409(start_server, project_
         recv_until(ws, pid_marker.name)
         child_pid = _read_pid(pid_marker)
 
-        # 대화형 bash는 SIGTERM을 무시하므로 이 호출은 SIGKILL까지 기다린다.
+        # 응답은 프로세스 회수가 끝난 뒤에 온다. 기본 셸은 첫 SIGHUP에 끝난다.
         r = c.post("/api/session/end?project=demo&agent=shell", timeout=40.0)
         assert r.status_code == 200, r.text
         assert r.json()["ended"] is True
@@ -410,13 +455,19 @@ def test_end_session_kills_the_child_and_closes_with_4409(start_server, project_
 def test_a_terminating_session_is_not_live(start_server, project_dir):
     """종료가 끝나기 전까지 그 세션은 라이브가 아니다.
 
-    대화형 bash는 SIGTERM을 무시해서 SIGKILL까지 SIGTERM_WAIT초가 걸린다. 그동안
-    `alive`는 아직 True인데, 그 상태를 라이브로 내주면 두 가지가 깨진다: 사이드바
-    배지가 곧 사라질 세션을 켜 두고, attach가 죽어가는 PTY에 화면을 물려준다
-    (fd가 정리되는 순간 아무 알림 없이 멎는다).
+    종료는 SIGHUP → SIGTERM → SIGKILL로 올라가고, 자식이 그것을 다 버티면 SIGKILL
+    까지 SIGTERM_WAIT초가 걸린다. 그동안 `alive`는 아직 True인데, 그 상태를 라이브로
+    내주면 두 가지가 깨진다: 사이드바 배지가 곧 사라질 세션을 켜 두고, attach가
+    죽어가는 PTY에 화면을 물려준다 (fd가 정리되는 순간 아무 알림 없이 멎는다).
 
     같은 창이 유예 만료 직후에도 열린다 — 그 경로는 재현이 비싸서 여기서는 명시적
     종료로 같은 상태를 만든다.
+
+    창을 만들려면 자식이 SIGHUP과 SIGTERM을 **둘 다** 버텨야 한다. 대화형 bash는
+    SIGTERM만 기본으로 무시하므로 HUP은 여기서 직접 막는다. 예전에는 SIGTERM을
+    먼저 보냈던 터라 그것만으로 10초가 났지만, 지금은 SIGHUP이 먼저 가고 셸이
+    그 자리에서 죽는다 — 그 즉시성이 종료 버튼의 요점이라 여기서 되돌릴 것이
+    아니라, 이 테스트가 필요한 조건을 명시적으로 만들어야 한다.
     """
     h = start_server()
     token = h.login()
@@ -424,8 +475,12 @@ def test_a_terminating_session_is_not_live(start_server, project_dir):
 
     with ws_connect(h, "/ws/demo?agent=shell", token=token) as ws:
         status_message(ws)
-        send_line(ws, "true")
-        recv_until(ws, "true")
+        # 트랩이 **실제로 걸린 뒤에** 종료를 시작해야 한다. 입력의 에코는 셸이
+        # 그 줄을 실행하기 전에도 돌아오므로, 에코와 구별되는 출력을 기다린다 —
+        # 그러지 않으면 트랩이 걸리기 전에 SIGHUP이 도착해 셸이 즉사하고, 이
+        # 테스트는 창을 못 본 채 통과 여부가 경합으로 갈린다.
+        send_line(ws, "trap '' HUP; echo TRAP-$((21 * 2))-SET")
+        recv_until(ws, "TRAP-42-SET")
 
     end = threading.Thread(
         target=lambda: c.post("/api/session/end?project=demo&agent=shell", timeout=40.0)
@@ -449,6 +504,50 @@ def test_a_terminating_session_is_not_live(start_server, project_dir):
 
     (demo,) = c.get("/api/projects").json()
     assert demo["shell_live"] is False
+
+
+def test_end_hangs_up_background_jobs(start_server):
+    """종료는 셸이 띄운 백그라운드 잡까지 정리한다 — `exit`과 같은 결과여야 한다.
+
+    대화형 셸은 잡 컨트롤을 켜고 돌아서 잡마다 자기 프로세스 그룹을 만든다.
+    killpg가 때리는 것은 셸의 그룹뿐이라 잡에는 아무것도 닿지 않고, 포그라운드
+    잡은 셸이 죽을 때 커널이 보내는 SIGHUP에 걸리지만 백그라운드 잡은 그것도
+    아니다. SIGTERM/SIGKILL만 보내던 시절에는 그래서 종료 버튼이 고아 프로세스를
+    남겼다 — 사용자가 `exit`을 쳤을 때는 셸이 자기 잡 전체에 HUP을 돌려 남지
+    않는데도. 지금은 SIGHUP이 먼저 가고 셸이 그 종료 경로를 정상적으로 탄다.
+
+    잡의 pid는 테스트 프로세스에서 직접 확인한다. 서버가 같은 기계의 진짜
+    프로세스라 자식 손자까지 pid로 볼 수 있다.
+    """
+    h = start_server()
+    token = h.login()
+    c = h.client(headers={"Origin": h.origin, "Cookie": f"wterm_token={token}"})
+
+    with ws_connect(h, "/ws/demo?agent=shell", token=token) as ws:
+        status_message(ws)
+        # 에코와 구별되는 출력에서 pid를 읽는다 (`$!`는 실행돼야 숫자가 된다).
+        # `$!` 뒤에는 공백을 둔다 — 대화형 bash의 히스토리 확장이 `!-`를
+        # 이벤트 참조로 읽어 "event not found"로 끝난다.
+        send_line(ws, "sleep 600 & echo J$((21 * 2))-$! END")
+        out = recv_until(ws, "J42-")
+        job_pid = int(re.search(r"J42-(\d+) END", out).group(1))
+
+    assert pid_alive(job_pid), "백그라운드 잡이 뜨지 않았다 — 테스트 전제가 깨짐"
+    try:
+        # 고쳐지기 전에는 이 POST가 SIGKILL까지 10초를 꽉 채운다. 기본 타임아웃으로
+        # 두면 실패가 HTTP 타임아웃으로 나서 무엇이 깨졌는지 안 보인다.
+        res = c.post("/api/session/end?project=demo&agent=shell", timeout=40.0)
+        assert res.json()["ended"] is True
+        deadline = time.monotonic() + 15
+        while pid_alive(job_pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not pid_alive(job_pid), "종료 후에도 백그라운드 잡이 살아남았다"
+    finally:
+        # 실패했을 때 sleep 600을 10분간 남겨두지 않는다.
+        try:
+            os.kill(job_pid, 9)
+        except ProcessLookupError:
+            pass
 
 
 def test_end_session_checks_origin_before_auth_before_whitelist(start_server):
