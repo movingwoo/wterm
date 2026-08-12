@@ -309,6 +309,11 @@ MAX_TOKENS = 512  # 발급 토큰 상한. 넘으면 오래된 것부터 버린�
 # 같이 하므로 벽시계 기준으로 보관할 이유가 없다.
 _valid_tokens: OrderedDict[bytes, float] = OrderedDict()  # 토큰 해시 -> 발급 시각
 _password_hasher = PasswordHasher()
+# 토큰 저장소에서 실제 폐기가 일어나면 열린 소켓의 watchdog을 즉시 깨운다.
+# 평상시에는 AUTH_RECHECK_INTERVAL마다 확인하지만, MAX_TOKENS 축출이 막 일어난
+# 소켓을 그 시간만큼 더 살려둘 이유는 없다. asyncio.Event는 현재 기다리는 모든
+# watchdog을 한 번에 깨우므로 소켓별 태스크/큐를 따로 관리하지 않아도 된다.
+_auth_tokens_changed = asyncio.Event()
 
 
 def _token_key(token: str) -> bytes:
@@ -318,12 +323,17 @@ def _token_key(token: str) -> bytes:
 
 def _issue_token() -> str:
     now = time.monotonic()
+    removed = False
     for key in [k for k, at in _valid_tokens.items() if now - at >= AUTH_TOKEN_TTL]:
         del _valid_tokens[key]
+        removed = True
     token = secrets.token_urlsafe(32)
     _valid_tokens[_token_key(token)] = now
     while len(_valid_tokens) > MAX_TOKENS:
         _valid_tokens.popitem(last=False)  # 가장 먼저 발급된 것부터
+        removed = True
+    if removed:
+        _auth_tokens_changed.set()
     return token
 
 
@@ -334,6 +344,8 @@ def _key_valid(key: bytes) -> bool:
         return False
     if time.monotonic() - issued_at >= AUTH_TOKEN_TTL:
         del _valid_tokens[key]
+        # 같은 토큰으로 연 다른 프로젝트의 소켓도 다음 30초를 기다리지 않는다.
+        _auth_tokens_changed.set()
         return False
     return True
 
@@ -378,7 +390,18 @@ async def _revoke_token_sockets(key: bytes) -> int:
 async def _auth_watchdog(ws: WebSocket, key: bytes) -> None:
     """토큰이 만료(또는 MAX_TOKENS에 밀려 소멸)되면 소켓을 닫는다."""
     while True:
-        await asyncio.sleep(AUTH_RECHECK_INTERVAL)
+        try:
+            # 만료는 별도 타이머가 없으므로 주기 검사가 잡는다. 반면 로그인 도중의
+            # TTL 청소나 MAX_TOKENS 축출은 저장소가 Event를 세워 즉시 여기로 온다.
+            await asyncio.wait_for(
+                _auth_tokens_changed.wait(), timeout=AUTH_RECHECK_INTERVAL
+            )
+        except asyncio.TimeoutError:
+            pass
+        else:
+            # clear와 검사 사이에 또 폐기되어도 아래 검사에 잡히고, 검사 뒤에
+            # 폐기되면 Event가 다시 set 상태로 남아 다음 wait가 즉시 끝난다.
+            _auth_tokens_changed.clear()
         if not _key_valid(key):
             await _close_unauthed(ws, "인증이 만료되었습니다")
             return
