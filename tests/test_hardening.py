@@ -44,7 +44,7 @@ def test_security_headers_cover_static_too(start_server):
     나가면 CSP는 아무것도 막지 못하므로 여기가 핵심이다."""
     h = start_server()
     c = h.client()
-    for path in ("/", "/static/app.js"):
+    for path in ("/", "/static/app.js", "/static/modules/project-status.js"):
         r = c.get(path)
         assert r.status_code == 200, path
         csp = r.headers["content-security-policy"]
@@ -74,6 +74,7 @@ def test_cache_policy_separates_api_and_static(start_server):
     assert c.get("/api/projects").headers["cache-control"] == "no-store"
     assert c.get("/").headers["cache-control"] == "no-cache"
     assert c.get("/static/app.js").headers["cache-control"] == "no-cache"
+    assert c.get("/static/modules/theme.js").headers["cache-control"] == "no-cache"
 
 
 def test_logout_clears_client_side_state(start_server):
@@ -309,9 +310,9 @@ def test_input_flood_is_capped_and_reported(start_server):
 
 
 def test_codex_history_scan_ignores_junk_and_caches(start_server, tmp_path, project_dir):
-    """Codex 기록 조회는 ~/.codex/sessions 전체를 훑는다 — 프론트가 10초마다
-    폴링하는 경로라 그대로 두면 파일이 쌓일수록 느려지고, 그동안 살아있는 모든
-    PTY 세션의 입출력이 멎는다. 스캔은 스레드에서 돌고 결과는 짧게 캐시된다.
+    """Codex 기록 조회는 ~/.codex/sessions 전체를 훑는다 — 상태 채널의 주기
+    재검사에서 그대로 돌리면 파일이 쌓일수록 느려지고, 그동안 살아있는 모든 PTY
+    세션의 입출력이 멎는다. 스캔은 스레드에서 돌고 결과는 짧게 캐시된다.
 
     HOME을 갈아끼워 가짜 세션 디렉터리를 물린다 (경로는 import 시점에 정해진다).
     """
@@ -331,7 +332,7 @@ def test_codex_history_scan_ignores_junk_and_caches(start_server, tmp_path, proj
     assert demo["codex_has_history"] is True
 
     # 캐시가 있다는 것을 결정적으로 확인한다: 기록을 지워도 TTL 안에서는 그대로다.
-    # 최신성을 조금 내주고 폴링마다 도는 전체 스캔을 없앤 것이 이 설계의 거래다.
+    # 최신성을 조금 내주고 상태 조회마다 도는 전체 스캔을 없앤 것이 이 설계의 거래다.
     (sessions / "rollout-ok.jsonl").unlink()
     (demo,) = c.get("/api/projects").json()
     assert demo["codex_has_history"] is True

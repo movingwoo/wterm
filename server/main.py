@@ -9,45 +9,62 @@ import asyncio
 import atexit
 import errno
 import fcntl
-import hashlib
 import json
 import logging
 import os
-import re
-import secrets
 import signal
 import ssl
 import time
-from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from anyio import to_thread
-from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError, InvalidHash
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from .audit import (
+    audit as _audit,
+    audit_throttled as _audit_throttled,
+    peer as _peer,
+    setup_audit_logging,
+)
+from .auth import AuthManager
 from .config import CONFIG_PATH, load_config
-from .session import SessionManager, has_codex_history, latest_session_id, remote_has_history
+from .project_status import ProjectStatusHub
+from .session import (
+    SessionManager,
+    has_codex_history,
+    latest_session_id,
+    remote_has_history,
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
 PID_FILE = BASE_DIR / "logs" / "wterm.pid"
 
 config = load_config()
+auth = AuthManager(config.password_hash)
 manager = SessionManager(
-    grace_seconds=config.grace_seconds, idle_seconds=config.idle_seconds
+    grace_seconds=config.grace_seconds,
+    idle_seconds=config.idle_seconds,
+    # 콜백은 세션을 시작할 때 처음 실행되므로 아래 hub 할당이 끝난 뒤다.
+    state_changed=lambda: project_status.changed(),
 )
+project_status = ProjectStatusHub(config, manager)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield
-    await manager.shutdown()
+    status_task = asyncio.create_task(project_status.run())
+    try:
+        yield
+    finally:
+        status_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await status_task
+        await manager.shutdown()
 
 
 app = FastAPI(title="W-Term", lifespan=lifespan)
@@ -204,352 +221,22 @@ def origin_allowed(conn) -> bool:
     return parts.scheme == "https" if _is_secure(conn) else True
 
 
-# ── 감사 로그 ───────────────────────────────────────────────────────
-#
-# 탐지용이 아니라 사후 조사용이다. 뚫렸다고 판단했을 때 "언제 무엇이 실행됐나"를
-# 모르면 전부 초기화하는 것 말고 선택지가 없다.
-#
-# wterm.log가 아니라 자체 파일을 쓴다. 그쪽은 backupCount=1이라 이틀치만 남아
-# 사후 조사라는 목적에 애초에 못 쓴다. propagate=False로 끊어서 ERROR 전용인
-# wterm.log에 INFO가 섞이지 않게 한다 (핸들러는 setup_logging에서 붙인다).
-#
-# **터미널 내용은 절대 남기지 않는다.** 여기 들어갈 수 있는 것은 세션
-# 메타데이터(프로젝트/에이전트/모드/시각/상대 주소)뿐이다. 입력을 남기면 이
-# 파일 자체가 패스워드와 API 키가 흐르는 통로가 된다.
-AUDIT_BACKUP_DAYS = 90
-
-# 값에는 쿼리 파라미터(mode, agent)와 요청 헤더(origin, host)가 그대로 실린다.
-# URL의 %0A는 디코딩되어 진짜 개행이 되므로, 거르지 않으면 요청 하나로 감사
-# 로그에 위조된 줄을 심을 수 있다 — 이 파일의 용도가 "뚫린 뒤에 무엇이
-# 실행됐나"를 읽는 것이라, 침해당한 쪽이 자기 흔적을 흐릴 수 있다는 뜻이 된다.
-# 호출부마다 검증하는 대신 여기 한 곳에서 막아 앞으로 추가되는 필드까지 덮는다.
-AUDIT_VALUE_MAX = 128  # 한 줄을 길이로 밀어내는 것도 흔적 흐리기다
-_AUDIT_UNSAFE = re.compile(r"[\x00-\x1f\x7f]")
-
-_audit_log = logging.getLogger("wterm.audit")
-_audit_log.setLevel(logging.INFO)
-_audit_log.propagate = False
-
-
-def _peer(conn) -> str:
-    """요청/소켓의 상대 주소. uds나 프록시 뒤에서는 없거나 프록시 IP뿐이다.
-    감사 기록의 client와 로그인 제한 버킷 키가 같은 값을 쓴다."""
-    return conn.client.host if conn.client else "-"
-
-
-def _audit_value(value) -> str:
-    """감사 기록에 실을 수 있는 형태로 값을 정규화한다 (개행·제어문자 제거)."""
-    text = _AUDIT_UNSAFE.sub("?", str(value))
-    return text if len(text) <= AUDIT_VALUE_MAX else text[:AUDIT_VALUE_MAX] + "…"
-
-
-def _audit(event: str, **fields) -> None:
-    """감사 기록 한 줄. `event key=value ...` 형태라 grep으로 추려낼 수 있다."""
-    detail = " ".join(
-        f"{k}={_audit_value(v)}" for k, v in fields.items() if v is not None
-    )
-    _audit_log.info("%s%s", event, f" {detail}" if detail else "")
-
-
-# 인증 **전에** 남는 기록은 인증 없는 상대가 마음대로 늘릴 수 있다. 감사 파일은
-# 크기 상한 없이 날짜로만 로테이션하므로(setup_logging), 거절 한 번에 한 줄이면
-# 로그인 제한이 막아둔 것과 같은 구멍이 라우트 앞단에 그대로 남는다 — 초당 수천 번
-# 거절당하는 것만으로 디스크가 찬다.
-#
-# 크기 상한을 거는 것은 답이 아니다. 상한을 넘겨 로테이션하면 backupCount가
-# "90일"이 아니라 "90개 파일"이 되어, 홍수 한 번에 90일치 기록이 밀려나간다 —
-# 이 파일이 존재하는 이유 자체가 사라진다. 그래서 파일을 자르는 대신 **줄을 접는다**:
-# 같은 (주소, 사유)는 창당 한 줄이고, 접힌 횟수는 다음 줄에 suppressed로 실린다.
-# 조사에 필요한 "언제 누가 무엇을 얼마나"는 남고, 양은 주소 수 × 창으로 묶인다.
-AUDIT_THROTTLE_WINDOW = 60.0
-AUDIT_THROTTLE_KEYS = 256  # 추적할 (주소, 사유) 상한. 넘으면 오래된 것부터 버린다
-
-_audit_throttle: OrderedDict[tuple[str, str], list] = OrderedDict()  # 키 -> [마지막 기록, 접힌 수]
-
-
-def _audit_throttled(event: str, client: str, reason: str, **fields) -> None:
-    """인증 전 거절 기록. 같은 (client, reason)은 창당 한 줄로 접는다."""
-    key = (client, reason)
-    now = time.monotonic()
-    entry = _audit_throttle.get(key)
-    if entry is not None and now - entry[0] < AUDIT_THROTTLE_WINDOW:
-        entry[1] += 1
-        return
-    suppressed = entry[1] if entry is not None else 0
-    _audit_throttle[key] = [now, 0]
-    _audit_throttle.move_to_end(key)
-    while len(_audit_throttle) > AUDIT_THROTTLE_KEYS:
-        _audit_throttle.popitem(last=False)
-    _audit(
-        event, reason=reason, client=client,
-        **fields, suppressed=suppressed or None,
-    )
-
-
-# ── 패스워드 인증 (projects.json에 password_hash가 있을 때만) ──────────
-#
-# 로그인 성공 시 발급한 토큰을 서버 메모리에만 보관한다 (무상태 철학 유지,
-# 서버 재시작 시 전부 무효화되어 재로그인 필요).
-#
-# 만료는 쿠키 max-age가 아니라 서버가 판정한다. max-age는 브라우저에게 하는 부탁일
-# 뿐이라, 탈취된 토큰은 그것만으로는 영원히 유효하다. 발급 시각을 함께 들고 있으면서
-# 검사할 때마다 확인하고, 폐기 수단으로 /api/logout을 둔다 (재시작은 폐기 수단이 될
-# 수 없다 — PTY 세션이 전부 죽는다).
-#
-# 보관하는 것은 토큰이 아니라 토큰의 sha256이다. dict 조회는 해시가 같은 키끼리
-# 바이트를 순차 비교하므로, 토큰을 그대로 키로 쓰면 조회 시간이 "앞에서 몇 바이트가
-# 맞았나"와 상관을 갖는다 — 32바이트 난수라 실효 공격은 어렵지만, 저장하는 값을
-# 바꾸는 것만으로 그 상관이 사라진다(공격자가 고른 토큰과 저장된 값의 관계가
-# 해시를 지나며 끊긴다). 덤으로 서버 메모리 덤프에 유효 토큰 자체가 남지 않는다.
-AUTH_COOKIE = "wterm_token"
-AUTH_TOKEN_TTL = 30 * 24 * 3600  # 쿠키 max-age와 서버측 만료를 같은 값으로 묶는다
-MAX_TOKENS = 512  # 발급 토큰 상한. 넘으면 오래된 것부터 버린다
-
-# 시계 변경에 영향받지 않도록 monotonic을 쓴다. 토큰은 어차피 프로세스와 수명을
-# 같이 하므로 벽시계 기준으로 보관할 이유가 없다.
-_valid_tokens: OrderedDict[bytes, float] = OrderedDict()  # 토큰 해시 -> 발급 시각
-_password_hasher = PasswordHasher()
-# 토큰 저장소에서 실제 폐기가 일어나면 열린 소켓의 watchdog을 즉시 깨운다.
-# 평상시에는 AUTH_RECHECK_INTERVAL마다 확인하지만, MAX_TOKENS 축출이 막 일어난
-# 소켓을 그 시간만큼 더 살려둘 이유는 없다. asyncio.Event는 현재 기다리는 모든
-# watchdog을 한 번에 깨우므로 소켓별 태스크/큐를 따로 관리하지 않아도 된다.
-_auth_tokens_changed = asyncio.Event()
-
-
-def _token_key(token: str) -> bytes:
-    """토큰을 보관·조회에 쓰는 키로. 원문은 어디에도 남기지 않는다."""
-    return hashlib.sha256(token.encode("utf-8", "surrogatepass")).digest()
-
-
-def _issue_token() -> str:
-    now = time.monotonic()
-    removed = False
-    for key in [k for k, at in _valid_tokens.items() if now - at >= AUTH_TOKEN_TTL]:
-        del _valid_tokens[key]
-        removed = True
-    token = secrets.token_urlsafe(32)
-    _valid_tokens[_token_key(token)] = now
-    while len(_valid_tokens) > MAX_TOKENS:
-        _valid_tokens.popitem(last=False)  # 가장 먼저 발급된 것부터
-        removed = True
-    if removed:
-        _auth_tokens_changed.set()
-    return token
-
-
-def _key_valid(key: bytes) -> bool:
-    """이 토큰 키가 아직 살아 있는지. 만료된 것은 여기서 지운다."""
-    issued_at = _valid_tokens.get(key)
-    if issued_at is None:
-        return False
-    if time.monotonic() - issued_at >= AUTH_TOKEN_TTL:
-        del _valid_tokens[key]
-        # 같은 토큰으로 연 다른 프로젝트의 소켓도 다음 30초를 기다리지 않는다.
-        _auth_tokens_changed.set()
-        return False
-    return True
-
-
-def is_authed(cookies: dict[str, str]) -> bool:
-    if config.password_hash is None:
-        return True
-    token = cookies.get(AUTH_COOKIE)
-    return token is not None and _key_valid(_token_key(token))
-
-
-# ── 열려 있는 WebSocket의 인증 ──────────────────────────────────────
-#
-# 인증 검사는 핸드셰이크 때 한 번뿐이라, 그것만으로는 **이미 붙어 있는 소켓**을
-# 아무것도 끊지 못한다. 로그아웃이 토큰만 지우고 끝나면 폰을 잃어버렸을 때
-# "다른 기기에서 로그아웃"이 통하지 않고, 30일 만료도 열린 세션은 비껴간다 —
-# 그러면 /api/logout이 폐기 수단이라는 설명과 실제 동작이 어긋난다.
-#
-# 그래서 소켓마다 붙은 토큰을 들고 있다가 로그아웃 시 즉시 닫고(아래 revoke),
-# 만료처럼 알림이 없는 경우는 주기적으로 다시 확인한다(watchdog). close code는
-# 새로 만들지 않고 4401을 재사용한다 — static/app.js가 이미 로그인 오버레이를 띄운다.
-AUTH_RECHECK_INTERVAL = 30.0
-
-_ws_tokens: dict[WebSocket, bytes] = {}  # 열린 소켓 -> 그 소켓을 연 토큰의 키
-
-
-async def _close_unauthed(ws: WebSocket, reason: str) -> None:
-    try:
-        await ws.close(code=4401, reason=reason)
-    except Exception:
-        pass  # 이미 끊긴 소켓. 루프 쪽 finally가 정리한다
-
-
-async def _revoke_token_sockets(key: bytes) -> int:
-    """그 토큰으로 열린 소켓을 전부 닫는다. 닫은 개수를 반환."""
-    victims = [ws for ws, k in _ws_tokens.items() if k == key]
-    for ws in victims:
-        await _close_unauthed(ws, "세션이 폐기되었습니다")
-    return len(victims)
-
-
-async def _auth_watchdog(ws: WebSocket, key: bytes) -> None:
-    """토큰이 만료(또는 MAX_TOKENS에 밀려 소멸)되면 소켓을 닫는다."""
-    while True:
-        try:
-            # 만료는 별도 타이머가 없으므로 주기 검사가 잡는다. 반면 로그인 도중의
-            # TTL 청소나 MAX_TOKENS 축출은 저장소가 Event를 세워 즉시 여기로 온다.
-            await asyncio.wait_for(
-                _auth_tokens_changed.wait(), timeout=AUTH_RECHECK_INTERVAL
-            )
-        except asyncio.TimeoutError:
-            pass
-        else:
-            # clear와 검사 사이에 또 폐기되어도 아래 검사에 잡히고, 검사 뒤에
-            # 폐기되면 Event가 다시 set 상태로 남아 다음 wait가 즉시 끝난다.
-            _auth_tokens_changed.clear()
-        if not _key_valid(key):
-            await _close_unauthed(ws, "인증이 만료되었습니다")
-            return
-
-
-def _set_auth_cookie(resp: Response, request: Request, token: str) -> None:
-    # samesite=strict: 인증 확인은 같은 오리진에서 뜬 페이지의 fetch/WS만 하므로
-    # 교차 사이트 진입 흐름이 없다. 첫 문서 요청(/)은 쿠키를 보지 않는 덕에
-    # 외부 링크로 들어와도 화면이 깨지지 않는다.
-    resp.set_cookie(
-        AUTH_COOKIE,
-        token,
-        max_age=AUTH_TOKEN_TTL,
-        httponly=True,
-        samesite="strict",
-        secure=_is_secure(request),
-    )
-
-
-# ── 로그인 시도 제한 ────────────────────────────────────────────────
-#
-# argon2 검증 1회가 64 MiB / 35ms를 쓴다. 제한이 없으면 인증 없이 누구나 그 비용을
-# 태울 수 있고, 검증을 스레드로 뺀 뒤에도 비용 자체는 그대로다. 그래서 두 겹으로 막는다:
-#   (1) 버킷별 실패 횟수에 지수 백오프 — 반복 시도를 검증 전에 잘라낸다
-#   (2) 전역 동시 검증 수 제한 — IP를 흩뿌리는 시도에도 총비용의 상한을 준다
-# (1)만으로는 분산 시도를 막지 못하고 (2)만으로는 무차별 대입을 막지 못한다.
-
-LOGIN_FREE_ATTEMPTS = 5  # 이 횟수까지는 지연 없음 (오타 여유)
-LOGIN_BACKOFF_MAX = 900.0  # 차단 상한 15분
-LOGIN_FAIL_DECAY = 900.0  # 마지막 차단이 풀린 뒤 이만큼 조용하면 실패 횟수 리셋
-LOGIN_BUCKET_LIMIT = 1024  # 추적할 버킷 상한 (IP를 바꿔가며 채우는 것 방지)
-LOGIN_MAX_CONCURRENT = 2  # 동시 argon2 검증 수
-# 본문 상한. request.json()은 본문을 통째로 메모리에 올리는데 이 경로는 인증
-# 이전이고, 시도 제한은 LOGIN_FREE_ATTEMPTS회를 지나야 걸린다 — 그 사이에 몇 백
-# MB짜리 본문을 그대로 받으면 argon2 비용을 아끼려고 만든 방어가 그 앞단의
-# 메모리로 우회된다. 받는 것이 패스워드 하나뿐이라 아주 낮게 잡아도 잃는 것이 없다.
-LOGIN_BODY_LIMIT = 4096
-
-_login_fails: OrderedDict[str, tuple[int, float]] = OrderedDict()  # 키 -> (실패수, 해제시각)
-_login_slots = asyncio.Semaphore(LOGIN_MAX_CONCURRENT)
-
-
-# 제한 버킷 키는 상대 주소(_peer)를 그대로 쓴다. uds나 프록시 뒤에서는 실제
-# 클라이언트 IP가 없거나 프록시 IP뿐이라 전부 한 버킷으로 모인다 — 그 구성에서는
-# 앞단이 IP별 제한을 맡고, 여기서는 전역 제한으로만 동작한다.
-
-
-def _login_block_remaining(key: str, now: float) -> float:
-    """남은 차단 시간(초). 0이면 통과."""
-    entry = _login_fails.get(key)
-    return max(0.0, entry[1] - now) if entry else 0.0
-
-
-def _record_login_failure(key: str, now: float) -> None:
-    fails, unblock_at = _login_fails.pop(key, (0, 0.0))
-    if now - unblock_at > LOGIN_FAIL_DECAY:
-        fails = 0  # 한참 조용했으면 새로 센다 (오타가 영구 누적되지 않도록)
-    fails += 1
-    delay = (
-        min(2.0 ** (fails - LOGIN_FREE_ATTEMPTS), LOGIN_BACKOFF_MAX)
-        if fails > LOGIN_FREE_ATTEMPTS
-        else 0.0
-    )
-    if delay:
-        _audit("login-blocked", client=key, fails=fails, seconds=int(delay))
-    _login_fails[key] = (fails, now + delay)  # pop 후 재삽입이라 이미 맨 뒤(=최신)
-    while len(_login_fails) > LOGIN_BUCKET_LIMIT:
-        _login_fails.popitem(last=False)
-
-
 @app.post("/api/login")
 async def login(request: Request):
-    """패스워드 검증 후 HttpOnly 쿠키로 세션 토큰을 발급한다."""
-    key = _peer(request)
-    if not origin_allowed(request):
-        _audit(
-            "login-reject", reason="origin", client=key,
-            origin=request.headers.get("origin"), host=request.headers.get("host"),
-        )
-        return JSONResponse({"ok": False}, status_code=403)
-    if config.password_hash is None:
-        return JSONResponse({"ok": True})
-    # 본문을 읽기 전에 크기부터 본다. Content-Length가 없는 요청(chunked)도
-    # 거부한다 — 그러지 않으면 길이를 안 밝히는 것만으로 이 검사를 건너뛴다.
-    # 브라우저 fetch는 문자열 본문에 항상 Content-Length를 붙이므로 잃는 것이 없다.
-    declared = request.headers.get("content-length")
-    if declared is None or not declared.isdigit():
-        return JSONResponse({"ok": False}, status_code=411)
-    if int(declared) > LOGIN_BODY_LIMIT:
-        return JSONResponse({"ok": False}, status_code=413)
-    wait = _login_block_remaining(key, time.monotonic())
-    if wait > 0:
-        # 차단 중에는 argon2를 아예 돌리지 않는다. 비용을 안 태우는 것이 요점이다.
-        # 여기서 감사 기록을 남기지 않는 것도 같은 이유다 — 차단된 상대가 계속
-        # 두드리면 인증 없이 감사 파일을 무한히 부풀릴 수 있다. 차단이 걸린
-        # 순간의 login-blocked 한 줄이면 사후 조사에는 충분하다.
-        retry_after = int(wait) + 1
-        return JSONResponse(
-            {"ok": False, "retry_after": retry_after},
-            status_code=429,
-            headers={"Retry-After": str(retry_after)},
-        )
-    try:
-        body = await request.json()
-        password = str(body["password"])
-    except (json.JSONDecodeError, KeyError, TypeError, UnicodeDecodeError):
-        return JSONResponse({"ok": False}, status_code=400)
-    try:
-        async with _login_slots:
-            # argon2 검증은 64 MiB짜리 동기 CPU 작업이다. 이벤트 루프에서 그대로
-            # 돌리면 검증 한 번마다 살아있는 모든 PTY 세션의 입출력이 멎는다.
-            await to_thread.run_sync(
-                _password_hasher.verify, config.password_hash, password
-            )
-    except (VerifyMismatchError, InvalidHash):
-        _audit("login-fail", client=key)
-        _record_login_failure(key, time.monotonic())
-        return JSONResponse({"ok": False}, status_code=401)
-    _login_fails.pop(key, None)
-    _audit("login-ok", client=key)
-    resp = JSONResponse({"ok": True})
-    _set_auth_cookie(resp, request, _issue_token())
-    return resp
+    return await auth.login(
+        request,
+        origin_allowed=origin_allowed,
+        request_is_secure=_is_secure(request),
+    )
 
 
 @app.post("/api/logout")
 async def logout(request: Request):
-    """토큰을 서버에서 지우고 쿠키를 만료시킨다."""
-    if not origin_allowed(request):
-        return JSONResponse({"ok": False}, status_code=403)
-    token = request.cookies.get(AUTH_COOKIE)
-    closed = 0
-    if token:
-        key = _token_key(token)
-        _valid_tokens.pop(key, None)
-        # 토큰만 지우면 이미 열린 소켓은 그대로 살아서 명령을 계속 실행한다.
-        closed = await _revoke_token_sockets(key)
-    _audit("logout", client=_peer(request), sockets=closed)
-    resp = JSONResponse({"ok": True})
-    resp.delete_cookie(
-        AUTH_COOKIE, httponly=True, samesite="strict", secure=_is_secure(request)
+    return await auth.logout(
+        request,
+        origin_allowed=origin_allowed,
+        request_is_secure=_is_secure(request),
     )
-    # 남는 것은 사이드바 접힘 상태 정도라 실익은 작지만, 공용 기기에서 로그아웃한
-    # 사람이 기대하는 것은 "흔적이 남지 않는다"다. "cookies"는 넣지 않는다 —
-    # 그 지시어는 등록 가능 도메인 전체(같은 상위 도메인의 다른 서브도메인 포함)의
-    # 쿠키를 지워, 위의 delete_cookie가 하는 일보다 훨씬 넓게 번진다.
-    resp.headers["Clear-Site-Data"] = '"cache", "storage"'
-    return resp
 
 
 @app.get("/")
@@ -559,28 +246,50 @@ async def index():
 
 @app.get("/api/projects")
 async def list_projects(request: Request):
-    """화이트리스트 프로젝트 목록과 각 프로젝트의 상태를 반환한다."""
-    if not is_authed(request.cookies):
+    """상태 채널과 같은 현재 스냅샷을 반환하는 단발성 API."""
+    if not auth.is_authed(request.cookies):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    result = []
-    for p in config.projects:
-        result.append(
-            {
-                "name": p.name,
-                "path": p.path,
-                "ssh": p.ssh,
-                "live": manager.get_live(f"{p.name}#claude") is not None,
-                "codex_live": manager.get_live(f"{p.name}#codex") is not None,
-                "shell_live": manager.get_live(f"{p.name}#shell") is not None,
-                # 원격은 목록 조회 때마다 ssh를 돌리기엔 느려서 낙관적으로 true
-                # (실제 판단은 WS 접속 시 remote_has_history로 수행)
-                "has_history": True if p.ssh else latest_session_id(p.path) is not None,
-                "codex_has_history": (
-                    True if p.ssh else await has_codex_history(p.path)
-                ),
-            }
+    return await project_status.snapshot()
+
+
+@app.websocket("/api/projects/ws")
+async def project_status_ws(ws: WebSocket):
+    """인증된 프로젝트 상태 푸시 채널. 클라이언트 입력은 모두 무시한다."""
+    client = _peer(ws)
+    if not origin_allowed(ws):
+        _audit_throttled(
+            "project-status-ws-reject", client, "origin",
+            origin=ws.headers.get("origin"), host=ws.headers.get("host"),
         )
-    return result
+        await ws.close(code=4403, reason="허용되지 않은 오리진")
+        return
+
+    await ws.accept()
+    if not auth.is_authed(ws.cookies):
+        _audit_throttled("project-status-ws-reject", client, "unauthorized")
+        await ws.close(code=4401, reason="인증 필요")
+        return
+
+    watchdog = auth.register_socket(ws)
+
+    project_status.add(ws)
+    _audit("project-status-ws-open", client=client)
+    try:
+        while True:
+            try:
+                message = await ws.receive()
+            except RuntimeError:
+                # 로그아웃/만료 watchdog이 이미 닫은 경우.
+                break
+            if message["type"] == "websocket.disconnect":
+                break
+            # 이 채널은 서버→클라이언트 전용이다. 그 밖의 프레임은 조용히 무시한다.
+    except WebSocketDisconnect:
+        pass
+    finally:
+        project_status.discard(ws)
+        auth.unregister_socket(ws, watchdog)
+        _audit("project-status-ws-close", client=client)
 
 
 WS_MODES = ("attach", "new", "resume", "continue")
@@ -610,7 +319,7 @@ async def end_session(request: Request, project: str, agent: str = "claude"):
             origin=request.headers.get("origin"), host=request.headers.get("host"),
         )
         return JSONResponse({"ok": False}, status_code=403)
-    if not is_authed(request.cookies):
+    if not auth.is_authed(request.cookies):
         _audit_throttled("session-end-reject", client, "unauthorized", project=project)
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     # 여기부터는 인증된 호출자만 도달한다 — 접지 않고 그대로 남긴다. 세션을 끊는
@@ -623,7 +332,7 @@ async def end_session(request: Request, project: str, agent: str = "claude"):
         _audit("session-end-reject", reason="bad-agent", client=client, agent=agent)
         return JSONResponse({"ok": False}, status_code=400)
     # 이미 없는 세션이어도 200이다. 종료 버튼을 누른 사람이 원한 상태가 곧
-    # 그것이고, 라이브 여부는 폴링과 어차피 어긋난다.
+    # 그것이고, 라이브 여부는 클라이언트가 받은 직전 스냅샷과 어긋날 수 있다.
     ended = await manager.end(f"{project}#{agent}")
     _audit("session-end", client=client, project=project, agent=agent, ended=ended)
     return JSONResponse({"ok": True, "ended": ended})
@@ -685,7 +394,7 @@ async def terminal_ws(
 
     # 인증을 프로젝트/에이전트 검사보다 먼저 본다. 순서가 반대면 인증 없는 상대가
     # 4404/4400 여부로 화이트리스트에 무엇이 있는지 떠볼 수 있다.
-    if not is_authed(ws.cookies):
+    if not auth.is_authed(ws.cookies):
         _audit_throttled("ws-reject", client, "unauthorized", project=project_name)
         await ws.close(code=4401, reason="인증 필요")
         return
@@ -721,7 +430,8 @@ async def terminal_ws(
     elif agent == "shell":
         action = "start"
         session = await manager.start(
-            session_key, project.path, ssh=project.ssh, agent="shell"
+            session_key, project.path, ssh=project.ssh, agent="shell",
+            project_env=project.env,
         )
         await session.attach(ws)
         await ws.send_text(
@@ -749,7 +459,8 @@ async def terminal_ws(
             action = "start"
             extra_args, msg = None, "새 세션을 시작합니다."
         session = await manager.start(
-            session_key, project.path, extra_args, ssh=project.ssh, agent=agent
+            session_key, project.path, extra_args, ssh=project.ssh, agent=agent,
+            command_args=project.args_for(agent), project_env=project.env,
         )
         await session.attach(ws)
         await ws.send_text(json.dumps({"type": "status", "message": msg}))
@@ -764,12 +475,7 @@ async def terminal_ws(
 
     # 이 소켓을 연 토큰을 기록해 두면 로그아웃이 여기까지 닿는다. 인증이 꺼진
     # 구성(password_hash 없음)에는 폐기할 토큰 자체가 없으므로 건너뛴다.
-    token = ws.cookies.get(AUTH_COOKIE) if config.password_hash is not None else None
-    watchdog: asyncio.Task | None = None
-    if token:
-        key = _token_key(token)
-        _ws_tokens[ws] = key
-        watchdog = asyncio.ensure_future(_auth_watchdog(ws, key))
+    watchdog = auth.register_socket(ws)
 
     # 프로토콜 경계다. 여기서 걸러지지 않은 형식 오류는 전부 루프 밖으로 나가
     # 세션을 끊는다 — 자기 세션만 끊는 자해라 보안 문제는 아니지만, 버그난
@@ -809,9 +515,7 @@ async def terminal_ws(
     except WebSocketDisconnect:
         pass
     finally:
-        if watchdog is not None:
-            watchdog.cancel()
-        _ws_tokens.pop(ws, None)
+        auth.unregister_socket(ws, watchdog)
         session.detach(ws)
         _audit(
             "ws-close", client=client, project=project_name, agent=agent,
@@ -989,14 +693,7 @@ def setup_logging() -> None:
     root.addHandler(file_handler)
     root.addHandler(stream_handler)
 
-    audit_handler = TimedRotatingFileHandler(
-        log_dir / "wterm-audit.log",
-        when="midnight",
-        backupCount=AUDIT_BACKUP_DAYS,
-        encoding="utf-8",
-    )
-    audit_handler.setFormatter(fmt)
-    _audit_log.addHandler(audit_handler)
+    setup_audit_logging(log_dir, fmt)
 
 
 # ── 비밀 파일 권한 ──────────────────────────────────────────────────
@@ -1042,8 +739,17 @@ def main() -> None:
     # uvicorn이 serve() 진입 시 이 핸들러를 저장했다가 종료 직전에 복원하고
     # SIGTERM을 되던진다. 반드시 uvicorn.run() 전에 걸어야 한다.
     signal.signal(signal.SIGTERM, _exit_success)
-    # log_config=None: uvicorn 자체 로깅 설정을 끄고 위 root 로거로 전파시킴
-    kwargs = {"log_config": None, "access_log": False}
+    # log_config=None: uvicorn 자체 로깅 설정을 끄고 위 root 로거로 전파시킴.
+    # 구현 선택을 auto에 맡기면 설치된 extra와 uvicorn 릴리즈에 따라 이벤트 루프나
+    # HTTP/WS 프로토콜이 조용히 바뀐다. macOS에서 그 조합의 TLS WSS 업그레이드가
+    # 간헐적으로 멎은 적이 있으므로 CI와 운영이 검증한 조합을 명시한다.
+    kwargs = {
+        "log_config": None,
+        "access_log": False,
+        "loop": "asyncio",
+        "http": "httptools",
+        "ws": "websockets-sansio",
+    }
     if config.uds:
         if config.tls_enabled:
             # UDS는 앞단 프록시가 TLS를 담당하는 구성이므로 여기서 겹칠 이유가 없다.

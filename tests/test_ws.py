@@ -9,6 +9,7 @@ import json
 import os
 import pwd
 import re
+import shlex
 import threading
 import time
 
@@ -21,13 +22,16 @@ RECV_TIMEOUT = 20.0
 
 
 @pytest.mark.parametrize(
-    ("agent", "extra_args", "expected"),
+    ("agent", "command_args", "extra_args", "expected"),
     [
         (
             "claude",
+            ["--model", "sonnet"],
             ["--resume"],
             [
                 "claude",
+                "--model",
+                "sonnet",
                 "--settings",
                 '{"preferredNotifChannel":"terminal_bell"}',
                 "--resume",
@@ -35,12 +39,18 @@ RECV_TIMEOUT = 20.0
         ),
         (
             "codex",
+            ["-c", "tui.notifications=false", "--model", "gpt-5.4"],
             ["resume", "--last"],
-            ["codex", "-c", "tui.notifications=true", "resume", "--last"],
+            [
+                "codex", "-c", "tui.notifications=false", "--model", "gpt-5.4",
+                "-c", "tui.notifications=true", "resume", "--last",
+            ],
         ),
     ],
 )
-def test_agent_commands_pin_notification_channel(agent, extra_args, expected):
+def test_agent_commands_pin_notification_channel(
+    agent, command_args, extra_args, expected
+):
     """알림 플래그는 사용자 설정이 아니라 이 세션의 프로세스에만 붙는다.
 
     둘 다 기본값으로는 wterm의 PTY 안에서 조용하므로 플래그 하나가 빠져도 기능
@@ -49,7 +59,27 @@ def test_agent_commands_pin_notification_channel(agent, extra_args, expected):
     """
     session = object.__new__(Session)
     session.agent = agent
+    session.command_args = command_args
     assert session._agent_cmd(extra_args) == expected
+
+
+def test_remote_command_quotes_project_args_and_environment():
+    """원격 설정값은 셸 코드가 아니라 env/CLI argv 한 요소로 도착해야 한다."""
+    session = object.__new__(Session)
+    session.agent = "codex"
+    session.ssh = "user@remote"
+    session.cwd = "/work/a project"
+    session.command_args = ["--model", "configured model"]
+    session.project_env = {"PROJECT_VALUE": "space ; $(not-a-command)"}
+
+    base = [
+        "env", "PROJECT_VALUE=space ; $(not-a-command)",
+        "codex", "--model", "configured model",
+        "-c", "tui.notifications=true", "resume", "--last",
+    ]
+    inner = f"cd {shlex.quote(session.cwd)} && exec {shlex.join(base)}"
+    expected = ["ssh", "-t", "user@remote", f"exec bash -lc {shlex.quote(inner)}"]
+    assert session._command(["resume", "--last"]) == expected
 
 
 def ws_connect(h, path: str, *, token: str | None = None, origin: str | None = ""):
@@ -146,6 +176,23 @@ def status_message(ws) -> str:
     return payload["message"]
 
 
+def project_status(ws, **expected):
+    """상태 채널에서 demo가 원하는 라이브 상태가 될 때까지 스냅샷을 읽는다."""
+    deadline = time.monotonic() + RECV_TIMEOUT
+    last = None
+    while time.monotonic() < deadline:
+        msg = ws.recv(timeout=max(0.1, deadline - time.monotonic()))
+        if not isinstance(msg, str):
+            continue
+        payload = json.loads(msg)
+        if payload.get("type") != "projects":
+            continue
+        last = next(p for p in payload["projects"] if p["name"] == "demo")
+        if all(last.get(key) == value for key, value in expected.items()):
+            return last
+    raise AssertionError(f"프로젝트 상태가 {expected!r}로 바뀌지 않음: {last!r}")
+
+
 # ── 접속 거부 경로 ───────────────────────────────────────────────────
 #
 # 오리진 검사만 ws.accept() 전에 닫는다. Starlette이 핸드셰이크를 HTTP 403으로
@@ -204,7 +251,49 @@ def test_unauthenticated_unknown_project_still_says_4401(start_server):
     assert exc.value.rcvd.code == 4401
 
 
+def test_project_status_websocket_uses_same_security_boundary(start_server):
+    """상태 전용 소켓도 터미널과 같은 Origin 선검사와 4401 계약을 지킨다."""
+    h = start_server()
+    token = h.login()
+    with pytest.raises(InvalidStatus) as exc:
+        ws_connect(h, "/api/projects/ws", token=token, origin=None)
+    assert exc.value.response.status_code == 403
+
+    with ws_connect(h, "/api/projects/ws") as ws:
+        with pytest.raises(ConnectionClosed) as exc:
+            ws.recv(timeout=RECV_TIMEOUT)
+    assert exc.value.rcvd.code == 4401
+
+
 # ── PTY 왕복 ─────────────────────────────────────────────────────────
+
+
+def test_project_status_websocket_pushes_session_lifecycle(start_server):
+    """브라우저 폴링 없이 세션 시작·자연 종료·명시 종료가 즉시 배지에 도달한다."""
+    h = start_server()
+    token = h.login()
+    client = h.client(headers={"Origin": h.origin, "Cookie": f"wterm_token={token}"})
+
+    with ws_connect(h, "/api/projects/ws", token=token) as state:
+        project_status(state, live=False, codex_live=False, shell_live=False)
+
+        # 자연 종료는 Session._handle_exit 경로다.
+        with ws_connect(h, "/ws/demo?agent=shell", token=token) as shell:
+            status_message(shell)
+            project_status(state, shell_live=True)
+            end_shell(shell)
+        project_status(state, shell_live=False)
+
+        # 명시 종료는 terminate 진입 즉시 라이브 판정에서 빠져야 한다.
+        with ws_connect(h, "/ws/demo?agent=shell", token=token) as shell:
+            status_message(shell)
+            project_status(state, shell_live=True)
+            response = client.post(
+                "/api/session/end?project=demo&agent=shell", timeout=40.0
+            )
+            assert response.status_code == 200
+            project_status(state, shell_live=False)
+
 
 
 def test_shell_session_roundtrip(start_server):
@@ -228,6 +317,60 @@ def test_shell_session_roundtrip(start_server):
         assert demo["live"] is False  # claude 세션과 키가 분리되어 있다
 
         end_shell(ws)
+
+
+def test_project_args_and_environment_reach_local_session(
+    start_server, project_dir
+):
+    """projects.json → route → PTY의 실제 argv/env를 끝까지 왕복한다.
+
+    API 응답에는 설정을 싣지 않는다. 환경변수나 실행 인자에는 토큰이 들어갈 수
+    있으므로 프로젝트 목록으로 브라우저에 노출되면 안 된다.
+    """
+    bin_dir = project_dir / "test-bin"
+    bin_dir.mkdir()
+    fake_claude = bin_dir / "claude"
+    fake_claude.write_text(
+        "#!/bin/sh\n"
+        "printf 'ARGS='\n"
+        "for arg in \"$@\"; do printf '<%s>' \"$arg\"; done\n"
+        "printf '\\r\\nPROJECT_ENV=<%s>\\r\\n' \"$WTERM_PROJECT_VALUE\"\n"
+        "sleep 0.2\n",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(0o755)
+
+    h = start_server(
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+        projects=[
+            {
+                "name": "demo",
+                "path": str(project_dir),
+                "args": {"claude": ["--model", "configured model"]},
+                "env": {"WTERM_PROJECT_VALUE": "space;$HOME"},
+            }
+        ],
+    )
+    token = h.login()
+    with ws_connect(h, "/ws/demo?agent=claude&mode=new", token=token) as ws:
+        status_message(ws)
+        seen = recv_until(ws, "PROJECT_ENV=<space;$HOME>")
+        assert "ARGS=<--model><configured model>" in seen
+        assert '<--settings><{"preferredNotifChannel":"terminal_bell"}>' in seen
+
+        while True:
+            msg = ws.recv(timeout=RECV_TIMEOUT)
+            if isinstance(msg, bytes):
+                continue
+            payload = json.loads(msg)
+            if payload["type"] == "exit":
+                assert payload["code"] == 0
+                break
+
+    with h.client(headers={"Origin": h.origin, "Cookie": f"wterm_token={token}"}) as c:
+        (project,) = c.get("/api/projects").json()
+    assert "args" not in project
+    assert "env" not in project
 
 
 def test_malformed_messages_do_not_kill_the_session(start_server):

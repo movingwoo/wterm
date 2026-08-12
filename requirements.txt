@@ -1,3 +1,7 @@
 fastapi>=0.115
-uvicorn[standard]>=0.30
+# auto 구현과 전이 의존성이 새 릴리즈에 맞춰 함께 바뀌면 같은 커밋의 TLS/WSS
+# 동작도 달라진다. server/main.py가 명시한 네트워크 스택은 검증한 버전으로 고정한다.
+uvicorn==0.52.1
+httptools==0.8.0
+websockets==16.1.1
 argon2-cffi>=23.1

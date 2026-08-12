@@ -12,7 +12,7 @@
     <h1>W-Term</h1>
     <div id="project-list"></div>
     <div id="conn-status" class="disconnected">연결 안 됨</div>
-    <!-- 시스템/라이트/다크. 버튼은 app.js가 채운다. -->
+    <!-- 시스템/라이트/다크. 버튼은 modules/theme.js가 채운다. -->
     <div id="theme-picker" role="group" aria-label="테마"></div>
     <!-- 권한 요청은 클릭에서만 띄운다. Safari는 사용자 제스처 없는
          Notification.requestPermission()을 아예 거부하고, 다른 브라우저도
@@ -34,7 +34,7 @@
     <!-- 창(pane)은 app.js가 만든다. 큰 화면에서는 최대 둘까지 좌우로 나뉘고,
          창마다 자기 탭 줄과 터미널 더미를 가진다. -->
     <div id="panes"></div>
-    <!-- 폰 소프트 키보드에 없는 키들. 버튼은 app.js가 채운다. -->
+    <!-- 폰 소프트 키보드에 없는 키들. 버튼은 modules/key-bar.js가 채운다. -->
     <div id="key-bar" role="toolbar" aria-label="터미널 특수키"></div>
   </main>
   <div id="login-overlay">
@@ -53,6 +53,7 @@
   </div>
   <script src="/static/vendor/xterm.js"></script>
   <script src="/static/vendor/addon-fit.js"></script>
-  <script src="/static/app.js"></script>
+  <script src="/static/vendor/addon-search.js"></script>
+  <script type="module" src="/static/app.js"></script>
 </body>
 </html>

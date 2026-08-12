@@ -57,6 +57,61 @@ def test_ssh_project_skips_local_path_check(load):
     ]
 
 
+def test_project_args_and_environment_are_validated_and_copied(load, tmp_path):
+    path = tmp_path / "configured"
+    path.mkdir()
+    cfg = load(
+        {
+            "projects": [
+                {
+                    "name": "configured",
+                    "path": str(path),
+                    "args": {
+                        "claude": ["--model", "sonnet"],
+                        "codex": ["--model", "gpt-5.4"],
+                    },
+                    "env": {"PROJECT_KIND": "configured", "EMPTY": ""},
+                }
+            ]
+        }
+    )
+    project = cfg.projects[0]
+    assert project.args == {
+        "claude": ["--model", "sonnet"],
+        "codex": ["--model", "gpt-5.4"],
+    }
+    assert project.env == {"PROJECT_KIND": "configured", "EMPTY": ""}
+
+    own_args = project.args_for("claude")
+    own_args.append("--unexpected")
+    assert project.args_for("claude") == ["--model", "sonnet"]
+    assert project.args_for("shell") == []
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        {"args": []},
+        {"args": {"shell": []}},
+        {"args": {"claude": "--model sonnet"}},
+        {"args": {"claude": ["--model", 3]}},
+        {"args": {"claude": ["bad\0arg"]}},
+        {"args": {"codex": ["--"]}},
+        {"env": []},
+        {"env": {"BAD-NAME": "value"}},
+        {"env": {"TERM": "dumb"}},
+        {"env": {"COUNT": 3}},
+        {"env": {"VALUE": "bad\0value"}},
+    ],
+)
+def test_invalid_project_runtime_config_fails_loudly(load, tmp_path, runtime):
+    path = tmp_path / "configured"
+    path.mkdir()
+    project = {"name": "configured", "path": str(path), **runtime}
+    with pytest.raises(ValueError, match="프로젝트 'configured'"):
+        load({"projects": [project]})
+
+
 def test_tls_needs_both_files(load, capsys):
     """한쪽만 있으면 HTTPS를 켤 수 없다. 조용히 평문으로 뜨면 알아채기 어렵다."""
     cfg = load({"tls_certfile": "/tmp/full.pem"})
