@@ -58,3 +58,8 @@ def test_theme_and_key_bar_are_es_module_boundaries():
     assert 'from "./modules/key-bar.js"' in app
     assert "export function createKeyBar" in key_bar
     assert 'const storageKey = "wterm.terminal.fontSize"' in key_bar
+
+
+def test_remote_history_failure_does_not_auto_reconnect():
+    app = (ROOT / "static" / "app.js").read_text()
+    assert "ev.code === 4410" in app

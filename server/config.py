@@ -7,7 +7,7 @@ projects.json 예시:
   "uds": "/app/wterm/run/wterm.sock",
   "grace_seconds": 60,
   "idle_seconds": 0,
-  "password_hash": "<argon2id 해시. 없으면 무인증>",
+  "password_hash": null,
   "allowed_origins": ["https://wterm.example.com:8443"],
   "tls_certfile": "/Users/me/.wterm/fullchain.pem",
   "tls_keyfile": "/Users/me/.wterm/key.pem",
@@ -56,13 +56,21 @@ HTTPS로 리슨한다 (uds 사용 시에는 무시됨). 인증서를 발급/갱�
 from __future__ import annotations
 
 import json
+import ipaddress
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
+
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "projects.json"
 PROJECT_ARG_AGENTS = frozenset(("claude", "codex"))
 ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+PORT_MAX = 65535
+GRACE_SECONDS_MAX = 24 * 60 * 60
+IDLE_SECONDS_MAX = 365 * 24 * 60 * 60
 
 
 @dataclass
@@ -92,6 +100,8 @@ class Config:
     allowed_origins: list[str] = field(default_factory=list)
     tls_certfile: str | None = None  # 풀체인 PEM. keyfile과 함께 있을 때만 HTTPS
     tls_keyfile: str | None = None  # 개인키 PEM
+    # loopback 밖의 무인증 또는 평문 TCP를 정말 의도한 경우에만 켜는 위험 승인.
+    allow_insecure_tcp: bool = False
     projects: list[Project] = field(default_factory=list)
 
     @property
@@ -149,47 +159,170 @@ def _project_env(raw: object, project_name: str) -> dict[str, str]:
     return result
 
 
+def _integer(
+    raw: dict[str, object], name: str, default: int, minimum: int, maximum: int
+) -> int:
+    value = raw.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name}는 정수여야 함")
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name}는 {minimum}..{maximum} 범위여야 함")
+    return value
+
+
+def _optional_string(raw: dict[str, object], name: str) -> str | None:
+    value = raw.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{name}는 문자열이어야 함")
+    value = value.strip()
+    return value or None
+
+
+def _password_hash(raw: dict[str, object]) -> str | None:
+    value = _optional_string(raw, "password_hash")
+    if value is None:
+        return None
+    if not value.startswith("$argon2id$"):
+        raise ValueError("password_hash는 유효한 Argon2id 해시여야 함")
+    try:
+        # 고정 문자열이 맞을 가능성은 무시할 만큼 작다. mismatch는 전체 인코딩과
+        # 파라미터를 정상적으로 해석했다는 뜻이고, decode/버전 오류만 거부한다.
+        PasswordHasher().verify(value, "wterm-config-validation")
+    except VerifyMismatchError:
+        pass
+    except (InvalidHashError, VerificationError) as exc:
+        raise ValueError("password_hash는 유효한 Argon2id 해시여야 함") from exc
+    return value
+
+
+def _allowed_origins(raw: dict[str, object]) -> list[str]:
+    values = raw.get("allowed_origins", [])
+    if not isinstance(values, list):
+        raise ValueError("allowed_origins는 문자열 배열이어야 함")
+    result: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("allowed_origins는 비어 있지 않은 문자열 배열이어야 함")
+        origin = value.strip()
+        parts = urlsplit(origin)
+        try:
+            port = parts.port
+        except ValueError as exc:
+            raise ValueError("allowed_origins에 유효하지 않은 origin이 있음") from exc
+        if (
+            parts.scheme.lower() not in ("http", "https")
+            or parts.hostname is None
+            or parts.username is not None
+            or parts.password is not None
+            or parts.path
+            or parts.query
+            or parts.fragment
+            or any(ch.isspace() for ch in parts.netloc)
+        ):
+            raise ValueError("allowed_origins에는 path/query/fragment 없는 완전한 origin만 허용")
+        # port 속성을 읽는 것 자체가 범위 검증이다. netloc은 IPv6 괄호를 보존한다.
+        _ = port
+        normalized = f"{parts.scheme.lower()}://{parts.netloc.lower()}"
+        if normalized not in result:
+            result.append(normalized)
+    return result
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def load_config() -> Config:
     raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    projects = []
-    for item in raw.get("projects", []):
-        name = item["name"]
-        ssh = item.get("ssh") or None
+    if not isinstance(raw, dict):
+        raise ValueError("projects.json 최상위 값은 객체여야 함")
+
+    host = raw.get("host", "127.0.0.1")
+    if not isinstance(host, str) or not host.strip():
+        raise ValueError("host는 비어 있지 않은 문자열이어야 함")
+    host = host.strip()
+    port = _integer(raw, "port", 8877, 1, PORT_MAX)
+    grace_seconds = _integer(raw, "grace_seconds", 60, 0, GRACE_SECONDS_MAX)
+    idle_seconds = _integer(raw, "idle_seconds", 0, 0, IDLE_SECONDS_MAX)
+    uds = _optional_string(raw, "uds")
+    password_hash = _password_hash(raw)
+    allowed_origins = _allowed_origins(raw)
+    certfile = _optional_string(raw, "tls_certfile")
+    keyfile = _optional_string(raw, "tls_keyfile")
+    if bool(certfile) != bool(keyfile):
+        raise ValueError("tls_certfile과 tls_keyfile은 함께 지정해야 함")
+    allow_insecure_tcp = raw.get("allow_insecure_tcp", False)
+    if not isinstance(allow_insecure_tcp, bool):
+        raise ValueError("allow_insecure_tcp는 bool이어야 함")
+
+    project_items = raw.get("projects", [])
+    if not isinstance(project_items, list):
+        raise ValueError("projects는 배열이어야 함")
+    projects: list[Project] = []
+    names: set[str] = set()
+    for index, item in enumerate(project_items):
+        if not isinstance(item, dict):
+            raise ValueError(f"projects[{index}]는 객체여야 함")
+        name_value = item.get("name")
+        if not isinstance(name_value, str) or not name_value.strip():
+            raise ValueError(f"projects[{index}].name은 비어 있지 않은 문자열이어야 함")
+        name = name_value.strip()
+        if name in names:
+            raise ValueError(f"중복 프로젝트 이름: {name!r}")
+        names.add(name)
+        path_value = item.get("path")
+        if not isinstance(path_value, str) or not path_value.strip():
+            raise ValueError(f"프로젝트 {name!r}: path는 비어 있지 않은 문자열이어야 함")
+        project_path = path_value.strip()
+        ssh_value = item.get("ssh")
+        if ssh_value is not None and (
+            not isinstance(ssh_value, str) or not ssh_value.strip()
+        ):
+            raise ValueError(f"프로젝트 {name!r}: ssh는 비어 있지 않은 문자열이어야 함")
+        ssh = ssh_value.strip() if isinstance(ssh_value, str) else None
         args = _project_args(item.get("args"), name)
         env = _project_env(item.get("env"), name)
         if ssh is not None:
             # 원격 경로는 로컬에 없으므로 존재 검증 없이 그대로 사용
             projects.append(
-                Project(name=name, path=item["path"], ssh=ssh, args=args, env=env)
+                Project(name=name, path=project_path, ssh=ssh, args=args, env=env)
             )
             continue
-        path = Path(item["path"]).resolve()
+        path = Path(project_path).resolve()
         if not path.is_dir():
             print(f"[config] 경고: 디렉터리가 없어 제외함: {path}")
             continue
         projects.append(Project(name=name, path=str(path), args=args, env=env))
-    password_hash = raw.get("password_hash")
-    # 비교는 소문자 기준. 브라우저가 보내는 Origin에는 끝 슬래시가 없으므로 떼어 맞춘다.
-    allowed_origins = [
-        o.strip().rstrip("/").lower()
-        for o in raw.get("allowed_origins", [])
-        if isinstance(o, str) and o.strip()
-    ]
-    certfile = raw.get("tls_certfile") or None
-    keyfile = raw.get("tls_keyfile") or None
-    if bool(certfile) != bool(keyfile):
-        # 한쪽만 있으면 HTTPS를 켤 수 없다. 조용히 평문으로 뜨면 눈치채기 어려우므로 경고.
-        print("[config] 경고: tls_certfile과 tls_keyfile은 함께 지정해야 함. HTTP로 기동함")
-        certfile = keyfile = None
+
+    tls_enabled = bool(certfile and keyfile)
+    if uds is None and not _is_loopback_host(host) and not allow_insecure_tcp:
+        if password_hash is None:
+            raise ValueError(
+                "loopback 밖의 TCP bind에는 인증이 필요함; 위험을 감수하려면 "
+                "allow_insecure_tcp=true를 명시"
+            )
+        if not tls_enabled:
+            raise ValueError(
+                "loopback 밖의 평문 TCP bind는 거부됨; TLS/UDS를 쓰거나 위험을 "
+                "감수하려면 allow_insecure_tcp=true를 명시"
+            )
     return Config(
-        host=raw.get("host", "127.0.0.1"),
-        port=int(raw.get("port", 8877)),
-        uds=raw.get("uds") or None,
-        grace_seconds=int(raw.get("grace_seconds", 60)),
-        idle_seconds=max(0, int(raw.get("idle_seconds", 0))),
-        password_hash=password_hash.strip() if password_hash else None,
+        host=host,
+        port=port,
+        uds=uds,
+        grace_seconds=grace_seconds,
+        idle_seconds=idle_seconds,
+        password_hash=password_hash,
         allowed_origins=allowed_origins,
         tls_certfile=certfile,
         tls_keyfile=keyfile,
+        allow_insecure_tcp=allow_insecure_tcp,
         projects=projects,
     )

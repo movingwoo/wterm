@@ -34,6 +34,8 @@ from .auth import AuthManager
 from .config import CONFIG_PATH, load_config
 from .project_status import ProjectStatusHub
 from .session import (
+    HISTORY_CHECK_CLOSE_CODE,
+    HistoryState,
     SessionManager,
     has_codex_history,
     latest_session_id,
@@ -338,18 +340,6 @@ async def end_session(request: Request, project: str, agent: str = "claude"):
     return JSONResponse({"ok": True, "ended": ended})
 
 
-async def _notify_input_dropped(ws: WebSocket) -> None:
-    try:
-        await ws.send_text(
-            json.dumps({
-                "type": "status",
-                "message": "입력이 밀려 일부를 버렸습니다 (세션이 입력을 읽지 않는 중).",
-            })
-        )
-    except Exception:
-        pass  # 이 알림 때문에 세션이 끊길 이유는 없다
-
-
 @app.websocket("/ws/{project_name}")
 async def terminal_ws(
     ws: WebSocket, project_name: str, mode: str = "attach",
@@ -420,50 +410,65 @@ async def terminal_ws(
         return
 
     session_key = f"{project_name}#{agent}"
-    session = manager.get_live(session_key)
-    if session is not None and mode != "new":
-        action = "reattach"
-        await session.attach(ws)
-        await ws.send_text(
-            json.dumps({"type": "status", "message": "실행 중인 세션에 재접속했습니다."})
-        )
-    elif agent == "shell":
-        action = "start"
-        session = await manager.start(
-            session_key, project.path, ssh=project.ssh, agent="shell",
-            project_env=project.env,
-        )
-        await session.attach(ws)
-        await ws.send_text(
-            json.dumps({"type": "status", "message": "셸 세션을 시작합니다."})
-        )
-    else:
-        if project.ssh is not None:
-            has_history = await remote_has_history(project.ssh, project.path, agent)
-        elif agent == "codex":
-            has_history = await has_codex_history(project.path)
-        else:
-            has_history = latest_session_id(project.path) is not None
-        if mode == "resume" and has_history:
-            action = "resume"
-            extra_args = ["resume"] if agent == "codex" else ["--resume"]
-            msg = "이어할 세션을 목록에서 선택하세요."
-        elif mode == "continue" and has_history:
-            action = "continue"
-            extra_args = ["resume", "--last"] if agent == "codex" else ["--continue"]
-            msg = "가장 최근 세션을 이어합니다."
-        elif mode in ("resume", "continue"):
+    async with manager.transition(session_key):
+        session = manager.get_live(session_key)
+        if session is not None and mode != "new":
+            action = "reattach"
+            await session.attach(ws)
+            session.send_status("실행 중인 세션에 재접속했습니다.")
+        elif agent == "shell":
             action = "start"
-            extra_args, msg = None, "이어할 세션 기록이 없어 새 세션을 시작합니다."
+            session = await manager.start_locked(
+                session_key, project.path, ssh=project.ssh, agent="shell",
+                project_env=project.env,
+            )
+            await session.attach(ws)
+            session.send_status("셸 세션을 시작합니다.")
         else:
-            action = "start"
-            extra_args, msg = None, "새 세션을 시작합니다."
-        session = await manager.start(
-            session_key, project.path, extra_args, ssh=project.ssh, agent=agent,
-            command_args=project.args_for(agent), project_env=project.env,
-        )
-        await session.attach(ws)
-        await ws.send_text(json.dumps({"type": "status", "message": msg}))
+            if mode not in ("resume", "continue"):
+                has_history = False
+            elif project.ssh is not None:
+                history = await remote_has_history(project.ssh, project.path, agent)
+                if history is HistoryState.ERROR:
+                    message = (
+                        "원격 세션 기록을 확인하지 못했습니다. 연결·인증·호스트 키를 "
+                        "확인한 뒤 다시 시도하세요."
+                    )
+                    await ws.send_text(json.dumps({"type": "status", "message": message}))
+                    await ws.close(
+                        code=HISTORY_CHECK_CLOSE_CODE,
+                        reason="원격 기록 확인 실패",
+                    )
+                    _audit(
+                        "ws-open-failed", client=client, project=project_name,
+                        agent=agent, mode=mode, reason="history-check", remote=project.ssh,
+                    )
+                    return
+                has_history = history is HistoryState.PRESENT
+            elif agent == "codex":
+                has_history = await has_codex_history(project.path)
+            else:
+                has_history = latest_session_id(project.path) is not None
+            if mode == "resume" and has_history:
+                action = "resume"
+                extra_args = ["resume"] if agent == "codex" else ["--resume"]
+                msg = "이어할 세션을 목록에서 선택하세요."
+            elif mode == "continue" and has_history:
+                action = "continue"
+                extra_args = ["resume", "--last"] if agent == "codex" else ["--continue"]
+                msg = "가장 최근 세션을 이어합니다."
+            elif mode in ("resume", "continue"):
+                action = "start"
+                extra_args, msg = None, "이어할 세션 기록이 없어 새 세션을 시작합니다."
+            else:
+                action = "start"
+                extra_args, msg = None, "새 세션을 시작합니다."
+            session = await manager.start_locked(
+                session_key, project.path, extra_args, ssh=project.ssh, agent=agent,
+                command_args=project.args_for(agent), project_env=project.env,
+            )
+            await session.attach(ws)
+            session.send_status(msg)
 
     # 사후 조사에서 가장 중요한 줄. "어느 시각에 어느 프로젝트에서 무엇이 떴나"가
     # 여기 남는다. 실행된 명령이나 터미널 내용은 남기지 않는다.
@@ -475,7 +480,9 @@ async def terminal_ws(
 
     # 이 소켓을 연 토큰을 기록해 두면 로그아웃이 여기까지 닿는다. 인증이 꺼진
     # 구성(password_hash 없음)에는 폐기할 토큰 자체가 없으므로 건너뛴다.
-    watchdog = auth.register_socket(ws)
+    watchdog = auth.register_socket(
+        ws, lambda code, reason: session.close_attached(ws, code, reason)
+    )
 
     # 프로토콜 경계다. 여기서 걸러지지 않은 형식 오류는 전부 루프 밖으로 나가
     # 세션을 끊는다 — 자기 세션만 끊는 자해라 보안 문제는 아니지만, 버그난
@@ -506,7 +513,9 @@ async def terminal_ws(
                 if isinstance(data, str) and session.write_input(data):
                     # 자식이 stdin을 읽지 않아 입력이 버려졌다. 조용히 버리면
                     # 타이핑이 사라진 것처럼 보인다.
-                    await _notify_input_dropped(ws)
+                    session.send_status(
+                        "입력이 밀려 일부를 버렸습니다 (세션이 입력을 읽지 않는 중)."
+                    )
             elif kind == "resize":
                 cols, rows = msg.get("cols"), msg.get("rows")
                 # bool도 int이지만 resize가 값을 범위로 자르므로 해가 없다.
@@ -516,7 +525,7 @@ async def terminal_ws(
         pass
     finally:
         auth.unregister_socket(ws, watchdog)
-        session.detach(ws)
+        await session.detach(ws)
         _audit(
             "ws-close", client=client, project=project_name, agent=agent,
             seconds=int(time.monotonic() - opened_at),
@@ -550,9 +559,10 @@ def _on_sighup(signum, frame) -> None:
     try:
         _load_cert(_ssl_ctx)
         _tls_log.info("인증서를 다시 읽었습니다: %s", config.tls_certfile)
-    except Exception as exc:
+    except Exception:
         # 새 파일이 깨져 있어도 기존 컨텍스트는 온전하므로 서비스는 계속된다.
-        _tls_log.error("인증서 리로드 실패, 기존 인증서를 유지합니다: %s", exc)
+        # 개인키 경로가 예외 문자열에 섞여 로그로 나가지 않게 상세값은 남기지 않는다.
+        _tls_log.error("인증서 리로드 실패, 기존 인증서를 유지합니다")
 
 
 def _setup_tls():
@@ -560,7 +570,11 @@ def _setup_tls():
     global _ssl_ctx
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    _load_cert(ctx)  # 기동 시점의 실패는 감추지 않고 그대로 터뜨린다
+    try:
+        _load_cert(ctx)
+    except Exception:
+        # 기동은 실패시키되 ssl 예외가 개인키 경로를 출력하지 않게 경계를 정리한다.
+        raise RuntimeError("TLS 인증서/개인키를 읽지 못했습니다") from None
     _ssl_ctx = ctx
     # uvicorn이 가로채는 시그널은 SIGINT/SIGTERM뿐이라 SIGHUP 핸들러는 살아남는다.
     signal.signal(signal.SIGHUP, _on_sighup)

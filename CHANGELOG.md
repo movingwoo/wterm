@@ -10,6 +10,14 @@
 
 ## [미출시]
 
+## [1.4.1] — 2026-08-12
+
+- 느린 브라우저에서 PTY 출력 전송 태스크와 메모리가 무한히 쌓이지 않도록 세션별 단일 WebSocket writer와 high/low watermark 배압을 적용했다. replay·live output·status와 마지막 output·exit·close 순서도 같은 큐에서 보장한다.
+- 입력 write buffer가 큰 단일 프레임으로 1 MiB 상한을 넘던 문제를 고쳤다. UTF-8 메시지는 통째로 받아들이거나 버리고, partial write와 EAGAIN에서도 이미 받은 바이트를 보존한다.
+- `projects.json`을 fail-closed로 검증한다. 중복/빈 프로젝트, 잘못된 타입·범위·origin·Argon2id 해시, 인증서/키 한쪽만 있는 구성과 보호되지 않은 non-loopback TCP bind는 기동 전에 거부한다.
+- 같은 프로젝트·에이전트의 attach/new/resume/end와 grace/idle 만료를 세션 키별로 직렬화해 동시 요청이 막 시작한 PTY를 잘못 종료하거나 죽어가는 PTY에 붙는 경합을 막았다.
+- 원격 이어하기 기록 조회에 전체 timeout과 `있음`/`없음`/`확인 실패` 상태를 도입했다. 인증·호스트 키·네트워크·명령 실패에서는 새 세션으로 조용히 폴백하지 않고 재시도 가능한 안내를 표시한다.
+
 ## [1.4.0] — 2026-08-12
 
 - 큰 진입점의 관심사를 빌드 없는 모듈로 분리했다. 서버의 인증·감사·프로젝트 상태와 프론트의 상태 연결·프로젝트 카드·테마·모바일 키 바가 각각 독립 파일을 갖고, `main.py`와 `app.js`는 라우트 및 탭/pane 조정에 집중한다.
@@ -56,7 +64,8 @@ ssh 원격 프로젝트, 자체 HTTPS(무중단 인증서 리로드), 부팅 자
 서버가 판정하는 토큰 만료와 즉시 로그아웃, CSP를 포함한 응답 헤더, 90일 감사 로그
 (터미널 내용은 남기지 않음), 선택적 유휴 세션 종료.
 
-[미출시]: https://github.com/movingwoo/wterm/compare/v1.4.0...main
+[미출시]: https://github.com/movingwoo/wterm/compare/v1.4.1...main
+[1.4.1]: https://github.com/movingwoo/wterm/releases/tag/v1.4.1
 [1.4.0]: https://github.com/movingwoo/wterm/releases/tag/v1.4.0
 [1.3.0]: https://github.com/movingwoo/wterm/releases/tag/v1.3.0
 [1.2.0]: https://github.com/movingwoo/wterm/releases/tag/v1.2.0

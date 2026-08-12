@@ -7,7 +7,7 @@ import json
 import secrets
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 from anyio import to_thread
 from argon2 import PasswordHasher
@@ -39,6 +39,9 @@ class AuthManager:
         self._password_hasher = PasswordHasher()
         self._tokens_changed = asyncio.Event()
         self._ws_tokens: dict[WebSocket, bytes] = {}
+        self._ws_closers: dict[
+            WebSocket, Callable[[int, str], Awaitable[None]]
+        ] = {}
         self._login_fails: OrderedDict[str, tuple[int, float]] = OrderedDict()
         self._login_slots = asyncio.Semaphore(LOGIN_MAX_CONCURRENT)
 
@@ -83,8 +86,12 @@ class AuthManager:
         return token is not None and self._key_valid(self._token_key(token))
 
     async def _close_unauthed(self, ws: WebSocket, reason: str) -> None:
+        closer = self._ws_closers.get(ws)
         try:
-            await ws.close(code=4401, reason=reason)
+            if closer is not None:
+                await closer(4401, reason)
+            else:
+                await ws.close(code=4401, reason=reason)
         except Exception:
             pass
 
@@ -108,19 +115,26 @@ class AuthManager:
                 await self._close_unauthed(ws, "인증이 만료되었습니다")
                 return
 
-    def register_socket(self, ws: WebSocket) -> asyncio.Task | None:
+    def register_socket(
+        self,
+        ws: WebSocket,
+        close: Callable[[int, str], Awaitable[None]] | None = None,
+    ) -> asyncio.Task | None:
         """인증된 소켓을 로그아웃/만료 폐기 대상에 넣는다."""
         token = ws.cookies.get(AUTH_COOKIE) if self.password_hash is not None else None
         if not token:
             return None
         key = self._token_key(token)
         self._ws_tokens[ws] = key
+        if close is not None:
+            self._ws_closers[ws] = close
         return asyncio.ensure_future(self._watchdog(ws, key))
 
     def unregister_socket(self, ws: WebSocket, watchdog: asyncio.Task | None) -> None:
         if watchdog is not None:
             watchdog.cancel()
         self._ws_tokens.pop(ws, None)
+        self._ws_closers.pop(ws, None)
 
     def _login_block_remaining(self, key: str, now: float) -> float:
         entry = self._login_fails.get(key)

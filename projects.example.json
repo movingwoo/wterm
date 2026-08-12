@@ -21,6 +21,6 @@
       "ssh": "user@remote-host"
     }
   ],
-  "password_hash": "argon2id 해시",
+  "password_hash": null,
   "allowed_origins": []
 }
