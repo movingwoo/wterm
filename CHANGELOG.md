@@ -10,6 +10,13 @@
 
 ## [미출시]
 
+## [1.3.0] — 2026-08-12
+
+- 모바일 프로젝트 목록을 터미널 위의 서랍으로 바꿨다. 세션을 고르면 자동으로 닫히고, 배경이나 왼쪽 핸들로 여닫는다. 주소창이 움직이는 높이와 노치·홈 인디케이터 여백도 반영한다.
+- 모바일 터미널의 기본 글자를 16px로 올렸다. 키 바에서 12~20px로 조절하며 열린 모든 탭과 새 탭에 적용되고 새로고침 뒤에도 유지된다.
+- 토큰이 512개 상한에 밀려 폐기되면 인증 watchdog이 즉시 깨어 열린 WebSocket을 4401로 닫는다. 실제 로그인 513회와 PTY 재접속을 왕복하는 회귀 테스트를 추가했다.
+- UI 변경 릴리즈에서 테마·사이드바 상태 조합·포커스·복사/붙여넣기·모바일 키 바를 실제 화면으로 확인하는 브라우저 체크리스트를 추가했다.
+
 ## [1.2.0] — 2026-08-11
 
 - 종료가 셸의 백그라운드 잡까지 정리한다. SIGHUP을 먼저 보내 `exit`과 같은 결과를 만든다 — 전에는 고아 프로세스가 남았고, 종료마다 10초가 걸렸다.
@@ -41,7 +48,8 @@ ssh 원격 프로젝트, 자체 HTTPS(무중단 인증서 리로드), 부팅 자
 서버가 판정하는 토큰 만료와 즉시 로그아웃, CSP를 포함한 응답 헤더, 90일 감사 로그
 (터미널 내용은 남기지 않음), 선택적 유휴 세션 종료.
 
-[미출시]: https://github.com/movingwoo/wterm/compare/v1.2.0...main
+[미출시]: https://github.com/movingwoo/wterm/compare/v1.3.0...main
+[1.3.0]: https://github.com/movingwoo/wterm/releases/tag/v1.3.0
 [1.2.0]: https://github.com/movingwoo/wterm/releases/tag/v1.2.0
 [1.1.0]: https://github.com/movingwoo/wterm/releases/tag/v1.1.0
 [1.0.0]: https://github.com/movingwoo/wterm/releases/tag/v1.0.0

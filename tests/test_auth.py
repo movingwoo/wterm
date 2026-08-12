@@ -105,6 +105,49 @@ def test_logout_closes_live_websocket(start_server):
         end_shell(ws)
 
 
+def test_token_limit_wakes_watchdog_and_closes_live_websocket(start_server):
+    """오래된 토큰이 상한에 밀리면 열린 소켓도 즉시 접근을 잃는다.
+
+    30일 TTL을 기다릴 수는 없지만 watchdog이 보는 조건은 둘 다 같은
+    ``_key_valid`` 결과다. 싼 테스트용 argon2 해시로 MAX_TOKENS(512) 경계를
+    실제 로그인 요청으로 넘기면, 저장소 변경 알림에 깨어난 watchdog과 4401
+    프론트엔드 계약을 시간 축소용 테스트 설정 없이 함께 검증할 수 있다.
+    """
+    h = start_server()
+    c = h.client()
+    first = c.post("/api/login", json={"password": PASSWORD})
+    assert first.status_code == 200
+    oldest = first.cookies["wterm_token"]
+
+    with ws_connect(h, "/ws/demo?agent=shell", token=oldest) as ws:
+        status_message(ws)
+
+        # 첫 토큰을 포함해 513개가 되면 가장 오래된 first가 축출된다. 성공한
+        # 로그인은 시도 제한에 걸리지 않고 conftest의 저비용 해시를 검증한다.
+        latest = None
+        for _ in range(512):
+            issued = c.post("/api/login", json={"password": PASSWORD})
+            assert issued.status_code == 200
+            latest = issued.cookies["wterm_token"]
+
+        with pytest.raises(ConnectionClosed) as exc:
+            while True:
+                ws.recv(timeout=RECV_TIMEOUT)
+        assert exc.value.rcvd.code == 4401
+
+    # 축출된 키는 새 요청에도 거부되고, 가장 최근 토큰은 그대로 유효하다.
+    stale = h.client(headers={"Origin": h.origin, "Cookie": f"wterm_token={oldest}"})
+    assert stale.get("/api/projects").status_code == 401
+    assert latest is not None
+    fresh = h.client(headers={"Origin": h.origin, "Cookie": f"wterm_token={latest}"})
+    assert fresh.get("/api/projects").status_code == 200
+
+    # 인증 폐기는 프로세스를 죽이지 않는다. 새 토큰으로 같은 PTY에 붙어 끝낸다.
+    with ws_connect(h, "/ws/demo?agent=shell", token=latest) as ws:
+        assert "재접속" in status_message(ws)
+        end_shell(ws)
+
+
 def test_post_requires_matching_origin(start_server):
     """WS/POST는 CORS가 막아주지 않으므로 서버가 직접 Origin을 본다."""
     h = start_server()

@@ -4,6 +4,7 @@
 
   const sidebarEl = document.getElementById("sidebar");
   const sidebarToggleEl = document.getElementById("sidebar-toggle");
+  const sidebarScrimEl = document.getElementById("sidebar-scrim");
   const panesEl = document.getElementById("panes");
   const keyBarEl = document.getElementById("key-bar");
   const projectListEl = document.getElementById("project-list");
@@ -18,6 +19,9 @@
 
   const AGENT_LABEL = { claude: "Claude", codex: "Codex", shell: "셸" };
   const BASE_TITLE = document.title;
+  // 터치 중심 장치에서는 폭이 넓은 태블릿도 사이드바를 서랍으로 쓴다. 데스크톱은
+  // 창을 640px 아래로 줄였을 때 같은 상태가 되어 브라우저에서 검증할 수 있다.
+  const mobileLayout = window.matchMedia("(pointer: coarse), (max-width: 640px)");
 
   // 맥에서는 복붙 수식키가 ⌘라 Ctrl이 통째로 터미널 몫이지만, 윈도우·리눅스에는 ⌘가
   // 없어 브라우저 복붙과 터미널 제어문자가 같은 Ctrl을 두고 부딪친다 — createTab의
@@ -162,6 +166,9 @@
   function setSidebarCollapsed(collapsed, persist = false) {
     document.body.classList.toggle("sidebar-collapsed", collapsed);
     sidebarEl.toggleAttribute("inert", collapsed);
+    // 모바일에서 투명해진 스크림은 포인터뿐 아니라 접근성 트리에서도 빠져야 한다.
+    // display:none인 데스크톱에는 영향이 없고, 열린 서랍에서는 닫기 동작으로 읽힌다.
+    sidebarScrimEl.setAttribute("aria-hidden", String(collapsed));
     sidebarToggleEl.setAttribute("aria-expanded", String(!collapsed));
     const label = collapsed ? "사이드바 펼치기" : "사이드바 접기";
     sidebarToggleEl.setAttribute("aria-label", label);
@@ -177,17 +184,39 @@
     scheduleFit();
   }
 
-  let sidebarCollapsed = false;
+  let savedSidebarCollapsed = false;
   try {
-    sidebarCollapsed = localStorage.getItem(sidebarStorageKey) === "true";
+    savedSidebarCollapsed = localStorage.getItem(sidebarStorageKey) === "true";
   } catch {
     // localStorage 사용 불가 시 기본값(펼침)을 유지한다.
   }
+  let sidebarCollapsed = savedSidebarCollapsed;
   setSidebarCollapsed(sidebarCollapsed);
 
   sidebarToggleEl.addEventListener("click", () => {
     sidebarCollapsed = !sidebarCollapsed;
+    savedSidebarCollapsed = sidebarCollapsed;
     setSidebarCollapsed(sidebarCollapsed, true);
+  });
+
+  // 모바일 서랍 뒤쪽을 누르면 닫되, 데스크톱에서 저장한 접기 선호까지 바꾸지는
+  // 않는다. 창을 다시 넓히면 원래 데스크톱 상태로 돌아간다.
+  sidebarScrimEl.addEventListener("click", () => {
+    sidebarCollapsed = true;
+    setSidebarCollapsed(true);
+  });
+
+  function collapseSidebarForMobile() {
+    if (!mobileLayout.matches || sidebarCollapsed) return;
+    sidebarCollapsed = true;
+    setSidebarCollapsed(true);
+  }
+
+  mobileLayout.addEventListener("change", (e) => {
+    if (!e.matches && sidebarCollapsed !== savedSidebarCollapsed) {
+      sidebarCollapsed = savedSidebarCollapsed;
+      setSidebarCollapsed(sidebarCollapsed);
+    }
   });
 
   // ── 테마 ───────────────────────────────────────────────────────────
@@ -294,6 +323,64 @@
   // 모드(bracketed paste)에서 \x1b[200~ ... \x1b[201~로 감싸여 나가고, 그 안의
   // 바이트는 제어문자가 아니라 텍스트로 취급된다 — Esc가 Esc로 도착하지 않는다.
 
+  // 폰에서는 14px 고정 글자가 작고, 큰 글자가 필요한 정도는 기기와 시력에 따라
+  // 다르다. 기본은 모바일 16px / 데스크톱 14px이며 A-/A+로 바꾼 값은 모든 탭에
+  // 함께 적용하고 저장한다. 한 탭만 다르면 창을 옮길 때 열 수가 갑자기 바뀐다.
+  const fontSizeStorageKey = "wterm.terminal.fontSize";
+  const MIN_FONT_SIZE = 12;
+  const MAX_FONT_SIZE = 20;
+  let fontSizePinned = false;
+  let terminalFontSize = mobileLayout.matches ? 16 : 14;
+  try {
+    const saved = Number(localStorage.getItem(fontSizeStorageKey));
+    if (Number.isInteger(saved) && saved >= MIN_FONT_SIZE && saved <= MAX_FONT_SIZE) {
+      terminalFontSize = saved;
+      fontSizePinned = true;
+    }
+  } catch {
+    // 저장소가 막혀 있으면 반응형 기본값과 현재 탭의 변경만 유지한다.
+  }
+
+  let smallerFontEl = null;
+  let largerFontEl = null;
+  let fontSizeEl = null;
+
+  function paintFontControls() {
+    if (!fontSizeEl) return;
+    fontSizeEl.value = String(terminalFontSize);
+    fontSizeEl.textContent = `${terminalFontSize}px`;
+    smallerFontEl.disabled = terminalFontSize <= MIN_FONT_SIZE;
+    largerFontEl.disabled = terminalFontSize >= MAX_FONT_SIZE;
+    smallerFontEl.setAttribute(
+      "aria-label", `터미널 글자 작게 (현재 ${terminalFontSize}px)`
+    );
+    largerFontEl.setAttribute(
+      "aria-label", `터미널 글자 크게 (현재 ${terminalFontSize}px)`
+    );
+  }
+
+  function setTerminalFontSize(value, persist = false) {
+    const next = Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, value));
+    if (next === terminalFontSize && !persist) return;
+    terminalFontSize = next;
+    if (persist) {
+      fontSizePinned = true;
+      try {
+        localStorage.setItem(fontSizeStorageKey, String(next));
+      } catch {
+        /* 현재 페이지에서는 바뀐 크기가 그대로 유지된다 */
+      }
+    }
+    for (const tab of allTabs()) tab.term.options.fontSize = next;
+    paintFontControls();
+    scheduleFit();
+  }
+
+  // 사용자가 크기를 고정하지 않았다면 화면 성격이 바뀔 때만 기본값을 바꾼다.
+  mobileLayout.addEventListener("change", (e) => {
+    if (!fontSizePinned) setTerminalFontSize(e.matches ? 16 : 14);
+  });
+
   // 시퀀스가 null인 것은 보낼 것이 없는 고정 키(Ctrl)다.
   const BAR_KEYS = [
     ["Esc", "\x1b", "Esc (중단)"],
@@ -348,6 +435,34 @@
     btn.addEventListener("pointerdown", (e) => e.preventDefault());
     return btn;
   }
+
+  const fontControlsEl = document.createElement("div");
+  fontControlsEl.className = "font-controls";
+  fontControlsEl.setAttribute("role", "group");
+  fontControlsEl.setAttribute("aria-label", "터미널 글자 크기");
+
+  smallerFontEl = makeKeyButton("A−", "터미널 글자 작게");
+  smallerFontEl.classList.add("font-key");
+  smallerFontEl.addEventListener("click", () => {
+    setTerminalFontSize(terminalFontSize - 1, true);
+    const tab = activeTab();
+    if (tab) tab.term.focus();
+  });
+
+  fontSizeEl = document.createElement("output");
+  fontSizeEl.setAttribute("aria-live", "polite");
+
+  largerFontEl = makeKeyButton("A+", "터미널 글자 크게");
+  largerFontEl.classList.add("font-key");
+  largerFontEl.addEventListener("click", () => {
+    setTerminalFontSize(terminalFontSize + 1, true);
+    const tab = activeTab();
+    if (tab) tab.term.focus();
+  });
+
+  fontControlsEl.append(smallerFontEl, fontSizeEl, largerFontEl);
+  keyBarEl.appendChild(fontControlsEl);
+  paintFontControls();
 
   for (const [label, seq, title] of BAR_KEYS) {
     const btn = makeKeyButton(label, title);
@@ -716,6 +831,9 @@
     // 나가는데, 그건 여기서 누른 적이 없는 키다.
     setCtrlArmed(false);
     focusedPane = pane;
+    // 프로젝트를 골랐는데 서랍이 화면을 계속 덮고 있으면 터미널이 열린 사실조차
+    // 보이지 않는다. 모바일에서만 자동으로 닫고 데스크톱 접기 선호는 건드리지 않는다.
+    collapseSidebarForMobile();
     paintPanes();
     syncHash();
     tab.el.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -728,7 +846,7 @@
   function createTab(name, agent, pane) {
     const term = new Terminal({
       fontFamily: '"Cascadia Code", "D2Coding", Menlo, monospace',
-      fontSize: 14,
+      fontSize: terminalFontSize,
       cursorBlink: true,
       scrollback: 5000,
       theme: xtermTheme(),

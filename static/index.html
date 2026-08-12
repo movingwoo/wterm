@@ -2,7 +2,7 @@
 <html lang="ko">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
   <title>W-Term</title>
   <link rel="stylesheet" href="/static/vendor/xterm.css">
   <link rel="stylesheet" href="/static/style.css">
@@ -26,6 +26,10 @@
       <path d="M10 3 5 8l5 5"></path>
     </svg>
   </button>
+  <!-- 좁거나 터치 중심인 화면에서 사이드바는 본문 위에 놓인다. 뒤쪽을 누르면
+       닫히는 실제 버튼이어야 키보드/스크린리더 상태도 DOM과 함께 유지된다. -->
+  <button id="sidebar-scrim" type="button" tabindex="-1"
+          aria-label="사이드바 닫기"></button>
   <main id="terminal-pane">
     <!-- 창(pane)은 app.js가 만든다. 큰 화면에서는 최대 둘까지 좌우로 나뉘고,
          창마다 자기 탭 줄과 터미널 더미를 가진다. -->
