@@ -23,8 +23,12 @@ import signal
 import struct
 import termios
 import time
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
+from enum import Enum
 from collections.abc import Callable
 from pathlib import Path
+from typing import AsyncIterator, Awaitable
 
 from anyio import to_thread
 from fastapi import WebSocket
@@ -36,6 +40,12 @@ BUFFER_LIMIT = 256 * 1024  # 재연결 replay 버퍼 상한
 # 전체를 OOM으로 끌고 갈 수 있다.
 WRITE_BUFFER_LIMIT = 1024 * 1024
 READ_CHUNK = 65536
+# 붙은 브라우저가 출력을 받지 못할 때 WebSocket 전송 대기 메모리를 제한한다.
+# high에서 PTY reader를 떼면 커널의 PTY 버퍼가 차고, 결국 자식의 write가 막혀
+# 스트림을 버리지 않은 채 배압이 전달된다. writer가 low 아래로 비우면 다시 읽는다.
+OUTPUT_HIGH_WATERMARK = 1024 * 1024
+OUTPUT_LOW_WATERMARK = 512 * 1024
+OUTBOUND_CLOSE_TIMEOUT = 3.0
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 SIGTERM_WAIT = 10  # 종료 시그널 에스컬레이션 전체 예산(초). stop.sh의 20초 대기가
                    # 이 값 + SIGKILL 회수를 감안한 것이라 늘리면 그쪽도 같이 봐야 한다.
@@ -49,6 +59,12 @@ IDLE_MIN_SLEEP = 0.5  # 남은 시간이 0에 가까울 때 바쁜 루프가 되
 # 사용자가 명시적으로 끝낸 세션. 4408과 같은 이유로 별도 코드다 — 평범한 단절로
 # 보이면 app.js의 자동 재연결이 방금 종료한 세션을 곧바로 새로 띄운다.
 ENDED_CLOSE_CODE = 4409
+
+# 원격 기록 확인 실패. 새 프로세스로 조용히 폴백하면 사용자가 원래 이어야 할
+# 대화를 놓치므로 이 연결은 닫고 명시적인 재시도를 요구한다.
+HISTORY_CHECK_CLOSE_CODE = 4410
+
+REMOTE_HISTORY_TIMEOUT = 10.0
 
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
@@ -134,27 +150,84 @@ async def has_codex_history(cwd: str) -> bool:
     return cwd in _codex_cwds
 
 
-async def remote_has_history(ssh: str, cwd: str, agent: str = "claude") -> bool:
+class HistoryState(Enum):
+    PRESENT = "present"
+    ABSENT = "absent"
+    ERROR = "error"
+
+
+async def _reap_subprocess(proc: asyncio.subprocess.Process) -> None:
+    """timeout/cancel된 조회 subprocess를 확실히 거둔다."""
+    if proc.returncode is not None:
+        return
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        await asyncio.wait_for(proc.wait(), 1.0)
+        return
+    except asyncio.TimeoutError:
+        pass
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+    await proc.wait()
+
+
+async def remote_has_history(
+    ssh: str, cwd: str, agent: str = "claude"
+) -> HistoryState:
     """원격 호스트에 해당 cwd의 Claude/Codex 세션 기록이 있는지 확인한다.
 
-    비대화식 확인이므로 BatchMode를 쓴다 — 키 인증이 안 돼 있으면 False가 되어
-    새 세션으로 폴백한다 (스폰 자체는 대화식이라 터미널에서 패스워드 입력 가능).
+    비대화식 확인이므로 BatchMode와 StrictHostKeyChecking을 쓴다. 인증/호스트키/
+    네트워크/원격 명령 실패는 기록 없음과 구분한다. ConnectTimeout은 연결 단계만
+    덮으므로 subprocess 전체에도 별도 timeout을 둔다.
     """
     if agent == "codex":
         needle = json.dumps({"cwd": cwd}, ensure_ascii=False, separators=(",", ":"))[1:-1]
         check_cmd = (
+            "[ -d ~/.codex/sessions ] || exit 1; "
             f"grep -rlF -m1 -- {shlex.quote(needle)} ~/.codex/sessions "
             ">/dev/null 2>&1"
         )
     else:
-        check_cmd = f"ls ~/.claude/projects/{munge_cwd(cwd)}/*.jsonl"
-    proc = await asyncio.create_subprocess_exec(
-        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", ssh,
-        check_cmd,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    return (await proc.wait()) == 0
+        check_cmd = (
+            f"set -- ~/.claude/projects/{munge_cwd(cwd)}/*.jsonl; "
+            '[ -e "$1" ]'
+        )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+            "-o", "ConnectTimeout=5", ssh,
+            check_cmd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        return HistoryState.ERROR
+    try:
+        returncode = await asyncio.wait_for(proc.wait(), REMOTE_HISTORY_TIMEOUT)
+    except asyncio.TimeoutError:
+        await _reap_subprocess(proc)
+        return HistoryState.ERROR
+    except asyncio.CancelledError:
+        await asyncio.shield(_reap_subprocess(proc))
+        raise
+    if returncode == 0:
+        return HistoryState.PRESENT
+    if returncode == 1:
+        return HistoryState.ABSENT
+    return HistoryState.ERROR
+
+
+@dataclass
+class _Outbound:
+    kind: str
+    payload: bytes | str | tuple[int, str] | None
+    done: asyncio.Future[bool] | None = None
 
 
 class Session:
@@ -171,6 +244,8 @@ class Session:
         command_args: list[str] | None = None,
         project_env: dict[str, str] | None = None,
         state_changed: Callable[[], None] | None = None,
+        grace_expired: Callable[["Session"], Awaitable[None]] | None = None,
+        idle_expired: Callable[["Session"], Awaitable[None]] | None = None,
     ):
         self.project_name = project_name
         self.cwd = cwd
@@ -181,6 +256,8 @@ class Session:
         self.command_args = list(command_args or ())
         self.project_env = dict(project_env or {})
         self._state_changed = state_changed
+        self._grace_expired = grace_expired
+        self._idle_expired = idle_expired
         self.pid: int = -1
         self.master_fd: int = -1
         self.alive = False
@@ -198,6 +275,13 @@ class Session:
         self._write_buffer = bytearray()
         self._writer_registered = False
         self._input_dropped = False
+        self._reader_registered = False
+        self._pty_reader_paused = False
+        self._out_queue: asyncio.Queue[_Outbound] | None = None
+        self._out_writer_task: asyncio.Task[None] | None = None
+        self._out_writer_ws: WebSocket | None = None
+        self._out_pending_bytes = 0
+        self._exit_task: asyncio.Task[None] | None = None
 
     def _notify_state_changed(self) -> None:
         """라이브 여부가 바뀌었음을 알린다. 관찰자 실패가 PTY 수명을 깨면 안 된다."""
@@ -298,6 +382,7 @@ class Session:
         self.last_activity = time.monotonic()
         os.set_blocking(master_fd, False)
         self._loop.add_reader(master_fd, self._on_pty_readable)
+        self._reader_registered = True
         if self.idle_seconds > 0:
             self._idle_task = asyncio.ensure_future(self._idle_countdown())
 
@@ -309,23 +394,161 @@ class Session:
         except OSError:  # EIO: 자식 종료로 slave가 닫힘
             data = b""
         if not data:
-            asyncio.ensure_future(self._handle_exit())
+            if self._reader_registered and self.master_fd >= 0:
+                self._loop.remove_reader(self.master_fd)
+                self._reader_registered = False
+            if self._exit_task is None:
+                self._exit_task = asyncio.ensure_future(self._handle_exit())
             return
         self.last_activity = time.monotonic()
         self.buffer.extend(data)
         if len(self.buffer) > BUFFER_LIMIT:
             del self.buffer[: len(self.buffer) - BUFFER_LIMIT]
         if self.websocket is not None:
-            asyncio.ensure_future(self._send_bytes(data))
+            self._enqueue_outbound(_Outbound("bytes", data))
 
-    async def _send_bytes(self, data: bytes) -> None:
-        ws = self.websocket
-        if ws is None:
+    def _pause_pty_reader(self) -> None:
+        if self._pty_reader_paused or self.master_fd < 0:
+            return
+        if self._reader_registered:
+            try:
+                self._loop.remove_reader(self.master_fd)
+            except Exception:
+                pass
+            self._reader_registered = False
+        self._pty_reader_paused = True
+
+    def _resume_pty_reader(self) -> None:
+        if not self._pty_reader_paused:
+            return
+        if self.alive and not self.terminating and self.master_fd >= 0:
+            try:
+                self._loop.add_reader(self.master_fd, self._on_pty_readable)
+            except Exception:
+                return
+            self._reader_registered = True
+        self._pty_reader_paused = False
+
+    def _enqueue_outbound(self, item: _Outbound) -> asyncio.Future[bool] | None:
+        """현재 소켓의 단일 writer에 프레임을 넣는다. event loop 안에서만 호출한다."""
+        queue = self._out_queue
+        if queue is None:
+            if item.done is not None and not item.done.done():
+                item.done.set_result(False)
+            return item.done
+        if item.kind == "bytes":
+            assert isinstance(item.payload, bytes)
+            self._out_pending_bytes += len(item.payload)
+            if self._out_pending_bytes >= OUTPUT_HIGH_WATERMARK:
+                self._pause_pty_reader()
+        queue.put_nowait(item)
+        return item.done
+
+    def _queued_control(
+        self, kind: str, payload: str | tuple[int, str] | None = None
+    ) -> asyncio.Future[bool] | None:
+        if self._out_queue is None:
+            return None
+        done = self._loop.create_future()
+        return self._enqueue_outbound(_Outbound(kind, payload, done))
+
+    def send_status(self, message: str) -> None:
+        """PTY 출력과 순서가 섞이지 않도록 status도 같은 writer에 넣는다."""
+        self._enqueue_outbound(_Outbound("text", json.dumps({
+            "type": "status", "message": message,
+        })))
+
+    async def _outbound_writer(
+        self, ws: WebSocket, queue: asyncio.Queue[_Outbound]
+    ) -> None:
+        """이 세션의 유일한 WebSocket writer."""
+        current: _Outbound | None = None
+        try:
+            while True:
+                current = await queue.get()
+                sent = False
+                try:
+                    if current.kind == "bytes":
+                        assert isinstance(current.payload, bytes)
+                        await ws.send_bytes(current.payload)
+                    elif current.kind == "text":
+                        assert isinstance(current.payload, str)
+                        await ws.send_text(current.payload)
+                    elif current.kind == "close":
+                        assert isinstance(current.payload, tuple)
+                        await ws.close(code=current.payload[0], reason=current.payload[1])
+                    else:
+                        raise RuntimeError(f"알 수 없는 outbound 종류: {current.kind}")
+                    sent = True
+                finally:
+                    if current.kind == "bytes":
+                        assert isinstance(current.payload, bytes)
+                        self._out_pending_bytes -= len(current.payload)
+                        if self._out_pending_bytes <= OUTPUT_LOW_WATERMARK:
+                            self._resume_pty_reader()
+                    if current.done is not None and not current.done.done():
+                        current.done.set_result(sent)
+                if current.kind == "close":
+                    return
+                current = None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # receive loop가 disconnect를 관찰해 detach한다. 여기서 별도 전송을
+            # 시도하면 다시 복수 writer가 된다.
+            pass
+        finally:
+            while True:
+                try:
+                    pending = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if pending.kind == "bytes":
+                    assert isinstance(pending.payload, bytes)
+                    self._out_pending_bytes -= len(pending.payload)
+                if pending.done is not None and not pending.done.done():
+                    pending.done.set_result(False)
+            if self._out_pending_bytes <= OUTPUT_LOW_WATERMARK:
+                self._resume_pty_reader()
+            if self._out_writer_task is asyncio.current_task():
+                self._out_queue = None
+                self._out_writer_task = None
+                self._out_writer_ws = None
+
+    async def _stop_outbound_writer(self, ws: WebSocket) -> None:
+        task = self._out_writer_task
+        if task is None or self._out_writer_ws is not ws:
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    async def _wait_outbound_close(
+        self, ws: WebSocket, code: int, reason: str
+    ) -> None:
+        done = self._queued_control("close", (code, reason))
+        if done is None:
             return
         try:
-            await ws.send_bytes(data)
+            await asyncio.wait_for(asyncio.shield(done), OUTBOUND_CLOSE_TIMEOUT)
+        except asyncio.TimeoutError:
+            # 읽지 않는 브라우저 때문에 자연 종료/명시 종료가 영원히 남아서는 안 된다.
+            await self._stop_outbound_writer(ws)
+            try:
+                await asyncio.wait_for(ws.close(code=code, reason=reason), 1.0)
+            except Exception:
+                pass
+
+    async def close_attached(self, ws: WebSocket, code: int, reason: str) -> None:
+        """인증 watchdog 같은 외부 close도 세션의 writer로 직렬화한다."""
+        if self._out_writer_ws is ws:
+            await self._wait_outbound_close(ws, code, reason)
+            return
+        # 이미 교체된 소켓에는 이 세션 writer가 없으므로 동시 send 가능성도 없다.
+        try:
+            await ws.close(code=code, reason=reason)
         except Exception:
-            pass  # 전송 실패는 disconnect 핸들러가 처리
+            pass
 
     async def _handle_exit(self) -> None:
         if not self.alive:
@@ -338,11 +561,10 @@ class Session:
         ws = self.websocket
         self.websocket = None
         if ws is not None:
-            try:
-                await ws.send_text(json.dumps({"type": "exit", "code": exit_code}))
-                await ws.close()
-            except Exception:
-                pass
+            self._enqueue_outbound(_Outbound(
+                "text", json.dumps({"type": "exit", "code": exit_code})
+            ))
+            await self._wait_outbound_close(ws, 1000, "세션이 종료됨")
         # terminate()가 시작된 세션은 그 진입 시점에 이미 라이브 목록에서 빠졌고
         # 그때 알렸다. 자연 종료만 여기서 새 상태 변화를 만든다.
         if was_live:
@@ -350,10 +572,13 @@ class Session:
 
     def _cleanup_fd(self) -> None:
         if self.master_fd >= 0:
-            try:
-                self._loop.remove_reader(self.master_fd)
-            except Exception:
-                pass
+            if self._reader_registered:
+                try:
+                    self._loop.remove_reader(self.master_fd)
+                except Exception:
+                    pass
+                self._reader_registered = False
+            self._pty_reader_paused = False
             if self._writer_registered:
                 try:
                     self._loop.remove_writer(self.master_fd)
@@ -448,20 +673,39 @@ class Session:
         self.cancel_grace()
         self.last_activity = time.monotonic()
         old = self.websocket
-        self.websocket = ws
         if old is not None:
+            self.websocket = None
+            await self._stop_outbound_writer(old)
             try:
                 await old.close(code=4000, reason="다른 클라이언트가 연결됨")
             except Exception:
                 pass
+        self.websocket = ws
+        self._out_queue = asyncio.Queue()
+        self._out_writer_ws = ws
+        self._out_writer_task = asyncio.create_task(
+            self._outbound_writer(ws, self._out_queue),
+            name=f"wterm-output:{self.project_name}",
+        )
         if self.buffer:
-            await self._send_bytes(bytes(self.buffer))
+            replay_done = self._loop.create_future()
+            self._enqueue_outbound(_Outbound("bytes", bytes(self.buffer), replay_done))
+            # replay 전송 중 들어온 PTY 출력은 같은 큐에서 그 뒤에 붙는다. replay가
+            # 끝난 다음 attach가 돌아가야 route의 status가 그 live output 뒤에 놓인다.
+            try:
+                await replay_done
+            except asyncio.CancelledError:
+                if self.websocket is ws:
+                    self.websocket = None
+                await self._stop_outbound_writer(ws)
+                raise
 
-    def detach(self, ws: WebSocket) -> None:
+    async def detach(self, ws: WebSocket) -> None:
         """연결 해제. 유예 타이머를 시작한다."""
         if self.websocket is not ws:
             return  # 이미 다른 연결로 교체됨
         self.websocket = None
+        await self._stop_outbound_writer(ws)
         if self.alive:
             self._grace_task = asyncio.ensure_future(self._grace_countdown())
 
@@ -481,7 +725,10 @@ class Session:
         # 후속도 건너뛴다 — SIGTERM만 맞고 살아남은 자식이 마스터 fd를 문 채
         # "라이브"로 남는다. 참조를 먼저 비워 cancel_grace가 손댈 것을 없앤다.
         self._grace_task = None
-        await self.terminate()
+        if self._grace_expired is not None:
+            await self._grace_expired(self)
+        else:
+            await self.terminate()
 
     # ── 유휴 종료 ────────────────────────────────────────────────────
     #
@@ -511,7 +758,10 @@ class Session:
         except asyncio.CancelledError:
             return
         self._idle_task = None  # 아래 terminate가 자신을 취소하지 않도록
-        await self._expire_idle()
+        if self._idle_expired is not None:
+            await self._idle_expired(self)
+        else:
+            await self._expire_idle()
 
     async def _expire_idle(self) -> None:
         span = (
@@ -544,11 +794,10 @@ class Session:
         ws = self.websocket
         self.websocket = None
         if ws is not None:
-            try:
-                await ws.send_text(json.dumps({"type": "status", "message": message}))
-                await ws.close(code=code, reason=reason)
-            except Exception:
-                pass  # 이미 끊긴 소켓. 라우트 쪽 finally가 정리한다
+            self._enqueue_outbound(_Outbound("text", json.dumps({
+                "type": "status", "message": message,
+            })))
+            await self._wait_outbound_close(ws, code, reason)
         await self.terminate()
 
     # ── 입력/리사이즈 ────────────────────────────────────────────────
@@ -574,11 +823,12 @@ class Session:
         if not (self.alive and self.master_fd >= 0):
             return False
         self.last_activity = time.monotonic()
-        if len(self._write_buffer) >= WRITE_BUFFER_LIMIT:
+        encoded = data.encode()
+        if len(self._write_buffer) + len(encoded) > WRITE_BUFFER_LIMIT:
             first = not self._input_dropped
             self._input_dropped = True
             return first
-        self._write_buffer.extend(data.encode())
+        self._write_buffer.extend(encoded)
         self._flush_write()
         return False
 
@@ -635,6 +885,20 @@ class SessionManager:
         self.idle_seconds = idle_seconds
         self._state_changed = state_changed
         self.sessions: dict[str, Session] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def _lock_for(self, session_key: str) -> asyncio.Lock:
+        lock = self._locks.get(session_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[session_key] = lock
+        return lock
+
+    @asynccontextmanager
+    async def transition(self, session_key: str) -> AsyncIterator[None]:
+        """한 세션 키의 판정/history/종료/기동/등록을 직렬화한다."""
+        async with self._lock_for(session_key):
+            yield
 
     def get_live(self, project_name: str) -> Session | None:
         s = self.sessions.get(project_name)
@@ -662,16 +926,44 @@ class SessionManager:
         project_env: dict[str, str] | None = None,
     ) -> Session:
         """새 claude/셸 프로세스를 기동한다. 같은 키의 라이브 세션이 있으면 먼저 종료한다."""
+        async with self.transition(project_name):
+            return await self.start_locked(
+                project_name, cwd, extra_args, ssh, agent, command_args, project_env
+            )
+
+    async def start_locked(
+        self,
+        project_name: str,
+        cwd: str,
+        extra_args: list[str] | None = None,
+        ssh: str | None = None,
+        agent: str = "claude",
+        command_args: list[str] | None = None,
+        project_env: dict[str, str] | None = None,
+    ) -> Session:
+        """transition(project_name)을 이미 잡은 호출자가 쓰는 기동 경로."""
         existing = self.get_live(project_name)
         if existing is not None:
+            existing.cancel_grace()
+            ws = existing.websocket
+            existing.websocket = None
+            if ws is not None:
+                await existing._stop_outbound_writer(ws)
+                try:
+                    await ws.close(code=4000, reason="새 세션으로 교체됨")
+                except Exception:
+                    pass
             await existing.terminate()
-            del self.sessions[project_name]
+            if self.sessions.get(project_name) is existing:
+                del self.sessions[project_name]
 
         session = Session(
             project_name, cwd, self.grace_seconds,
             ssh=ssh, agent=agent, idle_seconds=self.idle_seconds,
             command_args=command_args, project_env=project_env,
             state_changed=self._state_changed,
+            grace_expired=lambda expired: self._expire_grace(project_name, expired),
+            idle_expired=lambda expired: self._expire_idle(project_name, expired),
         )
         session.spawn(extra_args)
         self.sessions[project_name] = session
@@ -685,16 +977,35 @@ class SessionManager:
         유예 타이머를 먼저 끊는다 — 소켓이 이미 떨어진 세션이면 그쪽도 곧
         terminate를 부르고, 둘이 겹치면 죽은 pid를 두 번 거두게 된다.
         """
-        session = self.get_live(project_name)
-        if session is None:
-            return False
-        session.cancel_grace()
-        await session.end_now()
-        # terminate는 SIGTERM_WAIT까지 걸린다. 그 사이 같은 키로 새 세션이 떴다면
-        # 맵에 있는 것은 더 이상 우리가 끝낸 세션이 아니다.
-        if self.sessions.get(project_name) is session:
-            del self.sessions[project_name]
-        return True
+        async with self.transition(project_name):
+            session = self.get_live(project_name)
+            if session is None:
+                return False
+            session.cancel_grace()
+            await session.end_now()
+            if self.sessions.get(project_name) is session:
+                del self.sessions[project_name]
+            return True
+
+    async def _expire_grace(self, project_name: str, session: Session) -> None:
+        """grace 만료와 reconnect/end/new를 같은 키 lock에서 선형화한다."""
+        async with self.transition(project_name):
+            if self.sessions.get(project_name) is not session:
+                return
+            if session.websocket is not None or not session.alive:
+                return
+            await session.terminate()
+            if self.sessions.get(project_name) is session:
+                del self.sessions[project_name]
+
+    async def _expire_idle(self, project_name: str, session: Session) -> None:
+        """idle 종료도 attach/new/end와 같은 키 lock에서 선형화한다."""
+        async with self.transition(project_name):
+            if self.sessions.get(project_name) is not session or not session.alive:
+                return
+            await session._expire_idle()
+            if self.sessions.get(project_name) is session:
+                del self.sessions[project_name]
 
     async def shutdown(self) -> None:
         # 세션마다 SIGTERM 후 최대 SIGTERM_WAIT초를 기다리므로 순차로 돌리면
@@ -706,4 +1017,9 @@ class SessionManager:
             s.cancel_grace()
         if sessions:
             await asyncio.gather(*(s.terminate() for s in sessions))
+        for s in sessions:
+            ws = s.websocket
+            s.websocket = None
+            if ws is not None:
+                await s._stop_outbound_writer(ws)
         self.sessions.clear()

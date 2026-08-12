@@ -66,23 +66,24 @@ cp projects.example.json projects.json
     },
     { "name": "remote-project", "path": "/home/user/remote-project", "ssh": "user@remote-host" }
   ],
-  "password_hash": "argon2id 해시"
+  "password_hash": null
 }
 ```
 
 | 필드 | 필수 | 설명 |
 | --- | --- | --- |
-| `host`, `port` | O | 바인딩 주소. **반드시 내부 IP(기본 `127.0.0.1`)로 유지**할 것. 앞단 프록시 없이 다른 기기에서 접속한다면 루프백이 아니라 그 기기들이 닿을 수 있는 내부 주소(예: 테일넷 IP) |
-| `grace_seconds` | O | 연결 해제 후 프로세스를 무손상 유지하는 시간(초). 이후 SIGHUP → SIGTERM → SIGKILL 순으로 프로세스 그룹을 정리 |
-| `idle_seconds` | 선택 | 양쪽 방향 모두 이 시간(초) 동안 조용한 세션을 종료. 기본 `0`(끔). 탭을 열어둔 채 잊은 세션용 — 출력이 계속 나오는 자동 실행은 종료되지 않음 |
+| `host`, `port` | O | 바인딩 주소와 1~65535 포트. 기본은 `127.0.0.1:8877`. loopback 밖의 TCP는 아래 안전 조건을 만족하지 않으면 기동 거부 |
+| `grace_seconds` | O | 0~86400초. 연결 해제 후 프로세스를 무손상 유지하고, 이후 SIGHUP → SIGTERM → SIGKILL 순으로 프로세스 그룹을 정리 |
+| `idle_seconds` | 선택 | 0~31536000초. 양쪽 방향 모두 이 시간 동안 조용한 세션을 종료. 기본 `0`(끔). 출력이 계속 나오는 자동 실행은 종료되지 않음 |
 | `projects` | O | 화이트리스트. `path`가 없는 로컬 프로젝트는 기동 시 제외됨 |
 | `projects[].ssh` | 선택 | `user@host`. 지정하면 Claude/Codex/셸을 해당 원격 호스트에서 실행 |
 | `projects[].args` | 선택 | `claude`/`codex`별 CLI 전역 인자의 문자열 배열. 셸 문자열이 아니며 resume/continue 인자보다 앞에 적용. 옵션 종결자 `--`는 지정 불가 |
 | `projects[].env` | 선택 | 해당 프로젝트의 Claude/Codex/셸에 공통 적용할 환경변수 문자열 맵. `TERM`은 W-Term이 관리하므로 지정 불가 |
-| `password_hash` | 선택 | argon2id 해시. 지정 시에만 로그인 인증이 켜짐 |
-| `allowed_origins` | 선택 | 허용 오리진 목록. **보통 비워둠** — 비어 있으면 "Origin 호스트 == Host 헤더"로 판정. 앞단 프록시가 Host를 바꿔 쓸 때만 명시 |
+| `password_hash` | 선택 | 유효한 Argon2id 해시. 지정 시에만 로그인 인증이 켜짐 |
+| `allowed_origins` | 선택 | path/query/fragment 없는 완전한 HTTP(S) origin 목록. **보통 비워둠** — 비어 있으면 "Origin 호스트 == Host 헤더"로 판정. 앞단 프록시가 Host를 바꿔 쓸 때만 명시 |
 | `uds` | 선택 | 이 경로의 유닉스 도메인 소켓으로 리슨(TCP 대신). 리버스 프록시 연동용 |
-| `tls_certfile`, `tls_keyfile` | 선택 | 풀체인/개인키 PEM 경로. **둘 다** 지정하면 HTTPS로 리슨 |
+| `tls_certfile`, `tls_keyfile` | 선택 | 풀체인/개인키 PEM 경로. **항상 둘을 함께** 지정하며, 한쪽만 있으면 기동 실패 |
+| `allow_insecure_tcp` | 선택 | 기본 `false`. loopback 밖의 무인증 또는 평문 TCP를 감수한다는 명시적 위험 승인. 정상 배포에서는 사용하지 말 것 |
 
 패스워드 해시는 이렇게 만듭니다.
 
@@ -90,12 +91,23 @@ cp projects.example.json projects.json
 .venv/bin/python -c "from argon2 import PasswordHasher; from getpass import getpass; print(PasswordHasher().hash(getpass('패스워드: ')))"
 ```
 
+출력된 전체 문자열로 예시의 `password_hash: null`을 교체하면 인증이 켜집니다.
+
 또는 W-Tools의 비밀번호 해시 생성 기능을 이용합니다.  
 [https://wtools.movingwoo.com/#/tool/password-hash](https://wtools.movingwoo.com/#/tool/password-hash)
 
 `projects[].args`와 `projects[].env`는 새로 시작하는 세션부터 적용됩니다.  
 실행 중인 세션은 설정을 다시 읽어 명령이나 환경을 바꾸지 않습니다.  
 두 필드는 프로젝트 목록 API와 감사 로그에 기록되지 않지만 `projects.json` 자체에는 평문으로 있으므로 기존과 같이 소유자만 읽을 수 있는 권한(`600`)을 유지하길 권장합니다.
+
+TCP로 직접 다른 기기에서 접속할 때는 loopback 대신 사설 VPN 인터페이스 주소를 쓰고,
+`password_hash`와 자체 TLS를 모두 설정해야 합니다. UDS 뒤에서 TLS를 종료하는 프록시는
+이 검사에서 제외됩니다. `0.0.0.0` 평문처럼 보호 경계가 없는 구성을 정말 써야 할 때만
+`allow_insecure_tcp: true`를 명시할 수 있으며, 이 값은 암호화나 인증을 제공하지 않습니다.
+
+원격 프로젝트의 `이어하기`/자동 재접속은 비대화식 SSH로 기록 존재를 먼저 확인합니다.
+연결, 인증, 호스트 키 또는 원격 명령 확인이 실패하면 새 세션으로 조용히 폴백하지 않고
+터미널에 원인을 알린 뒤 멈춥니다. 연결 상태를 고친 뒤 같은 버튼으로 재시도하세요.
 
 `projects.json`은 내부 경로와 패스워드 해시가 담기므로 실제 값은 커밋하지 않도록 주의합니다.
 

@@ -193,6 +193,58 @@ def project_status(ws, **expected):
     raise AssertionError(f"프로젝트 상태가 {expected!r}로 바뀌지 않음: {last!r}")
 
 
+def race_two_connections(h, token: str, path: str) -> list[tuple[str, object]]:
+    """두 연결이 모두 attach 구간에 들어갈 때까지 승자도 닫지 않고 붙들어 둔다."""
+    barrier = threading.Barrier(3)
+    release = threading.Event()
+    staged = threading.Event()
+    lock = threading.Lock()
+    stage_count = 0
+    outcomes: list[tuple[str, object]] = []
+
+    def worker(label: str) -> None:
+        nonlocal stage_count
+        ws = None
+        try:
+            barrier.wait()
+            ws = ws_connect(h, path, token=token)
+            message = status_message(ws)
+            with lock:
+                outcomes.append(("status", message))
+        except ConnectionClosed as exc:
+            with lock:
+                outcomes.append(("closed", exc.rcvd.code if exc.rcvd else None))
+        finally:
+            with lock:
+                stage_count += 1
+                if stage_count == 2:
+                    staged.set()
+
+        if ws is not None:
+            try:
+                assert release.wait(RECV_TIMEOUT)
+                send_line(ws, f"echo RACE-OWNER-{label}")
+                recv_until(ws, f"RACE-OWNER-{label}", timeout=5)
+                with lock:
+                    outcomes.append(("owner", label))
+            except ConnectionClosed as exc:
+                with lock:
+                    outcomes.append(("closed", exc.rcvd.code if exc.rcvd else None))
+            finally:
+                ws.close()
+
+    threads = [threading.Thread(target=worker, args=(label,)) for label in ("A", "B")]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    assert staged.wait(RECV_TIMEOUT), outcomes
+    release.set()
+    for thread in threads:
+        thread.join(RECV_TIMEOUT)
+        assert not thread.is_alive(), outcomes
+    return outcomes
+
+
 # ── 접속 거부 경로 ───────────────────────────────────────────────────
 #
 # 오리진 검사만 ws.accept() 전에 닫는다. Starlette이 핸드셰이크를 HTTP 403으로
@@ -439,6 +491,101 @@ def test_second_client_replaces_first(start_server):
             end_shell(second)
 
 
+def test_two_concurrent_attach_requests_leave_exactly_one_owner(start_server):
+    """동시 attach는 같은 PTY를 공유하되 마지막 소켓 하나만 소유한다."""
+    h = start_server()
+    token = h.login()
+    with ws_connect(h, "/ws/demo?agent=shell", token=token) as initial:
+        status_message(initial)
+        send_line(initial, "echo ORIGINAL-SESSION")
+        recv_until(initial, "ORIGINAL-SESSION")
+
+    outcomes = race_two_connections(h, token, "/ws/demo?agent=shell&mode=attach")
+    assert len([value for kind, value in outcomes if kind == "owner"]) == 1, outcomes
+    assert 4000 in [value for kind, value in outcomes if kind == "closed"], outcomes
+
+
+def test_two_concurrent_new_requests_do_not_cross_session_registration(start_server):
+    """동시 new가 같은 기존 세션을 겹쳐 종료하거나 두 PTY를 map에 남기지 않는다."""
+    h = start_server()
+    token = h.login()
+    with ws_connect(h, "/ws/demo?agent=shell", token=token) as initial:
+        status_message(initial)
+
+    outcomes = race_two_connections(h, token, "/ws/demo?agent=shell&mode=new")
+    assert len([value for kind, value in outcomes if kind == "owner"]) == 1, outcomes
+    assert 4000 in [value for kind, value in outcomes if kind == "closed"], outcomes
+
+    c = h.client(headers={"Origin": h.origin, "Cookie": f"wterm_token={token}"})
+    (demo,) = c.get("/api/projects").json()
+    assert demo["shell_live"] is True
+    assert c.post("/api/session/end?project=demo&agent=shell", timeout=40).json()["ended"]
+
+
+def test_concurrent_new_and_end_have_a_linearizable_result(start_server):
+    """new/end의 순서가 어느 쪽이든 결과는 그 한 순서로 설명 가능해야 한다."""
+    h = start_server()
+    token = h.login()
+    c = h.client(headers={"Origin": h.origin, "Cookie": f"wterm_token={token}"})
+    with ws_connect(h, "/ws/demo?agent=shell", token=token) as initial:
+        status_message(initial)
+
+    barrier = threading.Barrier(3)
+    result: dict[str, object] = {}
+
+    def open_new() -> None:
+        barrier.wait()
+        try:
+            with ws_connect(h, "/ws/demo?agent=shell&mode=new", token=token) as ws:
+                result["status"] = status_message(ws)
+                send_line(ws, "echo NEW-SURVIVED")
+                recv_until(ws, "NEW-SURVIVED", timeout=5)
+                result["new_live"] = True
+        except ConnectionClosed as exc:
+            result["new_close"] = exc.rcvd.code if exc.rcvd else None
+
+    def end_current() -> None:
+        barrier.wait()
+        result["ended"] = c.post(
+            "/api/session/end?project=demo&agent=shell", timeout=40
+        ).json()["ended"]
+
+    threads = [threading.Thread(target=open_new), threading.Thread(target=end_current)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(45)
+        assert not thread.is_alive(), result
+
+    assert result["ended"] is True
+    (demo,) = c.get("/api/projects").json()
+    if result.get("new_live"):
+        assert demo["shell_live"] is True  # end → new
+        c.post("/api/session/end?project=demo&agent=shell", timeout=40)
+    else:
+        assert result.get("new_close") == 4409  # new → end
+        assert demo["shell_live"] is False
+
+
+def test_grace_expiry_racing_reconnect_never_attaches_a_dying_pty(start_server):
+    """grace 경계의 reconnect는 옛 PTY 또는 새 PTY 중 하나에 온전히 붙는다."""
+    h = start_server(grace_seconds=1)
+    token = h.login()
+    with ws_connect(h, "/ws/demo?agent=shell", token=token) as ws:
+        status_message(ws)
+        send_line(ws, "echo BEFORE-GRACE-RACE")
+        recv_until(ws, "BEFORE-GRACE-RACE")
+
+    time.sleep(1.0)
+    with ws_connect(h, "/ws/demo?agent=shell&mode=attach", token=token) as ws:
+        message = status_message(ws)
+        assert "재접속" in message or "시작" in message
+        send_line(ws, "echo AFTER-GRACE-RACE")
+        recv_until(ws, "AFTER-GRACE-RACE")
+        end_shell(ws)
+
+
 def test_login_shell_falls_back_to_passwd_entry(start_server):
     """$SHELL이 없는 환경(=데몬)에서도 사용자의 로그인 셸을 띄운다.
 
@@ -472,6 +619,38 @@ def test_missing_agent_binary_reports_exit(start_server):
                 assert payload["code"] == 127  # execvpe 실패
                 return
         raise AssertionError("exit 메시지가 오지 않았다")
+
+
+def test_remote_history_failure_is_reported_without_starting_a_new_session(
+    start_server, project_dir
+):
+    """인증/네트워크/host-key 실패를 기록 없음으로 오인해 새 세션을 띄우지 않는다."""
+    bin_dir = project_dir / "fake-ssh-bin"
+    bin_dir.mkdir(exist_ok=True)
+    calls = project_dir / "fake-ssh-calls"
+    calls.unlink(missing_ok=True)
+    fake_ssh = bin_dir / "ssh"
+    fake_ssh.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(calls))}\n"
+        "exit 255\n",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+    h = start_server(
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+        projects=[{"name": "demo", "path": "/remote/work", "ssh": "new-host"}],
+    )
+    token = h.login()
+
+    with ws_connect(h, "/ws/demo?agent=claude&mode=resume", token=token) as ws:
+        assert "확인하지 못했습니다" in status_message(ws)
+        with pytest.raises(ConnectionClosed) as exc:
+            ws.recv(timeout=RECV_TIMEOUT)
+    assert exc.value.rcvd.code == 4410
+    lines = calls.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1  # interactive `ssh -t` session was never spawned
+    assert "StrictHostKeyChecking=yes" in lines[0]
 
 
 def test_legacy_shell_query_param(start_server):

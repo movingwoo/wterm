@@ -185,12 +185,14 @@ def test_broken_cert_keeps_previous_one(tls_server):
 
 def test_missing_cert_at_startup_is_fatal(start_server, tmp_path):
     """기동 시점의 실패는 감추지 않는다 — 조용히 평문으로 뜨면 더 나쁘다."""
+    key_path = tmp_path / "없는파일.key"
     h = start_server(
         wait=False,
         tls_certfile=str(tmp_path / "없는파일.pem"),
-        tls_keyfile=str(tmp_path / "없는파일.key"),
+        tls_keyfile=str(key_path),
     )
     assert h.proc.wait(timeout=30) != 0
+    assert str(key_path) not in h.output()
     # pid 파일까지 정리돼야 다음 기동이 잠금에 걸리지 않는다.
     assert not h.pid_file.exists()
 
