@@ -2,7 +2,7 @@
 #   .venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
 #   .venv/bin/python -m pytest
 #
-# WebSocket 클라이언트는 따로 넣지 않는다 — uvicorn[standard]가 가져오는
-# websockets 패키지의 동기 클라이언트를 그대로 쓴다.
+# WebSocket 클라이언트는 따로 넣지 않는다 — 런타임 버전으로 고정한 websockets의
+# 비동기 클라이언트를 TLS 테스트에서도 그대로 쓴다.
 pytest>=8.0
 httpx>=0.27

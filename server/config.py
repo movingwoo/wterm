@@ -12,7 +12,15 @@ projects.json 예시:
   "tls_certfile": "/Users/me/.wterm/fullchain.pem",
   "tls_keyfile": "/Users/me/.wterm/key.pem",
   "projects": [
-    {"name": "wterm", "path": "/app/wterm"},
+    {
+      "name": "wterm",
+      "path": "/app/wterm",
+      "args": {
+        "claude": ["--model", "your-claude-model"],
+        "codex": ["--model", "your-codex-model"]
+      },
+      "env": {"WTERM_PROJECT": "wterm"}
+    },
     {"name": "원격예시", "path": "/home/user/foo", "ssh": "user@100.x.x.x"}
   ]
 }
@@ -48,10 +56,13 @@ HTTPS로 리슨한다 (uds 사용 시에는 무시됨). 인증서를 발급/갱�
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "projects.json"
+PROJECT_ARG_AGENTS = frozenset(("claude", "codex"))
+ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
 @dataclass
@@ -59,6 +70,14 @@ class Project:
     name: str
     path: str
     ssh: str | None = None  # "user@host" — 지정 시 원격 호스트에서 claude 실행
+    # CLI 전역 옵션. resume/continue 서브커맨드보다 앞에 놓인다.
+    args: dict[str, list[str]] = field(default_factory=dict)
+    # 로컬/원격과 에이전트/셸에 똑같이 적용하는 프로젝트 환경.
+    env: dict[str, str] = field(default_factory=dict)
+
+    def args_for(self, agent: str) -> list[str]:
+        """세션이 자기 사본을 갖도록 새 리스트를 돌려준다."""
+        return list(self.args.get(agent, ()))
 
 
 @dataclass
@@ -86,20 +105,69 @@ class Config:
         return None
 
 
+def _project_args(raw: object, project_name: str) -> dict[str, list[str]]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"프로젝트 {project_name!r}: args는 객체여야 함")
+    unknown = set(raw) - PROJECT_ARG_AGENTS
+    if unknown:
+        names = ", ".join(sorted(map(str, unknown)))
+        raise ValueError(f"프로젝트 {project_name!r}: 지원하지 않는 args 대상: {names}")
+    result: dict[str, list[str]] = {}
+    for agent, values in raw.items():
+        if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+            raise ValueError(
+                f"프로젝트 {project_name!r}: args.{agent}는 문자열 배열이어야 함"
+            )
+        if any("\0" in value for value in values):
+            raise ValueError(f"프로젝트 {project_name!r}: 실행 인자에 NUL을 넣을 수 없음")
+        if "--" in values:
+            # 이 뒤의 강제 알림 옵션과 resume/continue를 위치 인자로 바꿔 버린다.
+            raise ValueError(f"프로젝트 {project_name!r}: args에 옵션 종결자 --를 넣을 수 없음")
+        result[agent] = list(values)
+    return result
+
+
+def _project_env(raw: object, project_name: str) -> dict[str, str]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"프로젝트 {project_name!r}: env는 객체여야 함")
+    result: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or ENV_NAME_RE.fullmatch(key) is None:
+            raise ValueError(f"프로젝트 {project_name!r}: 잘못된 환경변수 이름: {key!r}")
+        if key == "TERM":
+            # PTY와 xterm.js가 합의한 값이라 프로젝트마다 바뀌면 렌더링이 깨진다.
+            raise ValueError(f"프로젝트 {project_name!r}: TERM은 W-Term이 관리함")
+        if not isinstance(value, str):
+            raise ValueError(f"프로젝트 {project_name!r}: env.{key}는 문자열이어야 함")
+        if "\0" in value:
+            raise ValueError(f"프로젝트 {project_name!r}: env.{key}에 NUL을 넣을 수 없음")
+        result[key] = value
+    return result
+
+
 def load_config() -> Config:
     raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     projects = []
     for item in raw.get("projects", []):
+        name = item["name"]
         ssh = item.get("ssh") or None
+        args = _project_args(item.get("args"), name)
+        env = _project_env(item.get("env"), name)
         if ssh is not None:
             # 원격 경로는 로컬에 없으므로 존재 검증 없이 그대로 사용
-            projects.append(Project(name=item["name"], path=item["path"], ssh=ssh))
+            projects.append(
+                Project(name=name, path=item["path"], ssh=ssh, args=args, env=env)
+            )
             continue
         path = Path(item["path"]).resolve()
         if not path.is_dir():
             print(f"[config] 경고: 디렉터리가 없어 제외함: {path}")
             continue
-        projects.append(Project(name=item["name"], path=str(path)))
+        projects.append(Project(name=name, path=str(path), args=args, env=env))
     password_hash = raw.get("password_hash")
     # 비교는 소문자 기준. 브라우저가 보내는 Origin에는 끝 슬래시가 없으므로 떼어 맞춘다.
     allowed_origins = [

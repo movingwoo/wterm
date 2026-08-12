@@ -9,6 +9,7 @@ wss 업그레이드가 되고, 파일을 덮어써도 SIGHUP 전에는 바뀌지
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import signal
@@ -19,10 +20,57 @@ import time
 import httpx
 import pytest
 from websockets.exceptions import InvalidStatus
-from websockets.sync.client import connect
+from websockets.asyncio.client import connect
 
 from conftest import PASSWORD, free_port, wait_for_uds
-from test_ws import end_shell
+
+
+WS_RECV_TIMEOUT = 20.0
+
+
+async def _end_shell(ws) -> None:
+    """비동기 TLS 클라이언트가 연 셸을 정상 종료하고 exit 알림을 확인한다."""
+    await ws.send(json.dumps({"type": "input", "data": "true\n"}))
+    await ws.send(json.dumps({"type": "input", "data": "exit\n"}))
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + WS_RECV_TIMEOUT
+    while loop.time() < deadline:
+        msg = await asyncio.wait_for(
+            ws.recv(), timeout=max(0.1, deadline - loop.time())
+        )
+        if isinstance(msg, bytes):
+            continue
+        payload = json.loads(msg)
+        if payload["type"] == "exit":
+            assert payload["code"] == 0
+            return
+    raise AssertionError("셸 종료 후 exit 알림이 오지 않았다")
+
+
+async def _exercise_wss(h, ctx: ssl.SSLContext, token: str) -> None:
+    async with connect(
+        f"{h.ws_url}/ws/demo?agent=shell",
+        ssl=ctx,
+        additional_headers={"Origin": h.origin, "Cookie": f"wterm_token={token}"},
+        open_timeout=15,
+        proxy=None,
+    ) as ws:
+        msg = await asyncio.wait_for(ws.recv(), timeout=WS_RECV_TIMEOUT)
+        while isinstance(msg, bytes):
+            msg = await asyncio.wait_for(ws.recv(), timeout=WS_RECV_TIMEOUT)
+        assert json.loads(msg)["type"] == "status"
+        await _end_shell(ws)
+
+
+async def _connect_with_plaintext_origin(h, ctx: ssl.SSLContext, plain: str) -> None:
+    async with connect(
+        f"{h.ws_url}/ws/demo?agent=shell",
+        ssl=ctx,
+        additional_headers={"Origin": plain},
+        open_timeout=15,
+        proxy=None,
+    ):
+        pass
 
 pytestmark = pytest.mark.skipif(
     shutil.which("openssl") is None, reason="openssl이 없어 테스트 인증서를 만들 수 없다"
@@ -95,17 +143,7 @@ def test_https_and_wss_work(tls_server):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    with connect(
-        f"{h.ws_url}/ws/demo?agent=shell",
-        ssl=ctx,
-        additional_headers={"Origin": h.origin, "Cookie": f"wterm_token={token}"},
-        open_timeout=15,
-    ) as ws:
-        msg = ws.recv(timeout=20)
-        while isinstance(msg, bytes):
-            msg = ws.recv(timeout=20)
-        assert json.loads(msg)["type"] == "status"
-        end_shell(ws)
+    asyncio.run(_exercise_wss(h, ctx, token))
 
 
 def test_sighup_reloads_without_restarting(tls_server):
@@ -182,12 +220,7 @@ def test_plaintext_origin_is_rejected_over_https(tls_server):
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     with pytest.raises(InvalidStatus) as exc:
-        connect(
-            f"{h.ws_url}/ws/demo?agent=shell",
-            ssl=ctx,
-            additional_headers={"Origin": plain},
-            open_timeout=15,
-        )
+        asyncio.run(_connect_with_plaintext_origin(h, ctx, plain))
     assert exc.value.response.status_code == 403
 
 

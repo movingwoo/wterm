@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import time
 
 import httpx
@@ -103,6 +104,24 @@ def test_logout_closes_live_websocket(start_server):
         assert "재접속" in status_message(ws)
         recv_until(ws, "BEFORE-LOGOUT")  # 같은 프로세스의 replay 버퍼
         end_shell(ws)
+
+
+def test_logout_closes_project_status_websocket(start_server):
+    """프로젝트 상태 채널도 폐기된 토큰으로 계속 목록을 받아서는 안 된다."""
+    h = start_server()
+    c = h.client()
+    c.post("/api/login", json={"password": PASSWORD})
+    token = c.cookies["wterm_token"]
+
+    with ws_connect(h, "/api/projects/ws", token=token) as state:
+        payload = state.recv(timeout=RECV_TIMEOUT)
+        assert isinstance(payload, str)
+        assert json.loads(payload)["type"] == "projects"
+
+        assert c.post("/api/logout").status_code == 200
+        with pytest.raises(ConnectionClosed) as exc:
+            state.recv(timeout=RECV_TIMEOUT)
+    assert exc.value.rcvd.code == 4401
 
 
 def test_token_limit_wakes_watchdog_and_closes_live_websocket(start_server):

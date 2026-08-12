@@ -44,17 +44,20 @@
   --scrim: rgba(17, 17, 27, 0.88);
   --shadow: rgba(17, 17, 27, 0.35);
 
-  /* xterm은 CSS를 읽지 않는다. app.js가 이 토큰들을 읽어 term.options.theme에
-     넣는다.
+  /* xterm은 CSS를 읽지 않는다. modules/theme.js가 이 토큰들을 읽어
+     term.options.theme에 넣는다.
 
-     다크에서 ANSI 16색은 **일부러 비워 둔다.** 비어 있으면 app.js가 그 키를
-     빼고 넘기고, xterm은 자기 기본 팔레트를 쓴다 — 이 앱이 처음부터 쓰던 색이다.
+     다크에서 ANSI 16색은 **일부러 비워 둔다.** 비어 있으면 theme.js가 그 키를 빼고
+     넘기고, xterm은 자기 기본 팔레트를 쓴다 — 이 앱이 처음부터 쓰던 색이다.
      여기에 Mocha 팔레트를 깔면 터미널 안 색이 통째로 바뀐다(그렇게 해 봤고,
      기존 쪽이 낫다). 라이트에만 채워 넣는 이유는 xterm 기본값이 어두운 바탕을
      전제해서, 밝은 바탕에서는 밝은 글자가 되어 TUI가 안 읽히기 때문이다. */
   --term-bg: #1e1e2e;
   --term-fg: #cdd6f4;
   --term-cursor: #cba6f7;
+  --term-search-match: #45475a;
+  --term-search-active: #585b70;
+  --term-search-ruler: #cba6f7;
 }
 
 /* 시스템 설정이 라이트일 때. 다크로 못박아 둔 경우는 건드리지 않는다. */
@@ -90,6 +93,9 @@
     --term-bg: #eff1f5;
     --term-fg: #252a34;
     --term-cursor: #6f2dbd;
+    --term-search-match: #ccd0da;
+    --term-search-active: #acb0be;
+    --term-search-ruler: #6f2dbd;
     --term-black: #252a34;
     --term-red: #b4233f;
     --term-green: #2f741f;
@@ -143,6 +149,9 @@
   --term-bg: #eff1f5;
   --term-fg: #252a34;
   --term-cursor: #6f2dbd;
+  --term-search-match: #ccd0da;
+  --term-search-active: #acb0be;
+  --term-search-ruler: #6f2dbd;
   --term-black: #252a34;
   --term-red: #b4233f;
   --term-green: #2f741f;
@@ -314,7 +323,7 @@ body.sidebar-collapsed #sidebar-toggle svg { transform: rotate(180deg); }
    덩달아 좁아지고, "이어하기"가 두 줄로 접혔다. 열 경계보다 오른쪽 끝이 맞는
    쪽이 눈에 띄고, 이쪽은 줄바꿈도 나지 않는다.
 
-   `has-end`는 종료 버튼이 있는 줄에만 붙는다(app.js). 네 번째 칸을 늘 선언해
+   `has-end`는 종료 버튼이 있는 줄에만 붙는다(modules/project-sidebar.js). 네 번째 칸을 늘 선언해
    두면 버튼이 없는 줄에서도 그 앞의 간격 5px이 남아 오른쪽 끝이 그만큼 어긋난다.
    `:has()` 대신 클래스를 쓰는 이유는 지원 여부에 기대지 않기 위해서다. */
 .project .actions { display: flex; flex-direction: column; gap: 6px; }
@@ -620,6 +629,70 @@ body.split .pane-head { display: flex; }
 }
 .term-host.active { visibility: visible; }
 
+/* 창마다 하나인 검색 상자. term-stack 위에 겹쳐야 열고 닫을 때 PTY 크기가 바뀌지
+   않는다. 오른쪽 16px은 xterm 스크롤바와 검색 결과 눈금이 완전히 가려지지 않을
+   만큼의 여백이다. */
+.search-bar {
+  position: absolute;
+  z-index: 2;
+  top: 8px;
+  right: 16px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: min(420px, calc(100% - 28px));
+  padding: 6px;
+  border: 1px solid var(--surface-hover);
+  border-radius: 8px;
+  background: var(--bg-sunken);
+  box-shadow: 0 3px 12px var(--shadow);
+}
+
+.search-bar[hidden] { display: none; }
+
+.search-bar input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 5px 7px;
+  font: inherit;
+  font-size: 13px;
+  border: 1px solid var(--surface-hover);
+  border-radius: 5px;
+  outline: none;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.search-bar input::placeholder { color: var(--text-faint); }
+.search-bar input:focus { border-color: var(--accent); }
+
+.search-result {
+  flex: 0 0 auto;
+  min-width: 42px;
+  color: var(--text-dim);
+  font-size: 11px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.search-bar button {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 28px;
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  border: 1px solid var(--surface-hover);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.search-bar button:hover { background: var(--surface-hover); }
+.search-bar button:active { background: var(--surface-active); transform: translateY(1px); }
+.search-bar button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
 /* ── 모바일 키 바 ──────────────────────────────────────────────────
    폰 소프트 키보드에는 Esc·Tab·Ctrl·방향키가 없다. 물리 키보드가 있는 화면에서는
    자리만 차지하므로 터치 기기에서만 띄운다. max-width도 함께 보는 이유는 데스크톱
@@ -822,9 +895,9 @@ body.split .pane-head { display: flex; }
      에이전트 태그는 남긴다 — 같은 프로젝트의 Claude/Codex/셸 탭을 구분하는
      유일한 표시라, 이름을 줄이는 편이 낫다. */
   .tab { max-width: 150px; padding-left: 7px; gap: 5px; }
-  /* 좁은 화면에서는 분할 자체가 없다(app.js의 wideEnough). 창 버튼도 자리만
-     차지하므로 감춘다 — app.js가 hidden을 걸지만 CSS로도 못박아 둔다. */
-  .pane-actions { display: none; }
+  /* 좁은 화면에서는 분할 자체가 없다(app.js의 wideEnough). 검색은 물리 단축키가
+     없는 폰에서도 열 수 있어야 하므로 검색 버튼은 남기고 분할만 감춘다. */
+  .pane-split-btn { display: none; }
 
   #login-form {
     width: min(280px, calc(100vw - 32px));

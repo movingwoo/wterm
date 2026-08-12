@@ -1,4 +1,9 @@
-/* W-Term 프론트엔드: 프로젝트 목록 + 탭별 xterm.js 터미널 + WebSocket 연동 */
+import { createProjectSidebar } from "./modules/project-sidebar.js";
+import { createProjectStatusChannel } from "./modules/project-status.js";
+import { createThemeController } from "./modules/theme.js";
+import { createKeyBar } from "./modules/key-bar.js";
+
+/* W-Term 프론트엔드: 탭별 xterm.js 터미널 + pane/입력/알림 조정 */
 (() => {
   "use strict";
 
@@ -47,11 +52,9 @@
   // 에디터와 달리 터미널은 좁아지면 읽기 불편한 정도가 아니라 깨진다.
   const MAX_PANES = 2;
   const panes = [];
+  let nextPaneId = 1;
   let focusedPane = null;
   let lastProjects = [];
-  // 종료 요청이 나가 있는 세션 키(`<project>#<agent>`). 응답이 오기 전에 10초
-  // 폴링이 목록을 통째로 다시 그리므로, 진행 중 상태를 버튼에 두면 지워진다.
-  const endingKeys = new Set();
 
   function setStatus(cls, text) {
     connStatusEl.className = cls;
@@ -67,6 +70,13 @@
     loginOverlayEl.classList.add("visible");
     loginPasswordEl.focus();
   }
+
+  const projectStatus = createProjectStatusChannel({
+    hasProjects: () => lastProjects.length > 0,
+    onProjects: applyProjects,
+    onUnauthorized: showLogin,
+    onWaiting: (message) => { projectListEl.textContent = message; },
+  });
 
   loginFormEl.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -85,7 +95,7 @@
     if (res.ok) {
       loginPasswordEl.value = "";
       loginOverlayEl.classList.remove("visible");
-      loadProjects();
+      projectStatus.start();
       return;
     }
     if (res.status === 429) {
@@ -113,6 +123,9 @@
   });
 
   logoutBtnEl.addEventListener("click", async () => {
+    // 서버가 토큰을 폐기하며 상태 소켓을 4401로 닫기 전에 의도적으로 떼어 둔다.
+    // 그렇지 않으면 정상 로그아웃 중간에 "인증 만료" 메시지가 먼저 번쩍인다.
+    projectStatus.stop();
     try {
       await fetch("/api/logout", { method: "POST" });
     } catch {
@@ -220,265 +233,23 @@
   });
 
   // ── 테마 ───────────────────────────────────────────────────────────
-  //
-  // 셋 중 하나다: "system"(기본) · "light" · "dark". 색은 전부 style.css의 토큰이
-  // 들고 있고 여기서 하는 일은 html의 data-theme를 바꾸는 것뿐이다 — system이면
-  // 속성을 아예 지워 prefers-color-scheme이 정하게 둔다.
-  //
-  // 예외가 하나 있다: xterm은 CSS를 읽지 않으므로 터미널 안쪽 색만은 JS가 넣어야
-  // 한다. 팔레트를 여기에 한 벌 더 적으면 두 곳이 어긋나므로, 같은 토큰
-  // (--term-*)을 계산된 스타일에서 읽어 쓴다.
 
-  const themeStorageKey = "wterm.theme";
-  const THEMES = [["system", "시스템"], ["light", "라이트"], ["dark", "다크"]];
-  const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
-
-  let theme = "system";
-  try {
-    const saved = localStorage.getItem(themeStorageKey);
-    if (THEMES.some(([v]) => v === saved)) theme = saved;
-  } catch {
-    // 저장소가 막혀 있으면 이번 세션 동안만 유지된다.
-  }
-
-  // xterm ITheme 키 ← CSS 토큰 이름. ANSI 16색은 라이트에만 정의돼 있고 다크에서는
-  // 비어 있다 — 비면 아래에서 키째 빠져 xterm 기본 팔레트가 쓰인다.
-  const TERM_COLORS = [
-    ["background", "bg"], ["foreground", "fg"], ["cursor", "cursor"],
-    ["black", "black"], ["red", "red"], ["green", "green"], ["yellow", "yellow"],
-    ["blue", "blue"], ["magenta", "magenta"], ["cyan", "cyan"], ["white", "white"],
-    ["brightBlack", "bright-black"], ["brightRed", "bright-red"],
-    ["brightGreen", "bright-green"], ["brightYellow", "bright-yellow"],
-    ["brightBlue", "bright-blue"], ["brightMagenta", "bright-magenta"],
-    ["brightCyan", "bright-cyan"], ["brightWhite", "bright-white"],
-  ];
-
-  function xtermTheme() {
-    const css = getComputedStyle(document.documentElement);
-    const out = {};
-    for (const [key, token] of TERM_COLORS) {
-      // 정의되지 않은 토큰은 키째 뺀다. 그러면 xterm이 자기 기본값을 쓴다 —
-      // 다크의 ANSI 16색이 그 경우다(style.css의 --term-* 주석 참고).
-      const value = css.getPropertyValue(`--term-${token}`).trim();
-      if (value) out[key] = value;
-    }
-    return out;
-  }
-
-  /** 지금 실제로 적용된 테마 ("system"을 풀어서). */
-  function resolvedTheme() {
-    if (theme !== "system") return theme;
-    return darkQuery.matches ? "dark" : "light";
-  }
-
-  // [W-Term] 안내 줄 색. 밝은 바탕에서 파스텔 256색은 거의 보이지 않는다.
-  function noticeSgr(kind) {
-    const light = resolvedTheme() === "light";
-    if (kind === "alert") return light ? "\x1b[38;5;125m" : "\x1b[38;5;210m";
-    return light ? "\x1b[38;5;92m" : "\x1b[38;5;183m";
-  }
-
-  function applyTheme() {
-    if (theme === "system") document.documentElement.removeAttribute("data-theme");
-    else document.documentElement.setAttribute("data-theme", theme);
-    for (const btn of themePickerEl.children) {
-      btn.setAttribute("aria-pressed", String(btn.dataset.theme === theme));
-    }
-    // 열려 있는 터미널 전부. 배경색이 바뀌면 xterm은 스스로 다시 그린다.
-    const colors = xtermTheme();
-    for (const tab of allTabs()) tab.term.options.theme = colors;
-  }
-
-  for (const [value, label] of THEMES) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.dataset.theme = value;
-    btn.textContent = label;
-    btn.addEventListener("click", () => {
-      theme = value;
-      try {
-        localStorage.setItem(themeStorageKey, value);
-      } catch {
-        /* 저장소가 막혀 있어도 이번 세션 동안은 바뀐 채로 남는다 */
-      }
-      applyTheme();
-    });
-    themePickerEl.appendChild(btn);
-  }
-
-  // 시스템 모드일 때만 OS 설정 변화를 따라간다. 못박아 둔 쪽은 그대로 둬야 한다.
-  darkQuery.addEventListener("change", () => {
-    if (theme === "system") applyTheme();
+  const { xtermTheme, noticeSgr } = createThemeController({
+    picker: themePickerEl,
+    getTabs: allTabs,
+    refreshSearches: refreshOpenSearches,
   });
-
-  applyTheme();
 
   // ── 모바일 키 바 ───────────────────────────────────────────────────
-  //
-  // 폰 소프트 키보드에는 Esc·Tab·Ctrl·방향키가 없다. Claude Code TUI는 Esc(중단)와
-  // 방향키(메뉴 선택)가 있어야 쓸 수 있으므로, 그것들 없이는 폰에서 사실상 텍스트
-  // 입력만 가능하다 — "폰에서 다시 열면 이어집니다"라는 이 도구의 용도가 반쪽이 된다.
-  //
-  // 보내는 것은 term.paste가 아니라 입력 메시지 그대로다. paste는 괄호 붙여넣기
-  // 모드(bracketed paste)에서 \x1b[200~ ... \x1b[201~로 감싸여 나가고, 그 안의
-  // 바이트는 제어문자가 아니라 텍스트로 취급된다 — Esc가 Esc로 도착하지 않는다.
 
-  // 폰에서는 14px 고정 글자가 작고, 큰 글자가 필요한 정도는 기기와 시력에 따라
-  // 다르다. 기본은 모바일 16px / 데스크톱 14px이며 A-/A+로 바꾼 값은 모든 탭에
-  // 함께 적용하고 저장한다. 한 탭만 다르면 창을 옮길 때 열 수가 갑자기 바뀐다.
-  const fontSizeStorageKey = "wterm.terminal.fontSize";
-  const MIN_FONT_SIZE = 12;
-  const MAX_FONT_SIZE = 20;
-  let fontSizePinned = false;
-  let terminalFontSize = mobileLayout.matches ? 16 : 14;
-  try {
-    const saved = Number(localStorage.getItem(fontSizeStorageKey));
-    if (Number.isInteger(saved) && saved >= MIN_FONT_SIZE && saved <= MAX_FONT_SIZE) {
-      terminalFontSize = saved;
-      fontSizePinned = true;
-    }
-  } catch {
-    // 저장소가 막혀 있으면 반응형 기본값과 현재 탭의 변경만 유지한다.
-  }
-
-  let smallerFontEl = null;
-  let largerFontEl = null;
-  let fontSizeEl = null;
-
-  function paintFontControls() {
-    if (!fontSizeEl) return;
-    fontSizeEl.value = String(terminalFontSize);
-    fontSizeEl.textContent = `${terminalFontSize}px`;
-    smallerFontEl.disabled = terminalFontSize <= MIN_FONT_SIZE;
-    largerFontEl.disabled = terminalFontSize >= MAX_FONT_SIZE;
-    smallerFontEl.setAttribute(
-      "aria-label", `터미널 글자 작게 (현재 ${terminalFontSize}px)`
-    );
-    largerFontEl.setAttribute(
-      "aria-label", `터미널 글자 크게 (현재 ${terminalFontSize}px)`
-    );
-  }
-
-  function setTerminalFontSize(value, persist = false) {
-    const next = Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, value));
-    if (next === terminalFontSize && !persist) return;
-    terminalFontSize = next;
-    if (persist) {
-      fontSizePinned = true;
-      try {
-        localStorage.setItem(fontSizeStorageKey, String(next));
-      } catch {
-        /* 현재 페이지에서는 바뀐 크기가 그대로 유지된다 */
-      }
-    }
-    for (const tab of allTabs()) tab.term.options.fontSize = next;
-    paintFontControls();
-    scheduleFit();
-  }
-
-  // 사용자가 크기를 고정하지 않았다면 화면 성격이 바뀔 때만 기본값을 바꾼다.
-  mobileLayout.addEventListener("change", (e) => {
-    if (!fontSizePinned) setTerminalFontSize(e.matches ? 16 : 14);
+  const { applyCtrl, getFontSize, setCtrlArmed } = createKeyBar({
+    root: keyBarEl,
+    mobileLayout,
+    getTabs: allTabs,
+    getActiveTab: activeTab,
+    sendJson,
+    scheduleFit,
   });
-
-  // 시퀀스가 null인 것은 보낼 것이 없는 고정 키(Ctrl)다.
-  const BAR_KEYS = [
-    ["Esc", "\x1b", "Esc (중단)"],
-    ["Tab", "\t", "Tab"],
-    ["Ctrl", null, "Ctrl (다음 한 글자에만 적용)"],
-    ["←", "\x1b[D", "왼쪽"],
-    ["↑", "\x1b[A", "위"],
-    ["↓", "\x1b[B", "아래"],
-    ["→", "\x1b[C", "오른쪽"],
-    ["^C", "\x03", "Ctrl-C (인터럽트)"],
-  ];
-
-  let ctrlArmed = false;
-  let ctrlKeyEl = null;
-
-  function setCtrlArmed(on) {
-    ctrlArmed = on;
-    if (ctrlKeyEl) {
-      ctrlKeyEl.classList.toggle("armed", on);
-      ctrlKeyEl.setAttribute("aria-pressed", String(on));
-    }
-  }
-
-  /** Ctrl이 걸려 있으면 다음 한 글자를 제어문자로 접는다. */
-  function applyCtrl(data) {
-    if (!ctrlArmed) return data;
-    // 소프트 키보드에는 동시 누르기가 없다. Ctrl은 누르면 다음 한 글자에만
-    // 걸리는 고정 키(sticky)여야 Ctrl-R 같은 조합을 낼 수 있다.
-    setCtrlArmed(false);
-    if (data.length !== 1) return data; // IME 조합 결과나 붙여넣기는 건드리지 않는다
-    const code = data.toUpperCase().charCodeAt(0);
-    // 0x40~0x5f(@A-Z[\]^_)만 접는다. 이 범위 밖에는 대응하는 제어문자가 없다.
-    return code >= 0x40 && code <= 0x5f ? String.fromCharCode(code & 0x1f) : data;
-  }
-
-  function sendKey(seq) {
-    const tab = activeTab();
-    if (!tab) return;
-    setCtrlArmed(false); // 바의 키들은 이미 완성된 시퀀스다
-    sendJson(tab, { type: "input", data: seq });
-    tab.term.focus();
-  }
-
-  function makeKeyButton(label, title) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "key";
-    btn.textContent = label;
-    btn.title = title;
-    // 버튼이 포커스를 가져가면 폰에서 소프트 키보드가 접힌다. pointerdown을
-    // 취소하면 포커스 이동만 막히고 click은 그대로 온다.
-    btn.addEventListener("pointerdown", (e) => e.preventDefault());
-    return btn;
-  }
-
-  const fontControlsEl = document.createElement("div");
-  fontControlsEl.className = "font-controls";
-  fontControlsEl.setAttribute("role", "group");
-  fontControlsEl.setAttribute("aria-label", "터미널 글자 크기");
-
-  smallerFontEl = makeKeyButton("A−", "터미널 글자 작게");
-  smallerFontEl.classList.add("font-key");
-  smallerFontEl.addEventListener("click", () => {
-    setTerminalFontSize(terminalFontSize - 1, true);
-    const tab = activeTab();
-    if (tab) tab.term.focus();
-  });
-
-  fontSizeEl = document.createElement("output");
-  fontSizeEl.setAttribute("aria-live", "polite");
-
-  largerFontEl = makeKeyButton("A+", "터미널 글자 크게");
-  largerFontEl.classList.add("font-key");
-  largerFontEl.addEventListener("click", () => {
-    setTerminalFontSize(terminalFontSize + 1, true);
-    const tab = activeTab();
-    if (tab) tab.term.focus();
-  });
-
-  fontControlsEl.append(smallerFontEl, fontSizeEl, largerFontEl);
-  keyBarEl.appendChild(fontControlsEl);
-  paintFontControls();
-
-  for (const [label, seq, title] of BAR_KEYS) {
-    const btn = makeKeyButton(label, title);
-    if (seq === null) {
-      ctrlKeyEl = btn;
-      btn.setAttribute("aria-pressed", "false");
-      btn.addEventListener("click", () => {
-        setCtrlArmed(!ctrlArmed);
-        const tab = activeTab();
-        if (tab) tab.term.focus();
-      });
-    } else {
-      btn.addEventListener("click", () => sendKey(seq));
-    }
-    keyBarEl.appendChild(btn);
-  }
 
   // ── 대기 알림 ──────────────────────────────────────────────────────
   //
@@ -559,6 +330,97 @@
     }
   });
 
+  // ── 터미널 검색 ────────────────────────────────────────────────────
+  //
+  // 검색 대상은 서버 출력 스트림이 아니라 각 xterm의 현재 스크롤백 버퍼다. 서버가
+  // 터미널 내용을 들여다보지 않는 경계는 그대로고, 탭마다 SearchAddon 하나를 둬서
+  // 같은 프로젝트의 세션이나 분할된 두 창이 서로의 선택을 건드리지 않는다.
+  //
+  // 검색 상자는 term-stack 위에 겹쳐 띄운다. 탭 줄과 스택 사이에 끼우면 열고 닫을
+  // 때마다 터미널 높이가 달라지고 PTY에도 resize가 전송된다. 출력 몇 줄을 가리는
+  // 작은 오버레이가 검색 한 번에 원격 TUI의 행 수를 바꾸는 것보다 예측 가능하다.
+
+  function searchDecorationOptions() {
+    const css = getComputedStyle(document.documentElement);
+    const token = (name) => css.getPropertyValue(`--term-search-${name}`).trim();
+    return {
+      matchBackground: token("match"),
+      matchOverviewRuler: token("ruler"),
+      activeMatchBackground: token("active"),
+      activeMatchColorOverviewRuler: token("ruler"),
+    };
+  }
+
+  function paintSearchResults(tab, { resultIndex, resultCount }) {
+    const pane = tab.pane;
+    if (!pane || pane.activeTab !== tab || pane.searchEl.hidden) return;
+    if (!pane.searchInputEl.value) {
+      pane.searchResultEl.textContent = "";
+    } else if (resultCount === 0) {
+      pane.searchResultEl.textContent = "없음";
+    } else if (resultIndex < 0) {
+      // 애드온은 장식 상한(기본 1000개)을 넘으면 현재 인덱스를 -1로 준다.
+      pane.searchResultEl.textContent = `${resultCount}+`;
+    } else {
+      pane.searchResultEl.textContent = `${resultIndex + 1}/${resultCount}`;
+    }
+  }
+
+  function runSearch(pane, direction = "next", incremental = false) {
+    const tab = pane.activeTab;
+    if (!tab) return;
+    // 한 창에서 보이는 검색은 활성 탭 하나뿐이다. 이전에 검색했던 숨은 탭의
+    // 장식을 남기면 다시 열었을 때 다른 검색어가 이유 없이 칠해져 있다.
+    for (const other of pane.tabs) {
+      if (other !== tab) other.searchAddon.clearDecorations();
+    }
+    const query = pane.searchInputEl.value;
+    if (!query) {
+      tab.searchAddon.clearDecorations();
+      pane.searchResultEl.textContent = "";
+      return;
+    }
+    const options = {
+      incremental,
+      decorations: searchDecorationOptions(),
+    };
+    if (direction === "previous") tab.searchAddon.findPrevious(query, options);
+    else tab.searchAddon.findNext(query, options);
+  }
+
+  function refreshPaneSearch(pane) {
+    // clearDecorations가 애드온의 캐시된 검색어도 지운다. 탭 또는 테마가 바뀐 뒤
+    // 같은 검색어를 다시 넣어도 장식 전체가 확실히 새로 만들어지는 이유다.
+    for (const tab of pane.tabs) tab.searchAddon.clearDecorations();
+    pane.searchResultEl.textContent = "";
+    if (!pane.searchEl.hidden && pane.activeTab && pane.searchInputEl.value) {
+      runSearch(pane, "next", true);
+    }
+  }
+
+  function refreshOpenSearches() {
+    for (const pane of panes) {
+      if (!pane.searchEl.hidden) refreshPaneSearch(pane);
+    }
+  }
+
+  function openSearch(pane) {
+    if (!pane.activeTab) return;
+    pane.searchEl.hidden = false;
+    pane.searchBtnEl.setAttribute("aria-expanded", "true");
+    if (pane.searchInputEl.value) refreshPaneSearch(pane);
+    pane.searchInputEl.focus();
+    pane.searchInputEl.select();
+  }
+
+  function closeSearch(pane, { focus = true } = {}) {
+    pane.searchEl.hidden = true;
+    pane.searchBtnEl.setAttribute("aria-expanded", "false");
+    pane.searchResultEl.textContent = "";
+    for (const tab of pane.tabs) tab.searchAddon.clearDecorations();
+    if (focus && pane.activeTab) pane.activeTab.term.focus();
+  }
+
   // ── 창(pane) ───────────────────────────────────────────────────────
   //
   // 큰 화면에서 세션 하나를 보려고 다른 하나를 덮는 것이 탭의 한계다. 창은 그
@@ -580,6 +442,7 @@
   }
 
   function createPane() {
+    const paneId = nextPaneId++;
     const el = document.createElement("section");
     el.className = "pane";
 
@@ -596,15 +459,24 @@
     const actionsEl = document.createElement("div");
     actionsEl.className = "pane-actions";
 
+    const searchBtnEl = document.createElement("button");
+    searchBtnEl.type = "button";
+    searchBtnEl.className = "pane-btn pane-search-btn";
+    searchBtnEl.textContent = "검색";
+    searchBtnEl.title = `터미널 버퍼 검색 (${IS_MAC ? "⌘F" : "Ctrl+F"})`;
+    searchBtnEl.setAttribute("aria-label", searchBtnEl.title);
+    searchBtnEl.setAttribute("aria-controls", `pane-search-${paneId}`);
+    searchBtnEl.setAttribute("aria-expanded", "false");
+
     const splitEl = document.createElement("button");
     splitEl.type = "button";
-    splitEl.className = "pane-btn";
+    splitEl.className = "pane-btn pane-split-btn";
     splitEl.addEventListener("click", () => {
       if (panes.length < MAX_PANES) addPane();
       else removePane(pane);
     });
 
-    actionsEl.appendChild(splitEl);
+    actionsEl.append(searchBtnEl, splitEl);
 
     const stackEl = document.createElement("div");
     stackEl.className = "term-stack";
@@ -614,10 +486,63 @@
     placeholderEl.textContent = "좌측에서 프로젝트를 선택하세요.";
     stackEl.appendChild(placeholderEl);
 
+    const searchEl = document.createElement("form");
+    searchEl.id = `pane-search-${paneId}`;
+    searchEl.className = "search-bar";
+    searchEl.setAttribute("role", "search");
+    searchEl.hidden = true;
+
+    const searchInputEl = document.createElement("input");
+    searchInputEl.type = "search";
+    searchInputEl.placeholder = "터미널 검색";
+    searchInputEl.autocomplete = "off";
+    searchInputEl.spellcheck = false;
+    searchInputEl.enterKeyHint = "search";
+    searchInputEl.setAttribute("aria-label", "터미널 버퍼 검색어");
+
+    const searchResultEl = document.createElement("output");
+    searchResultEl.className = "search-result";
+    searchResultEl.setAttribute("aria-live", "polite");
+    searchResultEl.setAttribute("aria-atomic", "true");
+
+    function searchBarButton(text, label) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = text;
+      btn.title = label;
+      btn.setAttribute("aria-label", label);
+      return btn;
+    }
+
+    const searchPreviousEl = searchBarButton("↑", "이전 일치 항목 (Shift+Enter)");
+    const searchNextEl = searchBarButton("↓", "다음 일치 항목 (Enter)");
+    const searchCloseEl = searchBarButton("×", "검색 닫기 (Esc)");
+    searchEl.append(
+      searchInputEl, searchResultEl, searchPreviousEl, searchNextEl, searchCloseEl
+    );
+    stackEl.appendChild(searchEl);
+
     headEl.append(tabBarEl, actionsEl);
     el.append(headEl, stackEl);
 
-    const pane = { el, tabBarEl, actionsEl, splitEl, stackEl, tabs: [], activeTab: null };
+    const pane = {
+      el, tabBarEl, actionsEl, splitEl, stackEl, searchBtnEl, searchEl,
+      searchInputEl, searchResultEl, tabs: [], activeTab: null,
+    };
+    searchBtnEl.addEventListener("click", () => openSearch(pane));
+    searchEl.addEventListener("submit", (e) => {
+      e.preventDefault();
+      runSearch(pane);
+    });
+    searchInputEl.addEventListener("input", () => runSearch(pane, "next", true));
+    searchInputEl.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter") return;
+      e.preventDefault();
+      runSearch(pane, e.shiftKey ? "previous" : "next");
+    });
+    searchPreviousEl.addEventListener("click", () => runSearch(pane, "previous"));
+    searchNextEl.addEventListener("click", () => runSearch(pane));
+    searchCloseEl.addEventListener("click", () => closeSearch(pane));
     // 창 안 어디를 눌러도 그 창이 포커스를 가져간다. 키 바와 상태줄, 주소 해시가
     // 따라오므로 "지금 어느 창을 쓰고 있나"가 클릭 한 번으로 정해져야 한다.
     //
@@ -669,6 +594,7 @@
   function moveTabToPane(tab, pane, { refit = true } = {}) {
     const from = tab.pane;
     if (from === pane) return;
+    tab.searchAddon.clearDecorations();
     from.tabs.splice(from.tabs.indexOf(tab), 1);
     pane.tabs.push(tab);
     tab.pane = pane;
@@ -676,14 +602,18 @@
     // 터미널 DOM은 그 안에 통째로 들어 있다. 다만 새 창의 폭에 맞춰 다시 재야 한다.
     pane.tabBarEl.appendChild(tab.el);
     pane.stackEl.appendChild(tab.hostEl);
-    if (from.activeTab === tab) from.activeTab = from.tabs[from.tabs.length - 1] || null;
+    if (from.activeTab === tab) {
+      from.activeTab = from.tabs[from.tabs.length - 1] || null;
+      if (from.activeTab) refreshPaneSearch(from);
+      else closeSearch(from, { focus: false });
+    }
     pane.activeTab = tab;
     if (refit) {
       activateTab(tab); // 포커스·해시·크기·상태줄을 한 곳에서 맞춘다
       // 옮긴 직후 한 번은 다시 그린다. 폭이 달라진 상자로 옮겨왔는데 fit이
       // 같은 열 수를 내놓으면 xterm은 리사이즈가 없었다고 보고 다시 그리지 않는다.
       tab.term.refresh(0, tab.term.rows - 1);
-    }
+    } else refreshPaneSearch(pane);
   }
 
   const splitStorageKey = "wterm.split.ratio";
@@ -801,6 +731,7 @@
     panes.forEach((pane, paneIndex) => {
       pane.el.classList.toggle("focused", pane === focusedPane && panes.length > 1);
       pane.el.classList.toggle("empty", pane.tabs.length === 0);
+      pane.searchBtnEl.disabled = pane.tabs.length === 0;
       for (const t of pane.tabs) {
         const on = t === pane.activeTab;
         t.el.classList.toggle("active", on);
@@ -823,6 +754,8 @@
 
   function activateTab(tab) {
     const pane = tab.pane;
+    const previous = pane.activeTab;
+    if (previous && previous !== tab) previous.searchAddon.clearDecorations();
     pane.activeTab = tab;
     tab.unread = false;
     tab.el.classList.remove("unread");
@@ -839,6 +772,7 @@
     tab.el.scrollIntoView({ block: "nearest", inline: "nearest" });
     setStatus(tab.statusCls, tab.statusText);
     fitTab(tab);
+    refreshPaneSearch(pane);
     tab.term.focus();
     renderProjects();
   }
@@ -846,13 +780,15 @@
   function createTab(name, agent, pane) {
     const term = new Terminal({
       fontFamily: '"Cascadia Code", "D2Coding", Menlo, monospace',
-      fontSize: terminalFontSize,
+      fontSize: getFontSize(),
       cursorBlink: true,
       scrollback: 5000,
       theme: xtermTheme(),
     });
     const fitAddon = new FitAddon.FitAddon();
+    const searchAddon = new SearchAddon.SearchAddon();
     term.loadAddon(fitAddon);
+    term.loadAddon(searchAddon);
 
     // 윈도우·리눅스의 복사·붙여넣기.
     //
@@ -936,7 +872,7 @@
     el.append(dotEl, nameEl, agentEl, moveEl, closeEl);
 
     const tab = {
-      name, agent, term, fitAddon, hostEl, el, dotEl, moveEl,
+      name, agent, term, fitAddon, searchAddon, hostEl, el, dotEl, moveEl,
       pane: null,
       ws: null,
       reconnectTimer: null,
@@ -947,6 +883,7 @@
       unread: false,
       bell: false,
     };
+    searchAddon.onDidChangeResults((results) => paintSearchResults(tab, results));
 
     el.addEventListener("click", (e) => {
       if (e.target === closeEl || e.target === moveEl) return;
@@ -1009,7 +946,10 @@
       } else {
         paintPanes();
         syncHash();
-        if (pane === focusedPane && !pane.activeTab) setStatus("disconnected", "연결 안 됨");
+        if (pane === focusedPane && !pane.activeTab) {
+          closeSearch(pane, { focus: false });
+          setStatus("disconnected", "연결 안 됨");
+        }
       }
     } else {
       paintPanes();
@@ -1059,6 +999,28 @@
     openTab(name, agent, "attach");
   }
 
+  // 브라우저 찾기 대신 포커스된 창의 xterm 버퍼를 찾는다. xterm은 자기 textarea의
+  // keydown에서 즉시 PTY 입력을 보내므로 캡처 단계에서 막아야 한다. 맥의 Ctrl+F는
+  // 터미널의 forward-char로 남기고 브라우저 관례대로 ⌘F만 검색에 쓴다.
+  document.addEventListener("keydown", (e) => {
+    if (!focusedPane) return;
+    if (e.key === "Escape" && !focusedPane.searchEl.hidden) {
+      e.preventDefault();
+      e.stopPropagation();
+      closeSearch(focusedPane);
+      return;
+    }
+    const findModifier = IS_MAC
+      ? e.metaKey && !e.ctrlKey
+      : e.ctrlKey && !e.metaKey;
+    const findKey = e.code === "KeyF" || e.key.toLowerCase() === "f";
+    if (!findModifier || e.altKey || e.shiftKey || !findKey) return;
+    if (!focusedPane.activeTab) return;
+    e.preventDefault();
+    e.stopPropagation();
+    openSearch(focusedPane);
+  }, true);
+
   // 탭 전환 단축키. xterm은 textarea에서 keydown을 받아 그 자리에서 입력을 보내므로
   // 캡처 단계에서 가로채야 터미널로 흘러 들어가지 않는다. Ctrl+Alt 조합은 Claude
   // TUI와 셸이 쓰는 키(Esc, Ctrl-C, 방향키, Alt+방향키)와 겹치지 않는 자리다.
@@ -1101,7 +1063,7 @@
       tab.reconnectAttempts = 0;
       setTabStatus(tab, "connected", `연결됨: ${tab.name} (${AGENT_LABEL[tab.agent]})`);
       fitTab(tab);
-      loadProjects();
+      renderProjects();
     };
 
     sock.onmessage = (ev) => {
@@ -1129,7 +1091,7 @@
     sock.onclose = (ev) => {
       if (tab.ws !== sock) return; // 이미 다른 연결로 교체됨
       tab.ws = null;
-      loadProjects();
+      renderProjects();
       // 오리진 거절(4403)은 여기로 오지 않는다. 서버가 accept 전에 닫아 핸드셰이크가
       // HTTP 403으로 끝나고, 브라우저는 그것을 1006으로만 알려준다. 아래 재연결
       // 경로를 타고 "재연결 실패"로 끝나며, 원인은 서버 로그에 남는다.
@@ -1172,185 +1134,31 @@
 
   // ── 프로젝트 목록 ──────────────────────────────────────────────────
 
-  async function loadProjects() {
-    try {
-      const res = await fetch("/api/projects");
-      if (res.status === 401) {
-        showLogin();
-        return;
-      }
-      lastProjects = await res.json();
-    } catch {
-      projectListEl.textContent = "프로젝트 목록을 불러오지 못했습니다.";
-      return;
-    }
+  function applyProjects(projects) {
+    if (!Array.isArray(projects)) return;
+    lastProjects = projects;
     renderProjects();
     // 복원은 목록을 받은 뒤에야 할 수 있다 — 그 세션이 아직 살아 있는지를
-    // 여기서만 알 수 있기 때문이다. 첫 목록에서 한 번만 시도한다(로그인이
-    // 필요한 상태였다면 위에서 빠져나가므로, 로그인 직후의 호출이 그 한 번이 된다).
+    // 여기서만 알 수 있기 때문이다. 첫 스냅샷에서 한 번만 시도한다(인증이
+    // 필요했다면 로그인 뒤 새 상태 소켓이 받은 스냅샷이 그 한 번이 된다).
     if (!hashRestored) {
       hashRestored = true;
       restoreFromHash();
     }
   }
 
+  const projectSidebar = createProjectSidebar({
+    root: projectListEl,
+    getProjects: () => lastProjects,
+    getActiveTab: activeTab,
+    findTab,
+    activateTab,
+    openTab,
+    showLogin,
+  });
+
   function renderProjects() {
-    projectListEl.replaceChildren();
-    for (const p of lastProjects) {
-      const card = document.createElement("div");
-      const focused = activeTab();
-      const cardActive = focused !== null && focused.name === p.name;
-      card.className = "project" + (cardActive ? " active" : "");
-
-      const nameEl = document.createElement("div");
-      nameEl.className = "name";
-      nameEl.textContent = p.name;
-      if (p.live) {
-        const badge = document.createElement("span");
-        badge.className = "badge";
-        badge.textContent = "CLAUDE";
-        nameEl.appendChild(badge);
-      }
-      if (p.codex_live) {
-        const badge = document.createElement("span");
-        badge.className = "badge codex";
-        badge.textContent = "CODEX";
-        nameEl.appendChild(badge);
-      }
-      if (p.shell_live) {
-        const badge = document.createElement("span");
-        badge.className = "badge shell";
-        badge.textContent = "SHELL";
-        nameEl.appendChild(badge);
-      }
-
-      const pathEl = document.createElement("div");
-      pathEl.className = "path";
-      pathEl.textContent = p.ssh ? `${p.ssh}:${p.path}` : p.path;
-
-      const actions = document.createElement("div");
-      actions.className = "actions";
-
-      // 탭을 닫는 것은 종료가 아니라 분리다 — 세션은 유예 시간 동안 살아 있고,
-      // 그래서 다시 열면 화면이 복원된다. 실제로 끝내려면 이 경로가 필요하다.
-      // 라이브일 때만 나온다 (끝낼 것이 없으면 버튼도 없다).
-      function makeEndButton(agent, label, live) {
-        if (!live) return null;
-        const key = `${p.name}#${agent}`;
-        const btn = document.createElement("button");
-        btn.className = "end";
-        btn.title = endingKeys.has(key)
-          ? `${label} 세션을 종료하는 중입니다`
-          : `실행 중인 ${label} 세션을 종료합니다`;
-        // 진행 중 상태는 버튼이 아니라 endingKeys가 들고 있다 — 목록은 10초마다
-        // 통째로 다시 그려지므로 버튼에만 담아두면 그때 지워진다.
-        // 진행 중 표시는 "종료"와 **같은 폭**이어야 한다. 더 긴 글자를 넣으면
-        // 그 순간 줄 전체가 다시 배분되어 옆 버튼들이 두 줄로 접힌다.
-        const ending = endingKeys.has(key);
-        btn.textContent = ending ? "…" : "종료";
-        btn.disabled = ending;
-        btn.setAttribute("aria-busy", String(ending));
-        btn.onclick = async () => {
-          if (!confirm(`'${p.name}'의 실행 중인 ${label} 세션을 종료할까요?`)) return;
-          // SIGHUP과 SIGTERM을 모두 무시하는 자식은 SIGKILL까지 시간이 걸린다.
-          // 그동안 아무 표시가 없으면 버튼이 먹지 않은 것으로 보인다.
-          endingKeys.add(key);
-          btn.disabled = true;
-          btn.textContent = "…";
-          btn.setAttribute("aria-busy", "true");
-          try {
-            const res = await fetch(
-              `/api/session/end?project=${encodeURIComponent(p.name)}` +
-              `&agent=${encodeURIComponent(agent)}`,
-              { method: "POST" }
-            );
-            if (res.status === 401) showLogin();
-          } catch {
-            /* 아래 loadProjects가 실제 상태를 다시 가져온다 */
-          } finally {
-            endingKeys.delete(key);
-          }
-          loadProjects();
-        };
-        return btn;
-      }
-
-      function makeAgentRow(label, agent, live, hasHistory) {
-        const row = document.createElement("div");
-        row.className = "agent-row";
-        const labelEl = document.createElement("span");
-        labelEl.className = `agent-label ${agent}`;
-        labelEl.textContent = label;
-
-        const open = findTab(p.name, agent);
-        const resumeBtn = document.createElement("button");
-        resumeBtn.className = "primary";
-        if (open && open.ws) {
-          // 이미 탭이 붙어 있는 세션. 여기서 다시 연결하면 서버가 그 탭의 소켓을
-          // 4000으로 끊는다 — 그러니 연결은 건드리지 않고 탭만 앞으로 가져온다.
-          resumeBtn.textContent = "보기";
-          resumeBtn.title = "열려 있는 탭으로 이동";
-          resumeBtn.onclick = () => activateTab(open);
-        } else {
-          resumeBtn.textContent = live ? "재접속" : "이어하기";
-          resumeBtn.title = live
-            ? `실행 중인 ${label} 세션에 재접속`
-            : `${label}의 이전 세션 목록에서 선택해 이어하기`;
-          resumeBtn.disabled = !live && !hasHistory;
-          resumeBtn.onclick = () => openTab(p.name, agent, "resume");
-        }
-
-        const newBtn = document.createElement("button");
-        newBtn.textContent = "새 세션";
-        newBtn.onclick = () => {
-          if (live && !confirm(`'${p.name}'의 실행 중인 ${label} 세션을 종료하고 새로 시작할까요?`)) return;
-          openTab(p.name, agent, "new");
-        };
-        row.append(labelEl, resumeBtn, newBtn);
-        const endBtn = makeEndButton(agent, label, live);
-        // has-end는 네 번째 칸을 여는 표식이다. 종료 버튼이 없는 줄에까지 칸을
-        // 열어두면 그 앞의 간격만큼 오른쪽 끝이 어긋난다 (style.css 주석 참고).
-        if (endBtn) {
-          row.appendChild(endBtn);
-          row.classList.add("has-end");
-        }
-        return row;
-      }
-      actions.append(
-        makeAgentRow("Claude", "claude", p.live, p.has_history),
-        makeAgentRow("Codex", "codex", p.codex_live, p.codex_has_history)
-      );
-
-
-      const openShell = findTab(p.name, "shell");
-      const shellBtn = document.createElement("button");
-      if (openShell && openShell.ws) {
-        shellBtn.textContent = "셸 보기";
-        shellBtn.title = "열려 있는 셸 탭으로 이동";
-        shellBtn.onclick = () => activateTab(openShell);
-      } else {
-        shellBtn.textContent = p.shell_live ? "셸 재접속" : "셸";
-        shellBtn.title = p.ssh
-          ? `원격 셸 열기 (ssh ${p.ssh})`
-          : "이 디렉터리에서 로컬 셸 열기";
-        shellBtn.onclick = () => openTab(p.name, "shell", "attach");
-      }
-
-      const shellRow = document.createElement("div");
-      shellRow.className = "agent-row shell-row";
-      const shellLabel = document.createElement("span");
-      shellLabel.className = "agent-label shell";
-      shellLabel.textContent = "Shell";
-      shellRow.append(shellLabel, shellBtn);
-      const endShellBtn = makeEndButton("shell", "셸", p.shell_live);
-      if (endShellBtn) {
-        shellRow.appendChild(endShellBtn);
-        shellRow.classList.add("has-end");
-      }
-      actions.append(shellRow);
-      card.append(nameEl, pathEl, actions);
-      projectListEl.appendChild(card);
-    }
+    projectSidebar.render();
   }
 
   // 창 하나로 시작한다. 두 번째는 분할 버튼을 눌러야 생긴다.
@@ -1358,11 +1166,5 @@
   layoutPanes();
   applyWidthLimit();
 
-  loadProjects();
-  // 붙어 있는 소켓이 없는 탭이 하나라도 있으면(또는 탭이 없으면) 배지가 바뀌어도
-  // 알 방법이 없다. 소켓이 전부 살아 있을 때는 그쪽 이벤트로 갱신되므로 쉰다.
-  setInterval(() => {
-    const open = allTabs();
-    if (open.length === 0 || open.some((t) => !t.ws)) loadProjects();
-  }, 10000);
+  projectStatus.start();
 })();

@@ -10,6 +10,14 @@
 
 ## [미출시]
 
+## [1.4.0] — 2026-08-12
+
+- 큰 진입점의 관심사를 빌드 없는 모듈로 분리했다. 서버의 인증·감사·프로젝트 상태와 프론트의 상태 연결·프로젝트 카드·테마·모바일 키 바가 각각 독립 파일을 갖고, `main.py`와 `app.js`는 라우트 및 탭/pane 조정에 집중한다.
+- 프로젝트 목록의 브라우저별 10초 폴링을 상태 WebSocket 푸시로 바꿨다. 세션 시작·종료는 즉시 반영하고 외부에서 생긴 기록은 서버 한 곳에서만 저빈도로 재검사한다.
+- `projects.json`에서 프로젝트별 Claude/Codex 실행 인자와 공통 환경변수를 지정할 수 있다. 로컬·SSH 세션에 동일하게 적용하며 설정값은 프로젝트 목록이나 감사 로그에 노출하지 않는다.
+- 터미널 스크롤백 검색을 추가했다. 각 창의 검색 버튼이나 Ctrl+F(macOS는 ⌘F)로 열고, 일치 항목 수와 이전·다음 이동을 지원한다.
+- macOS에서 간헐적으로 멎던 TLS WebSocket 스모크를 안정화했다. Uvicorn의 이벤트 루프와 HTTP/WebSocket 구현 및 관련 버전을 명시하고, TLS 검증 클라이언트를 비동기 구현으로 바꿨다.
+
 ## [1.3.0] — 2026-08-12
 
 - 모바일 프로젝트 목록을 터미널 위의 서랍으로 바꿨다. 세션을 고르면 자동으로 닫히고, 배경이나 왼쪽 핸들로 여닫는다. 주소창이 움직이는 높이와 노치·홈 인디케이터 여백도 반영한다.
@@ -48,7 +56,8 @@ ssh 원격 프로젝트, 자체 HTTPS(무중단 인증서 리로드), 부팅 자
 서버가 판정하는 토큰 만료와 즉시 로그아웃, CSP를 포함한 응답 헤더, 90일 감사 로그
 (터미널 내용은 남기지 않음), 선택적 유휴 세션 종료.
 
-[미출시]: https://github.com/movingwoo/wterm/compare/v1.3.0...main
+[미출시]: https://github.com/movingwoo/wterm/compare/v1.4.0...main
+[1.4.0]: https://github.com/movingwoo/wterm/releases/tag/v1.4.0
 [1.3.0]: https://github.com/movingwoo/wterm/releases/tag/v1.3.0
 [1.2.0]: https://github.com/movingwoo/wterm/releases/tag/v1.2.0
 [1.1.0]: https://github.com/movingwoo/wterm/releases/tag/v1.1.0

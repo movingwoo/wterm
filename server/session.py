@@ -23,6 +23,7 @@ import signal
 import struct
 import termios
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from anyio import to_thread
@@ -86,20 +87,21 @@ def latest_session_id(cwd: str) -> str | None:
 
 
 # Codex 세션 파일은 ~/.codex/sessions 아래에 쌓이기만 하는 구조다. 프로젝트마다
-# 전체를 rglob으로 훑으면 /api/projects 한 번이 O(파일 수 × 프로젝트 수)가 되고,
-# 프론트는 그 목록을 10초마다 폴링한다 — 시간이 지날수록 느려지는 형태다. 게다가
+# 전체를 rglob으로 훑으면 프로젝트 상태 한 번이 O(파일 수 × 프로젝트 수)가 되고,
+# 상태 채널은 외부에서 생긴 기록도 잡기 위해 주기적으로 이를 갱신한다 — 시간이
+# 지날수록 느려지는 형태다. 게다가
 # 동기 파일 I/O라 그동안 살아있는 모든 PTY 세션의 입출력이 멎는다(argon2 검증을
 # 스레드로 뺀 것과 정확히 같은 이유의 문제다).
 #
 # 그래서 세 가지를 함께 한다: 한 번의 스캔으로 cwd 집합을 통째로 만들고(프로젝트
-# 수와 무관해진다), 결과를 폴링 주기보다 넉넉히 길게 캐시하고, 스캔 자체는
+# 수와 무관해진다), 결과를 상태 재검사 주기만큼 캐시하고, 스캔 자체는
 # 스레드에서 돌린다. 대가는 방금 생긴 기록이 최대 CODEX_CACHE_TTL초 늦게 보이는
 # 것인데, 그 사이 그 세션은 라이브라 재접속 경로를 타므로 기록 조회에 닿지 않는다.
 CODEX_CACHE_TTL = 30.0
 
 _codex_cwds: set[str] = set()
 _codex_scanned_at = float("-inf")
-_codex_scan_lock = asyncio.Lock()  # 폴링이 겹칠 때 같은 스캔을 두 번 돌리지 않는다
+_codex_scan_lock = asyncio.Lock()  # 상태 조회가 겹칠 때 같은 스캔을 두 번 돌리지 않는다
 
 
 def _scan_codex_cwds() -> set[str]:
@@ -166,6 +168,9 @@ class Session:
         ssh: str | None = None,
         agent: str = "claude",
         idle_seconds: int = 0,
+        command_args: list[str] | None = None,
+        project_env: dict[str, str] | None = None,
+        state_changed: Callable[[], None] | None = None,
     ):
         self.project_name = project_name
         self.cwd = cwd
@@ -173,6 +178,9 @@ class Session:
         self.idle_seconds = idle_seconds
         self.ssh = ssh
         self.agent = agent  # "claude" | "codex" | "shell"
+        self.command_args = list(command_args or ())
+        self.project_env = dict(project_env or {})
+        self._state_changed = state_changed
         self.pid: int = -1
         self.master_fd: int = -1
         self.alive = False
@@ -190,6 +198,15 @@ class Session:
         self._write_buffer = bytearray()
         self._writer_registered = False
         self._input_dropped = False
+
+    def _notify_state_changed(self) -> None:
+        """라이브 여부가 바뀌었음을 알린다. 관찰자 실패가 PTY 수명을 깨면 안 된다."""
+        if self._state_changed is None:
+            return
+        try:
+            self._state_changed()
+        except Exception:
+            pass
 
     # ── 프로세스 수명 주기 ────────────────────────────────────────────
 
@@ -218,15 +235,25 @@ class Session:
             notify = ["--settings", '{"preferredNotifChannel":"terminal_bell"}']
         elif self.agent == "codex":
             notify = ["-c", "tui.notifications=true"]
-        return [self.agent, *notify, *(extra_args or [])]
+        # 프로젝트 옵션은 resume/continue 서브커맨드보다 앞에 와야 하고, 알림 옵션은
+        # 그 뒤에 와야 한다. 같은 설정이 중복될 때 대부분의 CLI는 마지막 값을 쓰므로
+        # 이 순서가 projects.json의 인자로 알림 불변조건을 끄지 못하게 한다.
+        return [self.agent, *self.command_args, *notify, *(extra_args or [])]
 
-    def spawn(self, extra_args: list[str] | None = None) -> None:
+    def _command(self, extra_args: list[str] | None = None) -> list[str]:
+        """로컬/SSH 실행 argv를 만든다. 원격 셸 문자열의 인코딩은 여기 한 곳뿐이다."""
         if self.ssh is not None:
             # 원격 셸은 로컬 $SHELL 경로가 원격 머신에 존재한다는 보장이 없으므로
             # bash로 고정한다.
             base_cmd = (
                 ["bash", "-l"] if self.agent == "shell" else self._agent_cmd(extra_args)
             )
+            if self.project_env:
+                # ssh의 로컬 프로세스 환경을 바꿔도 서버 설정에 따라 원격으로 전달되지
+                # 않는다. env argv를 원격 명령에 명시하고 shlex.join으로 값 전체를 한 번
+                # 인용해 공백·따옴표·셸 메타문자가 명령으로 해석되지 않게 한다.
+                assignments = [f"{key}={value}" for key, value in self.project_env.items()]
+                base_cmd = ["env", *assignments, *base_cmd]
             # -t: 원격에 TTY 강제 할당. resize(SIGWINCH)·시그널은 ssh가 중계하고,
             # ssh가 끊기면(grace 만료 포함) 원격 프로세스는 SIGHUP으로 정리된다.
             # BatchMode는 쓰지 않는다 — 패스워드/호스트키 프롬프트를 터미널에서 처리 가능.
@@ -245,13 +272,22 @@ class Session:
                 if self.agent == "shell"
                 else self._agent_cmd(extra_args)
             )
+        return cmd
+
+    def spawn(self, extra_args: list[str] | None = None) -> None:
+        cmd = self._command(extra_args)
 
         pid, master_fd = pty.fork()  # 자식은 setsid + PTY를 제어 터미널로 가짐
         if pid == 0:  # 자식 프로세스
             try:
                 if self.ssh is None:
                     os.chdir(self.cwd)  # 원격 경로는 로컬에 없음 — ssh 명령이 cd 수행
-                env = dict(os.environ, TERM="xterm-256color")
+                env = dict(os.environ)
+                if self.ssh is None:
+                    env.update(self.project_env)
+                # TERM은 config에서 예약해 두었지만 여기서도 마지막에 못박는다. PTY와
+                # xterm.js의 기능 합의라 프로젝트 설정 때문에 달라져서는 안 된다.
+                env["TERM"] = "xterm-256color"
                 os.execvpe(cmd[0], cmd, env)
             except Exception:
                 os._exit(127)
@@ -294,6 +330,7 @@ class Session:
     async def _handle_exit(self) -> None:
         if not self.alive:
             return
+        was_live = not self.terminating
         self.alive = False
         self._cancel_idle()
         self._cleanup_fd()
@@ -306,6 +343,10 @@ class Session:
                 await ws.close()
             except Exception:
                 pass
+        # terminate()가 시작된 세션은 그 진입 시점에 이미 라이브 목록에서 빠졌고
+        # 그때 알렸다. 자연 종료만 여기서 새 상태 변화를 만든다.
+        if was_live:
+            self._notify_state_changed()
 
     def _cleanup_fd(self) -> None:
         if self.master_fd >= 0:
@@ -381,7 +422,12 @@ class Session:
         """
         if not self.alive:
             return
+        first_terminator = not self.terminating
         self.terminating = True
+        # 실제 reap까지 SIGTERM_WAIT초가 걸릴 수 있지만, 종료에 들어온 세션은
+        # get_live에서 즉시 빠진다. 화면의 라이브 배지도 그 판정과 동시에 내린다.
+        if first_terminator:
+            self._notify_state_changed()
         self._cancel_idle()
         self._signal_group(signal.SIGHUP)
         if not await self._wait_reaped(SIGHUP_WAIT):
@@ -579,9 +625,15 @@ class Session:
 class SessionManager:
     """프로젝트 이름 → 라이브 세션 매핑."""
 
-    def __init__(self, grace_seconds: int, idle_seconds: int = 0):
+    def __init__(
+        self,
+        grace_seconds: int,
+        idle_seconds: int = 0,
+        state_changed: Callable[[], None] | None = None,
+    ):
         self.grace_seconds = grace_seconds
         self.idle_seconds = idle_seconds
+        self._state_changed = state_changed
         self.sessions: dict[str, Session] = {}
 
     def get_live(self, project_name: str) -> Session | None:
@@ -606,6 +658,8 @@ class SessionManager:
         extra_args: list[str] | None = None,
         ssh: str | None = None,
         agent: str = "claude",
+        command_args: list[str] | None = None,
+        project_env: dict[str, str] | None = None,
     ) -> Session:
         """새 claude/셸 프로세스를 기동한다. 같은 키의 라이브 세션이 있으면 먼저 종료한다."""
         existing = self.get_live(project_name)
@@ -616,9 +670,13 @@ class SessionManager:
         session = Session(
             project_name, cwd, self.grace_seconds,
             ssh=ssh, agent=agent, idle_seconds=self.idle_seconds,
+            command_args=command_args, project_env=project_env,
+            state_changed=self._state_changed,
         )
         session.spawn(extra_args)
         self.sessions[project_name] = session
+        if self._state_changed is not None:
+            self._state_changed()
         return session
 
     async def end(self, project_name: str) -> bool:
