@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import ssl
 import time
 from contextlib import asynccontextmanager, suppress
@@ -736,6 +737,73 @@ def _warn_on_config_permissions() -> None:
         )
 
 
+# ── 바인드 주소 대기 ────────────────────────────────────────────────
+#
+# host가 VPN 인터페이스의 주소(테일넷 IP 등)면 부팅 직후에는 그 주소가 아직
+# 인터페이스에 붙어 있지 않다. 그 상태에서 bind하면 EADDRNOTAVAIL로 실패하고
+# uvicorn은 종료 코드 3으로 끝난다. 되살리는 것은 감시자의 몫인데, launchd가
+# 다시 띄우는 간격 안에 VPN이 올라오지 못하거나 그 사이 시스템이 꺼지면
+# "부팅은 했는데 서버가 끝내 안 뜬" 상태로 남는다. 실제로 겪은 증상이고,
+# 원격 접속용 서버에서 그건 곧 접속 불가다.
+#
+# 그래서 주소가 인터페이스에 붙을 때까지 여기서 기다린다. 감시자의 재기동
+# 타이밍 운에 기대지 않고 기동이 결정적이 된다. loopback처럼 항상 있는 주소는
+# 첫 검사에서 그대로 통과하므로 평상시 비용은 없다.
+
+BIND_WAIT_SECONDS = 180.0
+BIND_WAIT_INTERVAL = 2.0
+
+_bind_log = logging.getLogger("wterm.bind")
+_bind_log.setLevel(logging.INFO)  # 루트가 ERROR로 잠겨 있다 — _tls_log 쪽 주석 참조
+
+
+def _host_address_ready(host: str) -> bool:
+    """host를 이 머신에서 bind할 수 있는지 본다.
+
+    포트는 0으로 잡는다. 여기서 보려는 것은 "주소가 인터페이스에 있는가"뿐이라,
+    실제 포트를 미리 잡으면 곧 uvicorn이 쓸 포트를 잠깐이라도 우리가 들고 있게
+    된다. EADDRNOTAVAIL이 아닌 실패는 기다린다고 풀릴 문제가 아니므로 준비된
+    것으로 보고 넘긴다 — uvicorn이 진짜 원인을 그대로 보고하는 편이 낫다.
+    """
+    try:
+        infos = socket.getaddrinfo(host, 0, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return False  # 이름이 아직 해석되지 않는다 (DNS/hosts가 늦게 올라오는 경우)
+    for family, socktype, proto, _canon, sockaddr in infos:
+        try:
+            with socket.socket(family, socktype, proto) as sock:
+                sock.bind(sockaddr)
+        except OSError as exc:
+            if exc.errno == errno.EADDRNOTAVAIL:
+                continue  # 이 주소는 아직 없다. 다음 후보를 본다.
+            return True
+        return True
+    return False
+
+
+def _wait_for_host_address(host: str, timeout: float = BIND_WAIT_SECONDS) -> None:
+    """host 주소가 인터페이스에 붙을 때까지 기다린다. 시간이 다하면 그냥 진행한다."""
+    if _host_address_ready(host):
+        return
+    _bind_log.warning(
+        "%s 주소가 아직 인터페이스에 없습니다 (VPN이 올라오는 중일 수 있음) — "
+        "최대 %.0f초 기다립니다",
+        host, timeout,
+    )
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(BIND_WAIT_INTERVAL)
+        if _host_address_ready(host):
+            _bind_log.info("%s 주소가 올라왔습니다 — 기동을 계속합니다", host)
+            return
+    # 여기까지 왔으면 설정이 틀렸을 가능성이 더 크다. 조용히 계속 기다리는 것보다
+    # uvicorn이 EADDRNOTAVAIL을 그대로 내고 죽어 감시자에게 넘기는 편이 낫다.
+    _bind_log.error(
+        "%s 주소가 %.0f초 안에 올라오지 않았습니다 — 그대로 bind를 시도합니다",
+        host, timeout,
+    )
+
+
 def main() -> None:
     import uvicorn
 
@@ -753,6 +821,10 @@ def main() -> None:
     # uvicorn이 serve() 진입 시 이 핸들러를 저장했다가 종료 직전에 복원하고
     # SIGTERM을 되던진다. 반드시 uvicorn.run() 전에 걸어야 한다.
     signal.signal(signal.SIGTERM, _exit_success)
+    # 시그널 핸들러를 건 뒤에 기다린다 — 대기 중에 stop.sh가 들어와도 pid 파일을
+    # 정리하고 종료 코드 0으로 끝나야 감시자가 곧바로 되살리지 않는다.
+    if not config.uds:
+        _wait_for_host_address(config.host)
     # log_config=None: uvicorn 자체 로깅 설정을 끄고 위 root 로거로 전파시킴.
     # 구현 선택을 auto에 맡기면 설치된 extra와 uvicorn 릴리즈에 따라 이벤트 루프나
     # HTTP/WS 프로토콜이 조용히 바뀐다. macOS에서 그 조합의 TLS WSS 업그레이드가

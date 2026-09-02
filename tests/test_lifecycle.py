@@ -109,3 +109,24 @@ def _read_pid(path, timeout: float = 20.0) -> int:
         except (OSError, ValueError):
             time.sleep(0.1)
     raise AssertionError(f"셸이 {timeout}초 안에 {path}를 쓰지 않았다")
+
+
+def test_waits_for_bind_address_instead_of_dying(start_server):
+    """부팅 직후 테일넷 주소가 아직 없을 때 즉시 죽으면 안 된다.
+
+    host가 VPN 인터페이스 주소면 부팅 직후에는 그 주소가 아직 없어서 bind가
+    EADDRNOTAVAIL로 실패한다. 예전에는 그대로 종료해 감시자의 재기동 간격 안에
+    VPN이 올라오는지에 기동이 걸려 있었고, 못 맞추면 그 부팅에서는 끝내 안 떴다.
+    """
+    h = start_server(
+        host="192.0.2.1",  # TEST-NET-1 — 어떤 인터페이스에도 붙지 않는다
+        allow_insecure_tcp=True,  # loopback 밖 평문 TCP라 이게 없으면 기동을 거부한다
+        wait=False,
+    )
+    time.sleep(3)
+
+    assert h.proc.poll() is None, f"바인드 주소를 기다리지 않고 종료함:\n{h.output()}"
+    assert "192.0.2.1 주소가 아직 인터페이스에 없습니다" in h.output()
+    # 기다리는 동안에도 stop.sh는 그대로 통해야 한다 (시그널 핸들러가 먼저 걸린다).
+    assert h.stop(signal.SIGTERM) == 0
+    assert not h.pid_file.exists()
